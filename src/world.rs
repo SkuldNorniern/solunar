@@ -5,6 +5,7 @@ use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::profile::StepTimes;
+use crate::solver::{CachedManifold, ContactScratch, solve_contacts};
 use crate::{
     ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
     FrameState, Frames, GridPosition, JobDispatch, PhysicsError, RigidBodyDesc, Sequential,
@@ -52,12 +53,13 @@ pub struct Advance {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Integrated {
-    position: Option<GridPosition>,
-    rotation: Quat,
-    linear: Vec3,
-    angular: Vec3,
-    momentum: Vec3,
+pub(crate) struct Integrated {
+    pub(crate) position: Option<GridPosition>,
+    pub(crate) rotation: Quat,
+    pub(crate) linear: Vec3,
+    pub(crate) angular: Vec3,
+    pub(crate) momentum: Vec3,
+    pub(crate) touched: bool,
 }
 
 impl Default for Integrated {
@@ -68,6 +70,7 @@ impl Default for Integrated {
             linear: Vec3::ZERO,
             angular: Vec3::ZERO,
             momentum: Vec3::ZERO,
+            touched: false,
         }
     }
 }
@@ -79,6 +82,8 @@ pub struct PhysicsWorld {
     pub(crate) bodies: Bodies,
     pub(crate) tick: u64,
     pub(crate) accumulator: f64,
+    pub(crate) contact_cache: Vec<CachedManifold>,
+    contact_scratch: ContactScratch,
     scratch: Vec<Integrated>,
     frame_gravity: Vec<Vec3>,
     times: StepTimes,
@@ -111,6 +116,8 @@ impl PhysicsWorld {
             bodies,
             tick,
             accumulator,
+            contact_cache: Vec::new(),
+            contact_scratch: ContactScratch::default(),
             scratch: Vec::new(),
             frame_gravity: Vec::new(),
             times: StepTimes::default(),
@@ -388,32 +395,25 @@ impl PhysicsWorld {
         let bodies = &self.bodies;
         let frame_gravity = &self.frame_gravity;
         let dt = self.settings.fixed_timestep;
-        let chunks: Vec<Mutex<(&mut [Integrated], bool)>> = self
-            .scratch
-            .chunks_mut(chunk_size)
-            .map(|chunk| Mutex::new((chunk, false)))
-            .collect();
-        dispatch.run(chunks.len(), &|job| {
-            let Some(chunk) = chunks.get(job) else {
-                return;
-            };
-            let mut guard = chunk.lock().unwrap_or_else(PoisonError::into_inner);
-            let (out, done) = &mut *guard;
-            let base = job * chunk_size;
-            for (offset, slot) in out.iter_mut().enumerate() {
-                *slot = integrate(bodies, frame_gravity, base + offset, dt);
-            }
-            *done = true;
-        });
-        let all_done = chunks
-            .iter()
-            .all(|chunk| chunk.lock().unwrap_or_else(PoisonError::into_inner).1);
-        drop(chunks);
-        if !all_done {
-            return Err(PhysicsError::DispatchIncomplete);
-        }
+        run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+            *slot = integrate_velocity(bodies, frame_gravity, dense, dt);
+        })?;
+
+        let mut next_cache = self.contact_cache.clone();
+        solve_contacts(
+            bodies,
+            &mut self.scratch,
+            &mut next_cache,
+            &mut self.contact_scratch,
+            dt,
+        );
+
+        run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+            integrate_position(bodies, dense, slot, dt);
+        })?;
 
         self.commit()?;
+        self.contact_cache = next_cache;
         self.tick += 1;
         self.times.record(started.elapsed());
         Ok(())
@@ -467,50 +467,102 @@ impl PhysicsWorld {
     }
 }
 
-fn integrate(bodies: &Bodies, frame_gravity: &[Vec3], dense: usize, dt: f32) -> Integrated {
-    let cell = bodies.cell[dense];
-    let local = bodies.local[dense];
+/// Runs `work` for every body on the host. Fails if the host skipped a job.
+fn run_jobs(
+    state: &mut [Integrated],
+    chunk_size: usize,
+    dispatch: &dyn JobDispatch,
+    work: &(dyn Fn(usize, &mut Integrated) + Sync),
+) -> Result<(), PhysicsError> {
+    let chunks: Vec<Mutex<(&mut [Integrated], bool)>> = state
+        .chunks_mut(chunk_size)
+        .map(|chunk| Mutex::new((chunk, false)))
+        .collect();
+    dispatch.run(chunks.len(), &|job| {
+        let Some(chunk) = chunks.get(job) else {
+            return;
+        };
+        let mut guard = chunk.lock().unwrap_or_else(PoisonError::into_inner);
+        let (out, done) = &mut *guard;
+        let base = job * chunk_size;
+        for (offset, slot) in out.iter_mut().enumerate() {
+            work(base + offset, slot);
+        }
+        *done = true;
+    });
+    let all_done = chunks
+        .iter()
+        .all(|chunk| chunk.lock().unwrap_or_else(PoisonError::into_inner).1);
+    if all_done {
+        Ok(())
+    } else {
+        Err(PhysicsError::DispatchIncomplete)
+    }
+}
+
+fn integrate_velocity(
+    bodies: &Bodies,
+    frame_gravity: &[Vec3],
+    dense: usize,
+    dt: f32,
+) -> Integrated {
     let rotation = bodies.rotation[dense];
     let linear = bodies.linear[dense];
     let angular = bodies.angular[dense];
-    match bodies.kind[dense] {
-        BodyKind::Static => Integrated {
-            position: Some(GridPosition { cell, local }),
+    if bodies.kind[dense] != BodyKind::Dynamic {
+        return Integrated {
+            position: None,
             rotation,
             linear,
             angular,
             momentum: Vec3::ZERO,
-        },
-        BodyKind::Kinematic => Integrated {
-            position: GridPosition {
-                cell,
-                local: local + linear * dt,
-            }
-            .rebased(),
-            rotation: spin(rotation, angular, dt),
-            linear,
-            angular,
-            momentum: Vec3::ZERO,
-        },
-        BodyKind::Dynamic => {
-            let inverse_mass = bodies.inverse_mass[dense];
-            let inverse_inertia = bodies.inverse_inertia[dense];
-            let gravity = frame_gravity[bodies.frame[dense].0 as usize];
-            let next_linear = linear + (gravity + bodies.force[dense] * inverse_mass) * dt;
+            touched: false,
+        };
+    }
+    let gravity = frame_gravity[bodies.frame[dense].0 as usize];
+    let momentum = bodies.momentum[dense] + bodies.torque[dense] * dt;
+    Integrated {
+        position: None,
+        rotation,
+        linear: linear + (gravity + bodies.force[dense] * bodies.inverse_mass[dense]) * dt,
+        angular: apply_diagonal(rotation, bodies.inverse_inertia[dense], momentum),
+        momentum,
+        touched: false,
+    }
+}
 
-            let momentum = bodies.momentum[dense] + bodies.torque[dense] * dt;
-            let next_rotation = tumble(rotation, inverse_inertia, momentum, dt);
-            Integrated {
-                position: GridPosition {
-                    cell,
-                    local: local + next_linear * dt,
-                }
-                .rebased(),
-                rotation: next_rotation,
-                linear: next_linear,
-                angular: apply_diagonal(next_rotation, inverse_inertia, momentum),
-                momentum,
+fn integrate_position(bodies: &Bodies, dense: usize, slot: &mut Integrated, dt: f32) {
+    let cell = bodies.cell[dense];
+    let local = bodies.local[dense];
+    match bodies.kind[dense] {
+        BodyKind::Static => {
+            slot.position = Some(GridPosition { cell, local });
+        }
+        BodyKind::Kinematic => {
+            slot.position = GridPosition {
+                cell,
+                local: local + slot.linear * dt,
             }
+            .rebased();
+            slot.rotation = spin(slot.rotation, slot.angular, dt);
+        }
+        BodyKind::Dynamic => {
+            let inverse_inertia = bodies.inverse_inertia[dense];
+            if slot.touched {
+                slot.momentum = momentum_from_velocity(
+                    BodyKind::Dynamic,
+                    slot.rotation,
+                    inverse_inertia,
+                    slot.angular,
+                );
+            }
+            slot.position = GridPosition {
+                cell,
+                local: local + slot.linear * dt,
+            }
+            .rebased();
+            slot.rotation = tumble(slot.rotation, inverse_inertia, slot.momentum, dt);
+            slot.angular = apply_diagonal(slot.rotation, inverse_inertia, slot.momentum);
         }
     }
 }

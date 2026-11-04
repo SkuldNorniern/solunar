@@ -1,6 +1,8 @@
 use algebrix::{IVec3, Quat, Vec3};
 
-use crate::{FrameId, GridPosition, MassProperties, Material, PhysicsError, Shape};
+use crate::{
+    CollisionFilter, FrameId, GridPosition, MassProperties, Material, PhysicsError, Shape,
+};
 
 const FREE: u32 = u32::MAX;
 
@@ -22,6 +24,7 @@ pub struct RigidBodyDesc {
     pub kind: BodyKind,
     pub shape: Shape,
     pub material: Material,
+    pub filter: CollisionFilter,
     pub frame: FrameId,
     pub position: GridPosition,
     pub rotation: Quat,
@@ -35,6 +38,7 @@ impl RigidBodyDesc {
             kind,
             shape,
             material: Material::default(),
+            filter: CollisionFilter::default(),
             frame: FrameId::ROOT,
             position: GridPosition::ORIGIN,
             rotation: Quat::IDENTITY,
@@ -57,6 +61,11 @@ impl RigidBodyDesc {
 
     pub fn material(mut self, material: Material) -> Self {
         self.material = material;
+        self
+    }
+
+    pub fn filter(mut self, filter: CollisionFilter) -> Self {
+        self.filter = filter;
         self
     }
 
@@ -138,6 +147,7 @@ pub(crate) struct Bodies {
     pub(crate) frame: Vec<FrameId>,
     pub(crate) shape: Vec<Shape>,
     pub(crate) material: Vec<Material>,
+    pub(crate) filter: Vec<CollisionFilter>,
 }
 
 impl Bodies {
@@ -151,6 +161,14 @@ impl Bodies {
                 Ok(slot.dense as usize)
             }
             _ => Err(PhysicsError::InvalidHandle),
+        }
+    }
+
+    pub(crate) fn handle_at(&self, dense: usize) -> BodyHandle {
+        let index = self.owner[dense];
+        BodyHandle {
+            index,
+            generation: self.slots[index as usize].generation,
         }
     }
 
@@ -200,6 +218,7 @@ impl Bodies {
         self.frame.push(desc.frame);
         self.shape.push(desc.shape);
         self.material.push(desc.material);
+        self.filter.push(desc.filter);
         Ok(BodyHandle { index, generation })
     }
 
@@ -220,6 +239,7 @@ impl Bodies {
         self.frame.swap_remove(dense);
         self.shape.swap_remove(dense);
         self.material.swap_remove(dense);
+        self.filter.swap_remove(dense);
         if let Some(moved) = self.owner.get(dense) {
             self.slots[*moved as usize].dense = dense as u32;
         }

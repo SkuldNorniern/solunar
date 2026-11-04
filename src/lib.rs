@@ -9,6 +9,7 @@ mod position;
 mod profile;
 mod shape;
 mod snapshot;
+mod solver;
 mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};

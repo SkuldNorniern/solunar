@@ -4,19 +4,22 @@ use std::fmt;
 use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 
 use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
+use crate::collision::MAX_CONTACTS;
+use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
-    BodyKind, FrameDesc, FrameId, Frames, GridPosition, Material, PhysicsSettings, PhysicsWorld,
-    RigidBodyDesc, Shape,
+    BodyHandle, BodyKind, CollisionFilter, FrameDesc, FrameId, Frames, GridPosition, Material,
+    PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 const HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
 const FRAME_BYTES: usize = 4 + 8 * 13;
 const SLOT_BYTES: usize = 8;
-const BODY_BYTES: usize = 4 + 1 + 1 + 4 * 3 + 4 * 3 + 4 + 4 * 3 + 4 * 3 + 4 * 4 + 4 * 3 * 5;
+const BODY_BYTES: usize = 4 + 1 + 1 + 4 * 3 + 4 * 3 + 4 * 2 + 4 + 4 * 3 + 4 * 3 + 4 * 4 + 4 * 3 * 5;
+const MANIFOLD_BYTES: usize = 4 * 4 + 1;
 const FREE_SLOT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +117,8 @@ impl PhysicsWorld {
             out.f32(material.density);
             out.f32(material.friction);
             out.f32(material.restitution);
+            out.u32(bodies.filter[dense].layers);
+            out.u32(bodies.filter[dense].mask);
             out.u32(bodies.frame[dense].index());
             let cell = bodies.cell[dense];
             out.i32(cell.x);
@@ -128,6 +133,19 @@ impl PhysicsWorld {
             out.vec3(bodies.momentum[dense]);
             out.vec3(bodies.force[dense]);
             out.vec3(bodies.torque[dense]);
+        }
+
+        out.len(self.contact_cache.len());
+        for manifold in &self.contact_cache {
+            out.u32(manifold.a.index);
+            out.u32(manifold.a.generation);
+            out.u32(manifold.b.index);
+            out.u32(manifold.b.generation);
+            out.u8(manifold.count as u8);
+            for point in &manifold.points[..manifold.count] {
+                out.vec3(point.local_a);
+                out.vec3(point.impulse);
+            }
         }
 
         let checksum = fnv1a(&out.data);
@@ -196,16 +214,13 @@ impl PhysicsWorld {
 
         let frames = read_frames(&mut reader, limits)?;
         let bodies = read_bodies(&mut reader, &frames, limits)?;
+        let contact_cache = read_contacts(&mut reader, limits)?;
         if reader.at != reader.data.len() {
             return Err(SnapshotError::Invalid("trailing data"));
         }
-        Ok(Self::from_parts(
-            settings,
-            frames,
-            bodies,
-            tick,
-            accumulator,
-        ))
+        let mut world = Self::from_parts(settings, frames, bodies, tick, accumulator);
+        world.contact_cache = contact_cache;
+        Ok(world)
     }
 }
 
@@ -304,6 +319,10 @@ fn read_body(
         friction: reader.f32()?,
         restitution: reader.f32()?,
     };
+    let filter = CollisionFilter {
+        layers: reader.u32()?,
+        mask: reader.u32()?,
+    };
     let frame = FrameId(reader.u32()?);
     if !frames.contains(frame) {
         return Err(SnapshotError::Invalid("body frame"));
@@ -332,6 +351,7 @@ fn read_body(
         kind,
         shape,
         material,
+        filter,
         frame,
         position,
         rotation,
@@ -356,7 +376,50 @@ fn read_body(
     bodies.frame.push(frame);
     bodies.shape.push(shape);
     bodies.material.push(material);
+    bodies.filter.push(filter);
     Ok(())
+}
+
+fn read_contacts(
+    reader: &mut Reader<'_>,
+    limits: &SnapshotLimits,
+) -> Result<Vec<CachedManifold>, SnapshotError> {
+    let count = reader.count(MANIFOLD_BYTES, limits.max_slots)?;
+    let mut cache: Vec<CachedManifold> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let a = BodyHandle {
+            index: reader.u32()?,
+            generation: reader.u32()?,
+        };
+        let b = BodyHandle {
+            index: reader.u32()?,
+            generation: reader.u32()?,
+        };
+        let points_count = reader.u8()? as usize;
+        if points_count == 0 || points_count > MAX_CONTACTS {
+            return Err(SnapshotError::Invalid("contact count"));
+        }
+        // the solver finds entries by binary search
+        if cache.last().is_some_and(|last| (last.a, last.b) >= (a, b)) {
+            return Err(SnapshotError::Invalid("contact order"));
+        }
+        let mut points = [CachedPoint::default(); MAX_CONTACTS];
+        for point in &mut points[..points_count] {
+            point.local_a = reader.vec3()?;
+            point.impulse = reader.vec3()?;
+            // the normal impulse only ever pushes apart
+            if !point.local_a.is_finite() || !point.impulse.is_finite() || point.impulse.x < 0.0 {
+                return Err(SnapshotError::Invalid("contact"));
+            }
+        }
+        cache.push(CachedManifold {
+            a,
+            b,
+            points,
+            count: points_count,
+        });
+    }
+    Ok(cache)
 }
 
 fn kind_tag(kind: BodyKind) -> u8 {
@@ -670,7 +733,7 @@ mod tests {
         );
     }
 
-    const GOLDEN_HASH: u64 = 11172332768420601478;
+    const GOLDEN_HASH: u64 = 4417293472329182613;
 
     #[test]
     fn every_truncation_fails() {
@@ -716,6 +779,70 @@ mod tests {
                 let _ = world.step_fixed();
             }
         }
+    }
+
+    fn sample_in_contact() -> PhysicsWorld {
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 1.0, 50.0)))
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+        for level in 0..3 {
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))
+                        .local_position(Vec3::new(0.0, 0.5 + level as f32, 0.0)),
+                )
+                .unwrap();
+        }
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+        }
+        assert!(!world.contact_cache.is_empty());
+        world
+    }
+
+    #[test]
+    fn contact_cache_round_trips() {
+        let world = sample_in_contact();
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.contact_cache, world.contact_cache);
+    }
+
+    #[test]
+    fn corrupt_contact_cache_never_panics() {
+        let bytes = sample_in_contact().save_snapshot();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let tail = 4 * (MANIFOLD_BYTES + 24 * MAX_CONTACTS);
+        for _ in 0..20_000 {
+            let mut bad = bytes.clone();
+            let body_end = bad.len() - CHECKSUM_BYTES;
+            for _ in 0..=(next() % 3) {
+                let at = body_end - 1 - (next() as usize) % tail.min(body_end);
+                bad[at] = next() as u8;
+            }
+            if let Ok(mut world) = PhysicsWorld::load_snapshot(&resealed(bad)) {
+                let _ = world.step_fixed();
+            }
+        }
+    }
+
+    #[test]
+    fn unsorted_contact_cache_fails() {
+        let mut world = sample_in_contact();
+        world.contact_cache.reverse();
+        assert_eq!(
+            PhysicsWorld::load_snapshot(&world.save_snapshot()).err(),
+            Some(SnapshotError::Invalid("contact order"))
+        );
     }
 
     #[test]
