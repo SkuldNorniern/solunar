@@ -1,0 +1,16 @@
+[package]
+name = "solunar"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone rigid body physics engine"
+license = "Apache-2.0"
+repository = "https://github.com/SkuldNorniern/solunar"
+
+[dependencies]
+algebrix = { git = "https://github.com/SkuldNorniern/algebrix", rev = "1bf888b98936f382f1def04ce06b15fbbfcdd46d", default-features = false, features = ["std"] }
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
