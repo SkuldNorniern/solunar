@@ -7,6 +7,7 @@ mod material;
 mod position;
 mod profile;
 mod shape;
+mod snapshot;
 mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
@@ -19,4 +20,5 @@ pub use material::Material;
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::StepReport;
 pub use shape::{MassProperties, Shape};
+pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};
 pub use world::{Advance, PhysicsSettings, PhysicsWorld};

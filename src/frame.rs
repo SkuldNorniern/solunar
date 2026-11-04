@@ -86,6 +86,12 @@ impl Frames {
     /// # Errors
     /// Fails on an unknown parent, a chain past [`MAX_FRAME_DEPTH`], non finite values or a zero rotation.
     pub fn add(&mut self, desc: FrameDesc) -> Result<FrameId, PhysicsError> {
+        let rotation = validated_rotation(desc.rotation)?;
+        self.restore(FrameDesc { rotation, ..desc })
+    }
+
+    /// Same checks as [`Self::add`], but keeps the rotation bits as they are.
+    pub(crate) fn restore(&mut self, desc: FrameDesc) -> Result<FrameId, PhysicsError> {
         let parent_depth = *self
             .depths
             .get(desc.parent.0 as usize)
@@ -94,7 +100,10 @@ impl Frames {
         if depth as usize > MAX_FRAME_DEPTH {
             return Err(PhysicsError::FrameTooDeep);
         }
-        let rotation = validated_rotation(desc.rotation)?;
+        let error = (length_squared(desc.rotation) - 1.0).abs();
+        if error.is_nan() || error >= 1e-6 {
+            return Err(PhysicsError::NonFinite("frame rotation"));
+        }
         if !finite(desc.translation)
             || !finite(desc.linear_velocity)
             || !finite(desc.angular_velocity)
@@ -102,9 +111,13 @@ impl Frames {
             return Err(PhysicsError::NonFinite("frame"));
         }
         let id = u32::try_from(self.descs.len()).map_err(|_| PhysicsError::OutOfRange)?;
-        self.descs.push(FrameDesc { rotation, ..desc });
+        self.descs.push(desc);
         self.depths.push(depth);
         Ok(FrameId(id))
+    }
+
+    pub(crate) fn descs(&self) -> &[FrameDesc] {
+        &self.descs
     }
 
     pub fn root_rotation(&self, frame: FrameId) -> Result<DQuat, PhysicsError> {
@@ -198,14 +211,18 @@ fn finite(v: DVec3) -> bool {
 }
 
 fn validated_rotation(rotation: DQuat) -> Result<DQuat, PhysicsError> {
-    let length_squared = rotation.x * rotation.x
-        + rotation.y * rotation.y
-        + rotation.z * rotation.z
-        + rotation.w * rotation.w;
-    if !length_squared.is_finite() || length_squared < 1e-12 {
+    let squared = length_squared(rotation);
+    if !squared.is_finite() || squared < 1e-12 {
         return Err(PhysicsError::NonFinite("frame rotation"));
     }
     Ok(rotation.normalize())
+}
+
+fn length_squared(rotation: DQuat) -> f64 {
+    rotation.x * rotation.x
+        + rotation.y * rotation.y
+        + rotation.z * rotation.z
+        + rotation.w * rotation.w
 }
 
 #[cfg(test)]
