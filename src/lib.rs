@@ -1,4 +1,5 @@
 mod body;
+mod collision;
 mod command;
 mod dispatch;
 mod error;
@@ -12,6 +13,7 @@ mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 pub use body::{BodyHandle, BodyKind, BodyState, RigidBodyDesc};
+pub use collision::CollisionFilter;
 pub use command::{ApplyReport, Command, CommandBuffer};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
