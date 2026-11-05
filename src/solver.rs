@@ -1,3 +1,9 @@
+use std::any::Any;
+use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
@@ -7,7 +13,7 @@ use crate::joint::{
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
 use crate::world::Integrated;
-use crate::{BodyHandle, BodyKind, Shape};
+use crate::{BodyHandle, BodyKind, JobDispatch, Shape};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
@@ -21,6 +27,125 @@ const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
 const RESTITUTION_THRESHOLD: f32 = 1.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
+/// Constraints in one block of work. A block is the smallest piece a thread takes.
+const COLOR_CHUNK: usize = if cfg!(miri) { 2 } else { 64 };
+/// Below this many blocks in a substep the solve stays on the calling thread.
+const PARALLEL_BLOCKS: usize = if cfg!(miri) { 2 } else { 8 };
+/// Spins before a waiting thread yields.
+const SPINS: u32 = 64;
+/// Colors smaller than this, next to each other, go in one block, one color after another.
+/// A barrier per tiny color cost more than solving them on one thread.
+const SMALL_COLOR: usize = 2 * COLOR_CHUNK;
+/// A stage this many blocks wide keeps one more thread busy.
+const BLOCKS_PER_WORKER: usize = if cfg!(miri) { 1 } else { 4 };
+/// Constraints that find no free color among these go in one more, solved in order.
+const COLORS: usize = 64;
+/// Islands with fewer constraints keep the plain in order sweep, one island per job. Colors
+/// carry load down a stack slower, a 16 box stack fell, so only big islands get them.
+const COLORED_ISLAND: usize = if cfg!(miri) { 8 } else { 1024 };
+
+/// The part of a body the iterations change. Positions and turns stay put during them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Motion {
+    pub(crate) linear: Vec3,
+    pub(crate) angular: Vec3,
+    pub(crate) recovery_linear: Vec3,
+    pub(crate) recovery_angular: Vec3,
+    pub(crate) touched: bool,
+}
+
+/// The two bodies of one constraint. A dynamic one is the real body, a static or kinematic one
+/// is a copy, the iterations never move it.
+pub(crate) struct Pair<'a> {
+    pub(crate) a: &'a mut Motion,
+    pub(crate) b: &'a mut Motion,
+}
+
+/// A constraint in solve order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    Point(u32),
+    Row(u32),
+    Manifold(u32),
+}
+
+/// Constraints put in colors, so no two in a color share a dynamic body. Colors go one after
+/// another, a color can go on many threads and still give what one thread does.
+#[derive(Debug, Clone, Default)]
+struct Colors {
+    used: Vec<u64>,
+    color: Vec<u8>,
+    order: Vec<Item>,
+    items: Vec<Item>,
+    ends: Vec<u32>,
+    /// Small islands, each solved in order by one job.
+    serial: Vec<Item>,
+    serial_ends: Vec<u32>,
+    /// Islands grouped into blocks of about a chunk of constraints.
+    runs: Vec<u32>,
+    stages: Vec<Stage>,
+}
+
+/// Blocks that may run at once. Every block of a stage is done before the next one starts.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Islands {
+        blocks: u32,
+    },
+    /// Colors `first` to `last`. More than one is a single block.
+    Colors {
+        first: u32,
+        last: u32,
+        pass: Pass,
+        reverse: bool,
+        blocks: u32,
+    },
+}
+
+impl Stage {
+    fn blocks(self) -> usize {
+        match self {
+            Self::Islands { blocks } | Self::Colors { blocks, .. } => blocks as usize,
+        }
+    }
+}
+
+/// Lets the jobs of one color reach their own constraints and bodies at once.
+struct Shared<'a, T> {
+    ptr: *mut T,
+    len: usize,
+    marker: PhantomData<&'a mut [T]>,
+}
+
+// SAFETY: jobs only use indexes no other job of the same color touches, see `solve_color`.
+unsafe impl<T: Send> Sync for Shared<'_, T> {}
+
+impl<'a, T: Copy> Shared<'a, T> {
+    fn new(slice: &'a mut [T]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+            marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// No other job may write `index` while this runs.
+    unsafe fn read(&self, index: usize) -> T {
+        assert!(index < self.len);
+        // SAFETY: in bounds, and the caller keeps writers of `index` out.
+        unsafe { self.ptr.add(index).read() }
+    }
+
+    /// # Safety
+    /// No other job may use `index` while the reference lives.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self, index: usize) -> &mut T {
+        assert!(index < self.len);
+        // SAFETY: in bounds, and the caller gives each index to one job only.
+        unsafe { &mut *self.ptr.add(index) }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct CachedPoint {
@@ -86,6 +211,8 @@ pub(crate) struct ContactScratch {
     joint_rows: Vec<JointRow>,
     joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
     islands: Islands,
+    colors: Colors,
+    motions: Vec<Motion>,
 }
 
 /// Awake dynamic bodies joined by contacts and joints. Static, kinematic and sleeping bodies
@@ -367,7 +494,7 @@ pub(crate) fn solve_substep(
     state: &mut [Integrated],
     scratch: &mut ContactScratch,
     (substep, last): (u32, bool),
-    dt: f32,
+    (dispatch, dt): (&dyn JobDispatch, f32),
 ) {
     build_rows(
         joints,
@@ -400,12 +527,32 @@ pub(crate) fn solve_substep(
     for manifold in &mut scratch.manifolds {
         refresh_manifold(bodies, state, manifold, last, dt);
     }
-    for island in 0..count {
-        let islands = &scratch.islands;
-        let points = &mut scratch.joint_points[Islands::range(&islands.point_ends, island)];
-        let rows = &mut scratch.joint_rows[Islands::range(&islands.row_ends, island)];
-        let manifolds = &mut scratch.manifolds[Islands::range(&islands.manifold_ends, island)];
-        solve_island(bodies, state, (points, rows, manifolds), substep);
+    color_constraints(bodies, scratch);
+    scratch.motions.clear();
+    scratch.motions.extend(state.iter().map(|body| Motion {
+        linear: body.linear,
+        angular: body.angular,
+        recovery_linear: body.recovery_linear,
+        recovery_angular: body.recovery_angular,
+        touched: body.touched,
+    }));
+    let shared = (
+        Shared::new(&mut scratch.motions),
+        Shared::new(&mut scratch.joint_points),
+        Shared::new(&mut scratch.joint_rows),
+        Shared::new(&mut scratch.manifolds),
+    );
+    plan_stages(&mut scratch.colors, substep);
+    let colors = &scratch.colors;
+    run_stages(&colors.stages, dispatch, &|stage, block| {
+        solve_block(bodies, colors, &shared, stage, block, substep);
+    });
+    for (body, motion) in state.iter_mut().zip(&scratch.motions) {
+        body.linear = motion.linear;
+        body.angular = motion.angular;
+        body.recovery_linear = motion.recovery_linear;
+        body.recovery_angular = motion.recovery_angular;
+        body.touched = motion.touched;
     }
     capture_impulses(
         &scratch.joint_points,
@@ -414,55 +561,381 @@ pub(crate) fn solve_substep(
     );
 }
 
-/// Islands share no moving body, so solving one after another gives what one big sweep did.
-fn solve_island(
-    bodies: &Bodies,
-    state: &mut [Integrated],
-    (points, rows, manifolds): (&mut [JointPoint], &mut [JointRow], &mut [SolverManifold]),
-    substep: u32,
-) {
-    for point in points.iter() {
-        warm_start_point(bodies, state, point);
+impl Colors {
+    fn count(&self) -> usize {
+        self.ends.len()
     }
-    for row in rows.iter() {
-        warm_start_row(state, row);
+
+    fn of(&self, color: usize) -> &[Item] {
+        let start = if color == 0 { 0 } else { self.ends[color - 1] };
+        &self.items[start as usize..self.ends[color] as usize]
     }
-    for manifold in manifolds.iter() {
-        warm_start(state, manifold);
+}
+
+/// Greedy, in island order: each constraint takes the lowest color neither of its dynamic
+/// bodies has. Static and kinematic bodies are only read, any number share them.
+fn color_constraints(bodies: &Bodies, scratch: &mut ContactScratch) {
+    let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
+    let colors = &mut scratch.colors;
+    colors.used.clear();
+    colors.used.resize(bodies.len(), 0);
+    colors.color.clear();
+    colors.items.clear();
+    colors.order.clear();
+    colors.serial.clear();
+    colors.serial_ends.clear();
+    let islands = &scratch.islands;
+    for island in 0..islands.count() {
+        let points = Islands::range(&islands.point_ends, island);
+        let rows = Islands::range(&islands.row_ends, island);
+        let manifolds = Islands::range(&islands.manifold_ends, island);
+        let size = points.len() + rows.len() + manifolds.len();
+        let out = if size < COLORED_ISLAND {
+            &mut colors.serial
+        } else {
+            &mut colors.order
+        };
+        out.extend(points.map(|index| Item::Point(index as u32)));
+        out.extend(rows.map(|index| Item::Row(index as u32)));
+        out.extend(manifolds.map(|index| Item::Manifold(index as u32)));
+        if size < COLORED_ISLAND {
+            colors.serial_ends.push(colors.serial.len() as u32);
+        }
     }
+    colors.runs.clear();
+    colors.runs.push(0);
+    let mut start = 0;
+    for (index, end) in colors.serial_ends.iter().enumerate() {
+        if (end - start) as usize >= COLOR_CHUNK {
+            colors.runs.push(index as u32 + 1);
+            start = *end;
+        }
+    }
+    if *colors.runs.last().unwrap_or(&0) as usize != colors.serial_ends.len() {
+        colors.runs.push(colors.serial_ends.len() as u32);
+    }
+    let order = std::mem::take(&mut colors.order);
+    let mut counts = [0_u32; COLORS + 1];
+    for item in &order {
+        let (a, b) = match *item {
+            Item::Point(index) => scratch.joint_points[index as usize].bodies(),
+            Item::Row(index) => scratch.joint_rows[index as usize].bodies(),
+            Item::Manifold(index) => {
+                let manifold = &scratch.manifolds[index as usize];
+                (manifold.a, manifold.b)
+            }
+        };
+        let mask = |dense: usize| {
+            if dynamic(dense) {
+                colors.used[dense]
+            } else {
+                0
+            }
+        };
+        let taken = mask(a) | mask(b);
+        let color = (!taken).trailing_zeros() as usize;
+        if color < COLORS {
+            let bit = 1_u64 << color;
+            for dense in [a, b] {
+                if dynamic(dense) {
+                    colors.used[dense] |= bit;
+                }
+            }
+        }
+        let color = color.min(COLORS);
+        colors.color.push(color as u8);
+        counts[color] += 1;
+    }
+    let last = counts
+        .iter()
+        .rposition(|count| *count > 0)
+        .map_or(0, |at| at + 1);
+    colors.ends.clear();
+    let mut next = 0;
+    for count in &counts[..last] {
+        next += count;
+        colors.ends.push(next);
+    }
+    let mut slot: Vec<u32> = std::iter::once(0)
+        .chain(colors.ends.iter().copied())
+        .take(last)
+        .collect();
+    colors.items.resize(order.len(), Item::Point(0));
+    for (item, color) in order.iter().zip(&colors.color) {
+        let at = &mut slot[*color as usize];
+        colors.items[*at as usize] = *item;
+        *at += 1;
+    }
+    colors.order = order;
+}
+
+/// Small islands in one stage, then each pass of the colored solve, color by color.
+fn plan_stages(colors: &mut Colors, substep: u32) {
+    let mut stages = std::mem::take(&mut colors.stages);
+    stages.clear();
+    if colors.runs.len() > 1 {
+        stages.push(Stage::Islands {
+            blocks: colors.runs.len() as u32 - 1,
+        });
+    }
+    // runs of colors: a big one alone, small neighbours together in one block
+    let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+    for color in 0..colors.count() {
+        let size = colors.of(color).len();
+        let small = color == COLORS || size < SMALL_COLOR;
+        match groups.last_mut() {
+            Some((_, last, blocks)) if small && *blocks == 1 && *last + 1 == color => {
+                *last = color;
+            }
+            _ if size == 0 => {}
+            _ => {
+                let blocks = if small { 1 } else { size.div_ceil(COLOR_CHUNK) };
+                groups.push((color, color, blocks));
+            }
+        }
+    }
+    let mut sweep = |pass, reverse: bool| {
+        let mut push = |&(first, last, blocks): &(usize, usize, usize)| {
+            stages.push(Stage::Colors {
+                first: first as u32,
+                last: last as u32,
+                pass,
+                reverse,
+                blocks: blocks as u32,
+            });
+        };
+        if reverse {
+            groups.iter().rev().for_each(&mut push);
+        } else {
+            groups.iter().for_each(&mut push);
+        }
+    };
+    sweep(Pass::WarmStart, false);
     // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
     for iteration in 0..VELOCITY_ITERATIONS {
-        if (substep as usize + iteration).is_multiple_of(2) {
-            for point in points.iter_mut() {
-                solve_point(bodies, state, point);
+        sweep(
+            Pass::Velocity,
+            !(substep as usize + iteration).is_multiple_of(2),
+        );
+    }
+    for _ in 0..RECOVERY_ITERATIONS {
+        sweep(Pass::Recovery, false);
+    }
+    colors.stages = stages;
+}
+
+/// One block of a stage. Islands go start to end: warm start, sweeps both ways, recovery.
+fn solve_block(
+    bodies: &Bodies,
+    colors: &Colors,
+    shared: &SharedParts<'_>,
+    stage: Stage,
+    block: usize,
+    substep: u32,
+) {
+    // SAFETY: a block owns its constraints and their dynamic bodies for its stage. Islands share
+    // no dynamic body, and inside one color no two constraints do. The overflow color is one
+    // block. Static and kinematic bodies are only read, nobody writes them during the solve.
+    let go = |item: &Item, pass| unsafe { solve_item(bodies, *item, shared, pass) };
+    match stage {
+        Stage::Islands { .. } => {
+            let (first, last) = (colors.runs[block] as usize, colors.runs[block + 1] as usize);
+            for index in first..last {
+                let start = if index == 0 {
+                    0
+                } else {
+                    colors.serial_ends[index - 1]
+                };
+                let items = &colors.serial[start as usize..colors.serial_ends[index] as usize];
+                items.iter().for_each(|item| go(item, Pass::WarmStart));
+                for iteration in 0..VELOCITY_ITERATIONS {
+                    if (substep as usize + iteration).is_multiple_of(2) {
+                        items.iter().for_each(|item| go(item, Pass::Velocity));
+                    } else {
+                        items.iter().rev().for_each(|item| go(item, Pass::Velocity));
+                    }
+                }
+                for _ in 0..RECOVERY_ITERATIONS {
+                    items.iter().for_each(|item| go(item, Pass::Recovery));
+                }
             }
-            for row in rows.iter_mut() {
-                solve_row(state, row);
+        }
+        Stage::Colors {
+            first,
+            last,
+            pass,
+            reverse,
+            ..
+        } => {
+            let run = |items: &[Item]| {
+                if reverse {
+                    items.iter().rev().for_each(|item| go(item, pass));
+                } else {
+                    items.iter().for_each(|item| go(item, pass));
+                }
+            };
+            if first != last {
+                let range = first as usize..=last as usize;
+                if reverse {
+                    range.rev().for_each(|color| run(colors.of(color)));
+                } else {
+                    range.for_each(|color| run(colors.of(color)));
+                }
+                return;
             }
-            for manifold in manifolds.iter_mut() {
-                solve_manifold(state, manifold);
-            }
-        } else {
-            for manifold in manifolds.iter_mut().rev() {
-                solve_manifold(state, manifold);
-            }
-            for row in rows.iter_mut().rev() {
-                solve_row(state, row);
-            }
-            for point in points.iter_mut().rev() {
-                solve_point(bodies, state, point);
+            let items = colors.of(first as usize);
+            if first as usize == COLORS {
+                run(items);
+            } else {
+                let start = block * COLOR_CHUNK;
+                run(&items[start..(start + COLOR_CHUNK).min(items.len())]);
             }
         }
     }
-    for _ in 0..RECOVERY_ITERATIONS {
-        for point in points.iter_mut() {
-            solve_point_recovery(bodies, state, point);
+}
+
+/// Runs every block of every stage, in stage order. One dispatch for all of them: job 0 takes
+/// blocks too and moves on to the next stage once every block of this one is done, the other
+/// jobs take blocks while there are some. Job 0 never waits for another job to start, so a
+/// dispatcher that runs jobs one after another still finishes, job 0 just does all of it.
+fn run_stages(stages: &[Stage], dispatch: &dyn JobDispatch, run: &(dyn Fn(Stage, usize) + Sync)) {
+    let total: usize = stages.iter().map(|stage| stage.blocks()).sum();
+    let widest = stages.iter().map(|stage| stage.blocks()).max().unwrap_or(0);
+    let workers = dispatch
+        .parallelism()
+        .min(widest.div_ceil(BLOCKS_PER_WORKER));
+    if workers < 2 || total < PARALLEL_BLOCKS {
+        for stage in stages {
+            (0..stage.blocks()).for_each(|block| run(*stage, block));
         }
-        for row in rows.iter_mut() {
-            solve_row_recovery(state, row);
+        return;
+    }
+    let current = AtomicUsize::new(0);
+    let claimed: Vec<AtomicU32> = stages.iter().map(|_| AtomicU32::new(0)).collect();
+    let done: Vec<AtomicU32> = stages.iter().map(|_| AtomicU32::new(0)).collect();
+    let failure: Mutex<Option<Box<dyn Any + Send>>> = Mutex::new(None);
+    // a block that panics still counts as done, so nobody waits on it forever
+    let take = |index: usize| -> bool {
+        let stage = stages[index];
+        let block = claimed[index].fetch_add(1, Ordering::Relaxed) as usize;
+        if block >= stage.blocks() {
+            return false;
         }
-        for manifold in manifolds.iter_mut() {
-            solve_recovery(state, manifold);
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run(stage, block))) {
+            let mut slot = failure.lock().unwrap_or_else(|poison| poison.into_inner());
+            slot.get_or_insert(panic);
+        }
+        done[index].fetch_add(1, Ordering::Release);
+        true
+    };
+    dispatch.run(workers, &|job| {
+        if job == 0 {
+            for (index, stage) in stages.iter().enumerate() {
+                while take(index) {}
+                let mut spins = 0;
+                while (done[index].load(Ordering::Acquire) as usize) < stage.blocks() {
+                    wait(&mut spins);
+                }
+                current.store(index + 1, Ordering::Release);
+            }
+            return;
+        }
+        let mut index = current.load(Ordering::Acquire);
+        let mut spins = 0;
+        while index < stages.len() {
+            if take(index) {
+                spins = 0;
+                continue;
+            }
+            wait(&mut spins);
+            index = current.load(Ordering::Acquire);
+        }
+    });
+    if let Some(panic) = failure
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        resume_unwind(panic);
+    }
+}
+
+fn wait(spins: &mut u32) {
+    if *spins < SPINS {
+        *spins += 1;
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    WarmStart,
+    Velocity,
+    Recovery,
+}
+
+type SharedParts<'a> = (
+    Shared<'a, Motion>,
+    Shared<'a, JointPoint>,
+    Shared<'a, JointRow>,
+    Shared<'a, SolverManifold>,
+);
+
+/// # Safety
+/// No other running job may use this constraint or its dynamic bodies.
+unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass: Pass) {
+    let (states, points, rows, manifolds) = shared;
+    let (a, b) = match item {
+        // SAFETY: the caller gives this constraint to this job only.
+        Item::Point(index) => unsafe { points.get(index as usize) }.bodies(),
+        Item::Row(index) => unsafe { rows.get(index as usize) }.bodies(),
+        Item::Manifold(index) => {
+            let manifold = unsafe { manifolds.get(index as usize) };
+            (manifold.a, manifold.b)
+        }
+    };
+    let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
+    // SAFETY: a dynamic body of this constraint belongs to this job alone. Others are only
+    // read, nobody writes them during the solve.
+    let (mut copy_a, mut copy_b) = unsafe { (states.read(a), states.read(b)) };
+    let mut pair = Pair {
+        a: if dynamic(a) {
+            unsafe { states.get(a) }
+        } else {
+            &mut copy_a
+        },
+        b: if dynamic(b) {
+            unsafe { states.get(b) }
+        } else {
+            &mut copy_b
+        },
+    };
+    match item {
+        Item::Point(index) => {
+            // SAFETY: as above.
+            let point = unsafe { points.get(index as usize) };
+            match pass {
+                Pass::WarmStart => warm_start_point(&mut pair, point),
+                Pass::Velocity => solve_point(&mut pair, point),
+                Pass::Recovery => solve_point_recovery(&mut pair, point),
+            }
+        }
+        Item::Row(index) => {
+            let row = unsafe { rows.get(index as usize) };
+            match pass {
+                Pass::WarmStart => warm_start_row(&mut pair, row),
+                Pass::Velocity => solve_row(&mut pair, row),
+                Pass::Recovery => solve_row_recovery(&mut pair, row),
+            }
+        }
+        Item::Manifold(index) => {
+            let manifold = unsafe { manifolds.get(index as usize) };
+            match pass {
+                Pass::WarmStart => warm_start(&mut pair, manifold),
+                Pass::Velocity => solve_manifold(&mut pair, manifold),
+                Pass::Recovery => solve_recovery(&mut pair, manifold),
+            }
         }
     }
 }
@@ -719,88 +1192,89 @@ fn matching_impulse(
     })
 }
 
-fn warm_start(state: &mut [Integrated], manifold: &SolverManifold) {
+fn warm_start(pair: &mut Pair, manifold: &SolverManifold) {
     for point in &manifold.points[..manifold.count] {
         for k in 0..3 {
-            push(state, manifold, point, k, point.impulse[k]);
+            push(
+                pair,
+                (&manifold.axes, manifold.inverse_mass),
+                point,
+                k,
+                point.impulse[k],
+            );
         }
     }
 }
 
-fn solve_manifold(state: &mut [Integrated], manifold: &mut SolverManifold) {
-    let shape = *manifold;
-    for point in &mut manifold.points[..shape.count] {
+fn solve_manifold(pair: &mut Pair, manifold: &mut SolverManifold) {
+    let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
+    let friction = manifold.friction;
+    for point in &mut manifold.points[..manifold.count] {
         // friction first, so the normal impulse has the last word on penetration
-        let limit = (shape.friction * point.impulse.x).max(0.0);
+        let limit = (friction * point.impulse.x).max(0.0);
         for k in 1..3 {
-            let speed = speed_along(state, &shape, point, k);
+            let speed = speed_along(pair, axes, point, k);
             let accumulated = point.impulse[k];
             // not `clamp`, it panics on a nan limit
             let next = (accumulated - speed * point.mass[k]).min(limit).max(-limit);
             point.impulse[k] = next;
-            push(state, &shape, point, k, next - accumulated);
+            push(pair, (axes, inverse), point, k, next - accumulated);
         }
-        let speed = speed_along(state, &shape, point, 0);
+        let speed = speed_along(pair, axes, point, 0);
         let next = (point.impulse.x + (point.target - speed) * point.mass.x).max(0.0);
         let change = next - point.impulse.x;
         point.impulse.x = next;
-        push(state, &shape, point, 0, change);
+        push(pair, (axes, inverse), point, 0, change);
     }
 }
 
 /// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
-fn solve_recovery(state: &mut [Integrated], manifold: &mut SolverManifold) {
-    let (a, b) = (manifold.a, manifold.b);
+fn solve_recovery(pair: &mut Pair, manifold: &mut SolverManifold) {
     let normal = manifold.axes[0];
     let [inverse_a, inverse_b] = manifold.inverse_mass;
     for point in &mut manifold.points[..manifold.count] {
-        let speed = (state[b].recovery_linear - state[a].recovery_linear).dot(normal)
-            + state[b].recovery_angular.dot(point.arm_b[0])
-            - state[a].recovery_angular.dot(point.arm_a[0]);
+        let (a, b) = (&mut *pair.a, &mut *pair.b);
+        let speed = (b.recovery_linear - a.recovery_linear).dot(normal)
+            + b.recovery_angular.dot(point.arm_b[0])
+            - a.recovery_angular.dot(point.arm_a[0]);
         let next = (point.recovery_impulse + (point.recovery - speed) * point.mass.x).max(0.0);
         let change = next - point.recovery_impulse;
         point.recovery_impulse = next;
         if inverse_a > 0.0 {
-            state[a].recovery_linear -= normal * (change * inverse_a);
-            state[a].recovery_angular -= point.turn_a[0] * change;
+            a.recovery_linear -= normal * (change * inverse_a);
+            a.recovery_angular -= point.turn_a[0] * change;
         }
         if inverse_b > 0.0 {
-            state[b].recovery_linear += normal * (change * inverse_b);
-            state[b].recovery_angular += point.turn_b[0] * change;
+            b.recovery_linear += normal * (change * inverse_b);
+            b.recovery_angular += point.turn_b[0] * change;
         }
     }
 }
 
 /// Speed of B against A at the point along axis `k`.
-fn speed_along(
-    state: &[Integrated],
-    manifold: &SolverManifold,
-    point: &SolverPoint,
-    k: usize,
-) -> f32 {
-    let (a, b) = (&state[manifold.a], &state[manifold.b]);
-    (b.linear - a.linear).dot(manifold.axes[k]) + b.angular.dot(point.arm_b[k])
+fn speed_along(pair: &Pair, axes: &[Vec3; 3], point: &SolverPoint, k: usize) -> f32 {
+    let (a, b) = (&*pair.a, &*pair.b);
+    (b.linear - a.linear).dot(axes[k]) + b.angular.dot(point.arm_b[k])
         - a.angular.dot(point.arm_a[k])
 }
 
 /// `impulse` along axis `k` on B, its opposite on A.
 fn push(
-    state: &mut [Integrated],
-    manifold: &SolverManifold,
+    pair: &mut Pair,
+    (axes, [inverse_a, inverse_b]): (&[Vec3; 3], [f32; 2]),
     point: &SolverPoint,
     k: usize,
     impulse: f32,
 ) {
-    let axis = manifold.axes[k];
-    let [inverse_a, inverse_b] = manifold.inverse_mass;
+    let axis = axes[k];
     if inverse_a > 0.0 {
-        let body = &mut state[manifold.a];
+        let body = &mut *pair.a;
         body.linear -= axis * (impulse * inverse_a);
         body.angular -= point.turn_a[k] * impulse;
         body.touched = true;
     }
     if inverse_b > 0.0 {
-        let body = &mut state[manifold.b];
+        let body = &mut *pair.b;
         body.linear += axis * (impulse * inverse_b);
         body.angular += point.turn_b[k] * impulse;
         body.touched = true;
@@ -843,9 +1317,56 @@ mod tests {
     use super::{Islands, group};
 
     use crate::{
-        BodyHandle, CollisionFilter, FrameDesc, FrameId, GridPosition, Material, PhysicsSettings,
-        PhysicsWorld, Quat, RigidBodyDesc, Shape, Vec3,
+        BodyHandle, CollisionFilter, FrameDesc, FrameId, GridPosition, JobDispatch, Material,
+        PhysicsSettings, PhysicsWorld, Quat, RigidBodyDesc, Sequential, Shape, Vec3,
     };
+
+    /// `threads` workers taking jobs off one counter.
+    struct Workers(usize);
+
+    impl JobDispatch for Workers {
+        fn parallelism(&self) -> usize {
+            self.0
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..self.0 {
+                    scope.spawn(|| {
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if index >= jobs {
+                                break;
+                            }
+                            job(index);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /// A pyramid with `base` boxes on the bottom row, all one island.
+    fn pyramid(base: usize) -> (PhysicsWorld, BodyHandle, Vec3) {
+        let mut world = world();
+        ground(&mut world);
+        let mut top = None;
+        for row in 0..base {
+            for column in 0..base - row {
+                let x = column as f32 * 1.05 - (base - row) as f32 * 0.525;
+                let at = Vec3::new(x, 0.5 + row as f32 * 1.0, 0.0);
+                let body = world
+                    .spawn(
+                        RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5))).local_position(at),
+                    )
+                    .unwrap();
+                top = Some((body, at));
+            }
+        }
+        let (body, at) = top.unwrap();
+        (world, body, at)
+    }
 
     fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
@@ -1256,6 +1777,65 @@ mod tests {
         run(&mut world, 1.0);
         let y = world.body_state(ball).unwrap().position.local.y;
         assert!((y - 0.25).abs() < 0.02, "{y}");
+    }
+
+    #[test]
+    fn small_pile_on_threads_matches_one_thread() {
+        // under miri the thresholds are tiny, so this takes the colored and threaded path
+        let run = |dispatch: &dyn JobDispatch| {
+            let (mut world, _, _) = pyramid(4);
+            let ball = world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::sphere(0.3))
+                        .local_position(Vec3::new(0.0, 6.0, 0.0)),
+                )
+                .unwrap();
+            let post = world
+                .spawn(RigidBodyDesc::fixed(Shape::sphere(0.1)))
+                .unwrap();
+            let joint = world
+                .joint_at(
+                    crate::JointDesc::ball(post, ball),
+                    GridPosition::from_local(Vec3::new(0.0, 7.0, 0.0)).unwrap(),
+                    Quat::IDENTITY,
+                )
+                .unwrap();
+            world.add_joint(joint).unwrap();
+            for _ in 0..if cfg!(miri) { 2 } else { 30 } {
+                world.step_with(dispatch).unwrap();
+            }
+            world.state_hash()
+        };
+        assert_eq!(run(&Workers(3)), run(&Sequential));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn big_pyramid_stands_when_colored() {
+        let (mut world, top, start) = pyramid(40);
+        world.step_fixed().unwrap();
+        let constraints = world.island_stats().largest_constraints;
+        assert!(constraints >= super::COLORED_ISLAND, "{constraints}");
+        for _ in 0..300 {
+            world.step_with(&Workers(4)).unwrap();
+        }
+        let now = world.body_state(top).unwrap().position.local;
+        assert!((now - start).length() < 0.1, "{start:?} {now:?}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn colored_solve_is_the_same_on_any_thread_count() {
+        let run = |dispatch: &dyn JobDispatch| {
+            let (mut world, _, _) = pyramid(40);
+            for _ in 0..60 {
+                world.step_with(dispatch).unwrap();
+            }
+            world.state_hash()
+        };
+        let one = run(&Sequential);
+        assert_eq!(run(&Workers(4)), one);
+        assert_eq!(run(&Workers(16)), one);
     }
 
     #[test]

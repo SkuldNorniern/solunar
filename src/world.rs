@@ -710,7 +710,7 @@ impl PhysicsWorld {
                 &mut self.scratch,
                 &mut self.contact_scratch,
                 (substep, substep + 1 == substeps),
-                part,
+                (dispatch, part),
             );
             lap(&mut phases.solve);
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {

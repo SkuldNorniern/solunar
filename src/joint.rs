@@ -1,6 +1,7 @@
 use algebrix::{Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal};
+use crate::solver::Pair;
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind, PhysicsError};
 
@@ -490,6 +491,9 @@ pub(crate) struct JointPoint {
     inverse_mass: [Vec3; 3],
     inverse_a: f32,
     inverse_b: f32,
+    /// World inverse inertia of each body as columns, at this substep's turn.
+    inertia_a: [Vec3; 3],
+    inertia_b: [Vec3; 3],
     impulse: Vec3,
     recovery: Vec3,
     recovery_impulse: Vec3,
@@ -542,6 +546,11 @@ fn build_point(
         unit * (inverse_a + inverse_b) + part(a, arm_a) + part(b, arm_b)
     };
     let matrix = [column(Vec3::X), column(Vec3::Y), column(Vec3::Z)];
+    let inertia = |dense: usize| {
+        let turn =
+            |unit: Vec3| apply_diagonal(poses[dense].rotation, bodies.inverse_inertia[dense], unit);
+        [turn(Vec3::X), turn(Vec3::Y), turn(Vec3::Z)]
+    };
     JointPoint {
         joint,
         a,
@@ -552,6 +561,8 @@ fn build_point(
         inverse_mass: inverted(&matrix).unwrap_or([Vec3::ZERO; 3]),
         inverse_a,
         inverse_b,
+        inertia_a: inertia(a),
+        inertia_b: inertia(b),
         impulse: axes[0] * impulses[0] + axes[1] * impulses[1] + axes[2] * impulses[2],
         recovery,
         recovery_impulse: Vec3::ZERO,
@@ -568,30 +579,20 @@ fn point_recovery(gap: Vec3, dt: f32) -> Vec3 {
     }
 }
 
-pub(crate) fn warm_start_point(bodies: &Bodies, state: &mut [Integrated], point: &JointPoint) {
+pub(crate) fn warm_start_point(pair: &mut Pair, point: &JointPoint) {
     let impulse = point.impulse;
-    let body = &mut state[point.a];
+    let body = &mut *pair.a;
     body.linear -= impulse * point.inverse_a;
-    let rotation = body.rotation;
-    body.angular -= apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[point.a],
-        point.arm_a.cross(impulse),
-    );
+    body.angular -= matrix_times(&point.inertia_a, point.arm_a.cross(impulse));
     body.touched = true;
-    let body = &mut state[point.b];
+    let body = &mut *pair.b;
     body.linear += impulse * point.inverse_b;
-    let rotation = body.rotation;
-    body.angular += apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[point.b],
-        point.arm_b.cross(impulse),
-    );
+    body.angular += matrix_times(&point.inertia_b, point.arm_b.cross(impulse));
     body.touched = true;
 }
 
-pub(crate) fn solve_point(bodies: &Bodies, state: &mut [Integrated], point: &mut JointPoint) {
-    let (a, b) = (&state[point.a], &state[point.b]);
+pub(crate) fn solve_point(pair: &mut Pair, point: &mut JointPoint) {
+    let (a, b) = (&*pair.a, &*pair.b);
     let speed = b.linear + b.angular.cross(point.arm_b) - a.linear - a.angular.cross(point.arm_a);
     let change = matrix_times(&point.inverse_mass, -speed);
     point.impulse += change;
@@ -599,36 +600,22 @@ pub(crate) fn solve_point(bodies: &Bodies, state: &mut [Integrated], point: &mut
         impulse: change,
         ..*point
     };
-    warm_start_point(bodies, state, &single);
+    warm_start_point(pair, &single);
 }
 
-pub(crate) fn solve_point_recovery(
-    bodies: &Bodies,
-    state: &mut [Integrated],
-    point: &mut JointPoint,
-) {
-    let (a, b) = (&state[point.a], &state[point.b]);
+pub(crate) fn solve_point_recovery(pair: &mut Pair, point: &mut JointPoint) {
+    let (a, b) = (&*pair.a, &*pair.b);
     let speed = b.recovery_linear + b.recovery_angular.cross(point.arm_b)
         - a.recovery_linear
         - a.recovery_angular.cross(point.arm_a);
     let change = matrix_times(&point.inverse_mass, point.recovery - speed);
     point.recovery_impulse += change;
-    let body = &mut state[point.a];
+    let body = &mut *pair.a;
     body.recovery_linear -= change * point.inverse_a;
-    let rotation = body.rotation;
-    body.recovery_angular -= apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[point.a],
-        point.arm_a.cross(change),
-    );
-    let body = &mut state[point.b];
+    body.recovery_angular -= matrix_times(&point.inertia_a, point.arm_a.cross(change));
+    let body = &mut *pair.b;
     body.recovery_linear += change * point.inverse_b;
-    let rotation = body.rotation;
-    body.recovery_angular += apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[point.b],
-        point.arm_b.cross(change),
-    );
+    body.recovery_angular += matrix_times(&point.inertia_b, point.arm_b.cross(change));
 }
 
 /// One scalar constraint. Speed along it is `linear . (vb - va) + ang_b . wb - ang_a . wa`.
@@ -925,12 +912,12 @@ pub(crate) fn build_rows(
     }
 }
 
-pub(crate) fn warm_start_row(state: &mut [Integrated], row: &JointRow) {
-    apply_row(state, row, row.impulse);
+pub(crate) fn warm_start_row(pair: &mut Pair, row: &JointRow) {
+    apply_row(pair, row, row.impulse);
 }
 
-pub(crate) fn solve_row(state: &mut [Integrated], row: &mut JointRow) {
-    let (a, b) = (&state[row.a], &state[row.b]);
+pub(crate) fn solve_row(pair: &mut Pair, row: &mut JointRow) {
+    let (a, b) = (&*pair.a, &*pair.b);
     let speed =
         row.linear.dot(b.linear - a.linear) + row.ang_b.dot(b.angular) - row.ang_a.dot(a.angular);
     let next = (row.impulse + (row.target - speed) * row.mass)
@@ -938,11 +925,11 @@ pub(crate) fn solve_row(state: &mut [Integrated], row: &mut JointRow) {
         .max(row.low);
     let change = next - row.impulse;
     row.impulse = next;
-    apply_row(state, row, change);
+    apply_row(pair, row, change);
 }
 
-pub(crate) fn solve_row_recovery(state: &mut [Integrated], row: &mut JointRow) {
-    let (a, b) = (&state[row.a], &state[row.b]);
+pub(crate) fn solve_row_recovery(pair: &mut Pair, row: &mut JointRow) {
+    let (a, b) = (&*pair.a, &*pair.b);
     let speed = row.linear.dot(b.recovery_linear - a.recovery_linear)
         + row.ang_b.dot(b.recovery_angular)
         - row.ang_a.dot(a.recovery_angular);
@@ -951,20 +938,20 @@ pub(crate) fn solve_row_recovery(state: &mut [Integrated], row: &mut JointRow) {
         .max(row.recovery_low);
     let change = next - row.recovery_impulse;
     row.recovery_impulse = next;
-    let body = &mut state[row.a];
+    let body = &mut *pair.a;
     body.recovery_linear -= row.linear * (change * row.inverse_a);
     body.recovery_angular -= row.turn_a * change;
-    let body = &mut state[row.b];
+    let body = &mut *pair.b;
     body.recovery_linear += row.linear * (change * row.inverse_b);
     body.recovery_angular += row.turn_b * change;
 }
 
-fn apply_row(state: &mut [Integrated], row: &JointRow, impulse: f32) {
-    let body = &mut state[row.a];
+fn apply_row(pair: &mut Pair, row: &JointRow, impulse: f32) {
+    let body = &mut *pair.a;
     body.linear -= row.linear * (impulse * row.inverse_a);
     body.angular -= row.turn_a * impulse;
     body.touched = true;
-    let body = &mut state[row.b];
+    let body = &mut *pair.b;
     body.linear += row.linear * (impulse * row.inverse_b);
     body.angular += row.turn_b * impulse;
     body.touched = true;
