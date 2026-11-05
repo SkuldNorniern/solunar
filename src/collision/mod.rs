@@ -1,4 +1,5 @@
 mod broadphase;
+pub(crate) mod convex;
 mod gjk;
 mod narrowphase;
 mod query;

@@ -110,12 +110,13 @@ impl PhysicsWorld {
                 let limit = best.map_or(max, |found| found.0);
                 let rotation = DQuat::from_quat(turn);
                 let inverse = rotation.conjugate();
-                let Some((time, normal)) = ray_shape(
-                    part,
-                    inverse.mul_vec3(offset - DVec3::from_vec3(at)),
-                    inverse.mul_vec3(direction),
-                    limit,
-                ) else {
+                let start = inverse.mul_vec3(offset - DVec3::from_vec3(at));
+                let along = inverse.mul_vec3(direction);
+                let found = match assets.convex(part) {
+                    Some(hull) => hull.ray(start, along, limit),
+                    None => ray_shape(part, start, along, limit),
+                };
+                let Some((time, normal)) = found else {
                     return;
                 };
                 let normal = rotation.mul_vec3(normal);
@@ -149,8 +150,12 @@ impl PhysicsWorld {
         let rotation = checked_rotation(cast.rotation)?;
         let rotation_in = rotation;
         let direction = self.check_cast(cast.origin, cast.direction, cast.max_distance, filter)?;
-        let (moving, radius) = Hull::of(&cast.shape, rotation, DVec3::ZERO);
-        let own_reach = f64::from(cast.shape.bounding_radius());
+        self.bodies.assets.validate(&cast.shape)?;
+        let (moving, radius) = self
+            .bodies
+            .assets
+            .hull_of(&cast.shape, rotation, DVec3::ZERO);
+        let own_reach = f64::from(self.bodies.assets.bounding_radius(&cast.shape));
         let max = f64::from(cast.max_distance);
         let mut best: Option<(f64, BodyHandle, DVec3, DVec3)> = None;
         for dense in 0..self.bodies.len() {
@@ -172,7 +177,7 @@ impl PhysicsWorld {
                 let start = inverse.mul_vec3(-center);
                 let along = inverse.mul_vec3(direction);
                 let (local, local_radius) =
-                    Hull::of(&cast.shape, body.1.conjugate() * rotation_in, start);
+                    assets.hull_of(&cast.shape, body.1.conjugate() * rotation_in, start);
                 let tip = (start + along * limit).as_vec3();
                 let area = Aabb::around(start.as_vec3(), own_reach as f32)
                     .union(Aabb::around(tip, own_reach as f32));
@@ -196,7 +201,8 @@ impl PhysicsWorld {
             }
             assets.for_each_part(body.0, body.1, |_, part, at, turn| {
                 let limit = best.map_or(max, |found| found.0);
-                let (target, target_radius) = Hull::of(part, turn, center + DVec3::from_vec3(at));
+                let (target, target_radius) =
+                    assets.hull_of(part, turn, center + DVec3::from_vec3(at));
                 let Some(hit) = sweep(&moving, radius, &target, target_radius, direction, limit)
                 else {
                     return;
@@ -234,7 +240,8 @@ impl PhysicsWorld {
         let rotation = checked_rotation(rotation)?;
         let position = checked_position(position)?;
         self.check_frame(filter)?;
-        let own_reach = f64::from(shape.bounding_radius());
+        self.bodies.assets.validate(shape)?;
+        let own_reach = f64::from(self.bodies.assets.bounding_radius(shape));
         for dense in 0..self.bodies.len() {
             if !self.visible(dense, filter) {
                 continue;
@@ -305,7 +312,10 @@ impl PhysicsWorld {
                 let limit = best.map_or(f64::from(max_distance), |found| found.0);
                 let rotation = DQuat::from_quat(turn);
                 let local = rotation.conjugate().mul_vec3(offset - DVec3::from_vec3(at));
-                let (gap, normal) = surface_distance(part, local);
+                let (gap, normal) = match assets.convex(part) {
+                    Some(hull) => hull.point_distance(local),
+                    None => surface_distance(part, local),
+                };
                 if gap > limit {
                     return;
                 }
@@ -416,7 +426,7 @@ fn ray_shape(shape: &Shape, origin: DVec3, direction: DVec3, max: f64) -> Option
             max,
         ),
         Shape::Cuboid { half_extents } => ray_box(origin, direction, half_extents, max),
-        Shape::Compound(_) | Shape::TriMesh(_) => None,
+        Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_) => None,
     }
 }
 
@@ -555,7 +565,7 @@ fn surface_distance(shape: &Shape, point: DVec3) -> (f64, DVec3) {
             half_height,
         } => rounded_distance(point, f64::from(half_height), f64::from(radius)),
         Shape::Cuboid { half_extents } => box_distance(point, half_extents),
-        Shape::Compound(_) | Shape::TriMesh(_) => (f64::INFINITY, DVec3::Y),
+        Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_) => (f64::INFINITY, DVec3::Y),
     }
 }
 

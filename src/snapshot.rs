@@ -5,14 +5,15 @@ use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 
 use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
+use crate::collision::convex::{ConvexHull, MAX_CONVEX_POINTS};
 use crate::collision::trimesh::{MAX_TRIANGLES, TriMesh};
 use crate::compound::{Compound, MAX_COMPOUND_CHILDREN};
 use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
-    BodyHandle, BodyKind, CollisionFilter, CompoundChild, CompoundId, FrameDesc, FrameId, Frames,
-    GridPosition, JointAxis, JointDesc, JointKind, JointLimit, JointMotor, Joints, MassProperties,
-    Material, MeshId, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
+    BodyHandle, BodyKind, CollisionFilter, CompoundChild, CompoundId, ConvexId, FrameDesc, FrameId,
+    Frames, GridPosition, JointAxis, JointDesc, JointKind, JointLimit, JointMotor, Joints,
+    MassProperties, Material, MeshId, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
@@ -119,6 +120,16 @@ impl PhysicsWorld {
                 out.vec3(child.position);
                 out.quat(child.rotation);
                 out.f32(child.density_scale);
+            }
+        }
+
+        out.len(self.bodies.assets.convexes.len());
+        for hull in &self.bodies.assets.convexes {
+            out.f32(hull.unit.mass);
+            out.vec3(hull.unit.inertia);
+            out.len(hull.source.len());
+            for point in &hull.source {
+                out.vec3(*point);
             }
         }
 
@@ -322,6 +333,11 @@ fn read_bodies(
     for _ in 0..compound_count {
         bodies.assets.compounds.push(read_compound(reader)?);
     }
+    let convex_count = reader.count(4 + 12 + 4, limits.max_slots)?;
+    bodies.assets.convexes.reserve(convex_count);
+    for _ in 0..convex_count {
+        bodies.assets.convexes.push(read_convex(reader)?);
+    }
     let mesh_count = reader.count(1, limits.max_slots)?;
     bodies.assets.meshes.reserve(mesh_count);
     for _ in 0..mesh_count {
@@ -492,6 +508,19 @@ fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
         });
     }
     Compound::from_rebased(children, unit).map_err(|_| SnapshotError::Invalid("compound"))
+}
+
+fn read_convex(reader: &mut Reader<'_>) -> Result<ConvexHull, SnapshotError> {
+    let unit = MassProperties {
+        mass: reader.f32()?,
+        inertia: reader.vec3()?,
+    };
+    let count = reader.count(12, MAX_CONVEX_POINTS)?;
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        points.push(reader.vec3()?);
+    }
+    ConvexHull::from_rebased(&points, unit).map_err(|_| SnapshotError::Invalid("convex"))
 }
 
 fn read_mesh(reader: &mut Reader<'_>, limits: &SnapshotLimits) -> Result<TriMesh, SnapshotError> {
@@ -859,6 +888,7 @@ impl Writer {
             } => (2, [radius, half_height, 0.0]),
             Shape::Compound(id) => (3, [f32::from_bits(id.0), 0.0, 0.0]),
             Shape::TriMesh(id) => (4, [f32::from_bits(id.0), 0.0, 0.0]),
+            Shape::Convex(id) => (5, [f32::from_bits(id.0), 0.0, 0.0]),
         };
         self.u8(tag);
         for value in values {
@@ -992,6 +1022,7 @@ impl Reader<'_> {
             2 => Ok(Shape::capsule(values[0], values[1])),
             3 => Ok(Shape::Compound(CompoundId(values[0].to_bits()))),
             4 => Ok(Shape::TriMesh(MeshId(values[0].to_bits()))),
+            5 => Ok(Shape::Convex(ConvexId(values[0].to_bits()))),
             _ => Err(SnapshotError::Invalid("shape kind")),
         }
     }

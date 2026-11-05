@@ -1,5 +1,6 @@
 use algebrix::{DVec3, Quat, Vec3};
 
+use super::convex::Poly;
 use super::gjk::{Hull, distance};
 use super::narrowphase::RawManifold;
 use crate::{PhysicsError, Shape};
@@ -432,10 +433,13 @@ pub(crate) fn triangle_contact(
                 margin,
             )
         }
-        Shape::Cuboid { half_extents } => {
-            box_contact(&triangle, convex, half_extents, rotation, center, margin)
-        }
-        Shape::Compound(_) | Shape::TriMesh(_) => None,
+        Shape::Cuboid { half_extents } => poly_triangle(
+            mesh,
+            index,
+            &Poly::of_box(half_extents, rotation, center),
+            margin,
+        ),
+        Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_) => None,
     }
 }
 
@@ -503,25 +507,16 @@ fn rounded_contact(
     result.filled()
 }
 
-fn box_contact(
-    triangle: &[Vec3; 3],
-    convex: u8,
-    half: Vec3,
-    rotation: Quat,
-    center: Vec3,
+/// A box or convex hull against a triangle, in mesh axes.
+pub(crate) fn poly_triangle(
+    mesh: &TriMesh,
+    index: u32,
+    poly: &Poly<'_>,
     margin: f32,
 ) -> Option<RawManifold> {
-    let axes = [
-        rotation.rotate_vec3(Vec3::X),
-        rotation.rotate_vec3(Vec3::Y),
-        rotation.rotate_vec3(Vec3::Z),
-    ];
-    let extents = [half.x, half.y, half.z];
-    let reach = |direction: Vec3| -> f32 {
-        (0..3)
-            .map(|i| extents[i] * axes[i].dot(direction).abs())
-            .sum()
-    };
+    let triangle = mesh.triangle(index);
+    let convex = mesh.convex[index as usize];
+    let center = poly.center;
     let face = (triangle[1] - triangle[0])
         .cross(triangle[2] - triangle[0])
         .normalize();
@@ -530,8 +525,8 @@ fn box_contact(
         triangle[2] - triangle[1],
         triangle[0] - triangle[2],
     ];
-    // gap along the face normal is one sided, a buried box is pushed out the front
-    let face_gap = (center - triangle[0]).dot(face) - reach(face);
+    // gap along the face normal is one sided, something buried is pushed out the front
+    let face_gap = (center - triangle[0]).dot(face) - poly.reach(-face);
     if face_gap > margin {
         return None;
     }
@@ -548,10 +543,10 @@ fn box_contact(
             axis = -axis;
         }
         let from_center = |point: Vec3| (point - center).dot(axis);
-        let lowest = from_center(triangle[0])
+        let highest = from_center(triangle[0])
             .max(from_center(triangle[1]))
             .max(from_center(triangle[2]));
-        let gap = -lowest - reach(axis);
+        let gap = -highest - poly.reach(-axis);
         if gap > margin {
             return false;
         }
@@ -563,15 +558,15 @@ fn box_contact(
         true
     };
     let any_edge = convex != 0;
-    for axis in axes {
-        if !try_axis(axis, any_edge) {
+    for (normal, _) in poly.planes() {
+        if !try_axis(*normal, any_edge) {
             return None;
         }
     }
-    for (index, edge) in edges.iter().enumerate() {
-        let open = convex & (1 << index) != 0;
-        for axis in axes {
-            if !try_axis(edge.cross(axis), open) {
+    for (at, edge) in edges.iter().enumerate() {
+        let open = convex & (1 << at) != 0;
+        for axis in poly.edges() {
+            if !try_axis(edge.cross(*axis), open) {
                 return None;
             }
         }
@@ -579,43 +574,24 @@ fn box_contact(
     let normal = best_axis;
     let mut result = RawManifold::new(normal);
     if is_face {
-        // box corners over the triangle, and triangle corners under the box
+        // corners over the triangle, and triangle corners under the shape
         let mut kept = [(Vec3::ZERO, 0.0_f32); 16];
         let mut count = 0;
-        for x in [-1.0, 1.0] {
-            for y in [-1.0, 1.0] {
-                for z in [-1.0, 1.0] {
-                    let corner = center
-                        + axes[0] * (x * extents[0])
-                        + axes[1] * (y * extents[1])
-                        + axes[2] * (z * extents[2]);
-                    let gap = (corner - triangle[0]).dot(face);
-                    let (closest, part) = closest_on_triangle(corner, triangle);
-                    if part == 0 && gap < margin && (center - corner).dot(face) > 0.0 {
-                        kept[count] = (closest + face * (gap * 0.5), -gap);
-                        count += 1;
-                    }
-                }
+        for corner in poly.vertices() {
+            let gap = (*corner - triangle[0]).dot(face);
+            let (closest, part) = closest_on_triangle(*corner, &triangle);
+            if part == 0 && gap < margin && (center - *corner).dot(face) > 0.0 && count < kept.len()
+            {
+                kept[count] = (closest + face * (gap * 0.5), -gap);
+                count += 1;
             }
         }
-        for corner in triangle {
-            let local = *corner - center;
-            // walk up the face normal from this corner to the box surface above it
-            let (mut enter, mut leave) = (f32::NEG_INFINITY, f32::INFINITY);
-            let mut misses = false;
-            for i in 0..3 {
-                let along = axes[i].dot(face);
-                let from = local.dot(axes[i]);
-                if along.abs() < 1e-6 {
-                    misses |= from.abs() > extents[i];
-                } else {
-                    let (one, two) = ((-extents[i] - from) / along, (extents[i] - from) / along);
-                    enter = enter.max(one.min(two));
-                    leave = leave.min(one.max(two));
-                }
-            }
-            if !misses && enter <= leave && enter < margin && leave >= 0.0 && count < kept.len() {
-                kept[count] = (*corner + face * (enter * 0.5), -enter);
+        for corner in &triangle {
+            if let Some(gap) = poly.surface_above(*corner, face)
+                && gap < margin
+                && count < kept.len()
+            {
+                kept[count] = (*corner + face * (gap * 0.5), -gap);
                 count += 1;
             }
         }
@@ -626,7 +602,7 @@ fn box_contact(
         let on_triangle = {
             let mut best = triangle[0];
             let mut most = f32::NEG_INFINITY;
-            for corner in triangle {
+            for corner in &triangle {
                 let value = corner.dot(normal);
                 if value > most {
                     most = value;
@@ -635,7 +611,7 @@ fn box_contact(
             }
             best
         };
-        let (closest, _) = closest_on_triangle(center, triangle);
+        let (closest, _) = closest_on_triangle(center, &triangle);
         let point = if is_face { closest } else { on_triangle };
         result.push(point + normal * (best_gap * 0.5), -best_gap);
     }

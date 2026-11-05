@@ -1,4 +1,4 @@
-use algebrix::{DQuat, DVec3, Quat};
+use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::Shape;
 
@@ -8,10 +8,15 @@ const RELATIVE_TOLERANCE: f64 = 1e-10;
 
 /// Shape without its radius. Spheres are a point, capsules a segment.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Hull {
+pub(crate) enum Hull<'a> {
     Point(DVec3),
     Segment(DVec3, DVec3),
     Triangle(DVec3, DVec3, DVec3),
+    Points {
+        vertices: &'a [Vec3],
+        rotation: DQuat,
+        center: DVec3,
+    },
     Box {
         center: DVec3,
         axes: [DVec3; 3],
@@ -19,24 +24,24 @@ pub(crate) enum Hull {
     },
 }
 
-impl Hull {
+impl Hull<'_> {
     /// Returns the hull and the radius around it.
-    pub(crate) fn of(shape: &Shape, rotation: Quat, center: DVec3) -> (Self, f64) {
+    pub(crate) fn of(shape: &Shape, rotation: Quat, center: DVec3) -> (Hull<'static>, f64) {
         let rotation = DQuat::from_quat(rotation);
         match *shape {
-            Shape::Sphere { radius } => (Self::Point(center), f64::from(radius)),
+            Shape::Sphere { radius } => (Hull::Point(center), f64::from(radius)),
             Shape::Capsule {
                 radius,
                 half_height,
             } => {
                 let half = rotation.mul_vec3(DVec3::Y * f64::from(half_height));
                 (
-                    Self::Segment(center - half, center + half),
+                    Hull::Segment(center - half, center + half),
                     f64::from(radius),
                 )
             }
             Shape::Cuboid { half_extents } => (
-                Self::Box {
+                Hull::Box {
                     center,
                     axes: [
                         rotation.mul_vec3(DVec3::X),
@@ -52,7 +57,7 @@ impl Hull {
                 0.0,
             ),
             // callers go part by part, a compound never gets here
-            Shape::Compound(_) | Shape::TriMesh(_) => (Self::Point(center), 0.0),
+            Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_) => (Hull::Point(center), 0.0),
         }
     }
 
@@ -61,6 +66,15 @@ impl Hull {
             Self::Point(point) => Self::Point(point + offset),
             Self::Segment(start, end) => Self::Segment(start + offset, end + offset),
             Self::Triangle(a, b, c) => Self::Triangle(a + offset, b + offset, c + offset),
+            Self::Points {
+                vertices,
+                rotation,
+                center,
+            } => Self::Points {
+                vertices,
+                rotation,
+                center: center + offset,
+            },
             Self::Box {
                 center,
                 axes,
@@ -82,6 +96,24 @@ impl Hull {
                 } else {
                     start
                 }
+            }
+            Self::Points {
+                vertices,
+                rotation,
+                center,
+            } => {
+                let local = rotation.conjugate().mul_vec3(direction);
+                let mut best = DVec3::ZERO;
+                let mut most = f64::NEG_INFINITY;
+                for vertex in vertices {
+                    let vertex = DVec3::from_vec3(*vertex);
+                    let value = vertex.dot(local);
+                    if value > most {
+                        most = value;
+                        best = vertex;
+                    }
+                }
+                center + rotation.mul_vec3(best)
             }
             Self::Triangle(a, b, c) => {
                 let (at_a, at_b, at_c) = (a.dot(direction), b.dot(direction), c.dot(direction));
@@ -116,6 +148,7 @@ impl Hull {
             Self::Point(point) => point,
             Self::Segment(start, end) => (start + end) * 0.5,
             Self::Triangle(a, b, c) => (a + b + c) / 3.0,
+            Self::Points { center, .. } => center,
             Self::Box { center, .. } => center,
         }
     }

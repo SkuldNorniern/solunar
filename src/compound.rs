@@ -1,6 +1,7 @@
 use algebrix::{DQuat, DVec3, Mat3, Quat, Vec3};
 
-use crate::collision::trimesh::{Aabb, TriMesh, triangle_contact};
+use crate::collision::convex::{ConvexHull, Poly, poly_poly, poly_rounded};
+use crate::collision::trimesh::{Aabb, TriMesh, poly_triangle, triangle_contact};
 use crate::collision::{Bounds, Hull, RawManifold, contacts, sweep};
 use crate::solver::CONTACT_MARGIN;
 use crate::{GridPosition, MassProperties, PhysicsError, PhysicsWorld, Shape};
@@ -13,6 +14,12 @@ pub struct CompoundId(pub(crate) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MeshId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConvexId(pub(crate) u32);
+
+/// Same rebasing as a compound, see [`CompoundInfo`].
+pub type ConvexInfo = CompoundInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompoundChild {
@@ -102,8 +109,10 @@ impl Compound {
 
 fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
     let squared = child.rotation.length_squared();
-    let good = !matches!(child.shape, Shape::Compound(_) | Shape::TriMesh(_))
-        && child.position.is_finite()
+    let good = !matches!(
+        child.shape,
+        Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_)
+    ) && child.position.is_finite()
         && squared.is_finite()
         && squared > 1e-12
         && child.density_scale.is_finite()
@@ -119,6 +128,7 @@ fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
 pub(crate) struct ShapeAssets {
     pub(crate) compounds: Vec<Compound>,
     pub(crate) meshes: Vec<TriMesh>,
+    pub(crate) convexes: Vec<ConvexHull>,
 }
 
 impl ShapeAssets {
@@ -133,6 +143,90 @@ impl ShapeAssets {
         }
     }
 
+    pub(crate) fn convex(&self, shape: &Shape) -> Option<&ConvexHull> {
+        match *shape {
+            Shape::Convex(id) => self.convexes.get(id.0 as usize),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hull_of(&self, shape: &Shape, rotation: Quat, center: DVec3) -> (Hull<'_>, f64) {
+        match self.convex(shape) {
+            Some(hull) => (hull.hull(rotation, center), 0.0),
+            None => Hull::of(shape, rotation, center),
+        }
+    }
+
+    fn poly_of<'a>(&'a self, shape: &Shape, rotation: Quat, center: Vec3) -> Option<Poly<'a>> {
+        match *shape {
+            Shape::Cuboid { half_extents } => Some(Poly::of_box(half_extents, rotation, center)),
+            _ => self
+                .convex(shape)
+                .map(|hull| Poly::of_hull(hull, rotation, center)),
+        }
+    }
+
+    /// Picks the routine for a pair of parts.
+    fn part_contact(
+        &self,
+        (shape_a, turn_a): (&Shape, Quat),
+        (shape_b, turn_b): (&Shape, Quat),
+        center: Vec3,
+        margin: f32,
+    ) -> Option<RawManifold> {
+        if self.convex(shape_a).is_none() && self.convex(shape_b).is_none() {
+            return contacts(shape_a, turn_a, shape_b, turn_b, center, margin);
+        }
+        let rounded = |shape: &Shape, turn: Quat, at: Vec3| match *shape {
+            Shape::Sphere { radius } => Some(((at, at), radius)),
+            Shape::Capsule {
+                radius,
+                half_height,
+            } => {
+                let half = turn.rotate_vec3(Vec3::Y * half_height);
+                Some(((at - half, at + half), radius))
+            }
+            _ => None,
+        };
+        match (
+            self.poly_of(shape_a, turn_a, Vec3::ZERO),
+            self.poly_of(shape_b, turn_b, center),
+        ) {
+            (Some(a), Some(b)) => poly_poly(&a, &b, margin),
+            (Some(a), None) => {
+                let (segment, radius) = rounded(shape_b, turn_b, center)?;
+                let (hull, _) = self.hull_of(shape_a, turn_a, DVec3::ZERO);
+                poly_rounded(&hull, &a, segment, radius, margin)
+            }
+            (None, Some(b)) => {
+                let (segment, radius) = rounded(shape_a, turn_a, Vec3::ZERO)?;
+                let (hull, _) = self.hull_of(shape_b, turn_b, DVec3::from_vec3(center));
+                let raw = poly_rounded(&hull, &b, segment, radius, margin)?;
+                let mut flipped = RawManifold::new(-raw.normal);
+                for point in &raw.points[..raw.count] {
+                    flipped.push(point.position, point.depth);
+                }
+                Some(flipped)
+            }
+            (None, None) => None,
+        }
+    }
+
+    fn triangle_part_contact(
+        &self,
+        mesh: &TriMesh,
+        triangle: u32,
+        part: &Shape,
+        turn: Quat,
+        center: Vec3,
+        margin: f32,
+    ) -> Option<RawManifold> {
+        match self.convex(part) {
+            Some(hull) => poly_triangle(mesh, triangle, &Poly::of_hull(hull, turn, center), margin),
+            None => triangle_contact(mesh, triangle, part, turn, center, margin),
+        }
+    }
+
     pub(crate) fn parts(&self, shape: &Shape) -> Option<&[CompoundChild]> {
         match *shape {
             Shape::Compound(id) => self.compound(id).map(|found| found.children.as_slice()),
@@ -144,6 +238,10 @@ impl ShapeAssets {
         match *shape {
             Shape::TriMesh(_) => self
                 .mesh(shape)
+                .map(|_| ())
+                .ok_or(PhysicsError::InvalidShape),
+            Shape::Convex(_) => self
+                .convex(shape)
                 .map(|_| ())
                 .ok_or(PhysicsError::InvalidShape),
             Shape::Compound(id) => self
@@ -166,6 +264,16 @@ impl ShapeAssets {
                     inertia: compound.unit.inertia * density,
                 },
             ),
+            Shape::Convex(_) => self.convex(shape).map_or(
+                MassProperties {
+                    mass: 0.0,
+                    inertia: Vec3::ZERO,
+                },
+                |hull| MassProperties {
+                    mass: hull.unit.mass * density,
+                    inertia: hull.unit.inertia * density,
+                },
+            ),
             _ => shape.mass_properties(density),
         }
     }
@@ -176,6 +284,7 @@ impl ShapeAssets {
                 .compound(id)
                 .map_or(f32::INFINITY, |compound| compound.radius),
             Shape::TriMesh(_) => self.mesh(shape).map_or(f32::INFINITY, |mesh| mesh.radius),
+            Shape::Convex(_) => self.convex(shape).map_or(f32::INFINITY, |hull| hull.radius),
             _ => shape.bounding_radius(),
         }
     }
@@ -197,6 +306,9 @@ impl ShapeAssets {
                     (mesh.bounds.max - mesh.bounds.min) * 0.5,
                 )
             }),
+            Shape::Convex(_) => self
+                .convex(shape)
+                .map(|hull| (hull.box_center, hull.box_half)),
             _ => None,
         };
         if let Some((box_center, half)) = local {
@@ -254,12 +366,13 @@ impl ShapeAssets {
             self.for_each_part(shape_b, rotation_b, |part_b, part, at_b, turn_b| {
                 let center = inverse.rotate_vec3(center_b + at_b);
                 let turn = inverse * turn_b;
-                let area = Aabb::around(center, part.bounding_radius() + margin);
+                let area = Aabb::around(center, self.bounding_radius(part) + margin);
                 let local_motion = motion.map(|travel| inverse.rotate_vec3(travel));
                 mesh.for_each_near(area, |triangle| {
-                    if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
+                    if let Some(raw) =
+                        self.triangle_part_contact(mesh, triangle, part, turn, center, margin)
                     {
-                        if !will_meet_triangle(
+                        if !self.will_meet_triangle(
                             &raw,
                             mesh,
                             triangle,
@@ -284,13 +397,14 @@ impl ShapeAssets {
             self.for_each_part(shape_a, rotation_a, |part_a, part, at_a, turn_a| {
                 let center = inverse.rotate_vec3(at_a - center_b);
                 let turn = inverse * turn_a;
-                let area = Aabb::around(center, part.bounding_radius() + margin);
+                let area = Aabb::around(center, self.bounding_radius(part) + margin);
                 // the part moves against the mesh, so its travel is the opposite of B's
                 let local_motion = motion.map(|travel| inverse.rotate_vec3(-travel));
                 mesh.for_each_near(area, |triangle| {
-                    if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
+                    if let Some(raw) =
+                        self.triangle_part_contact(mesh, triangle, part, turn, center, margin)
                     {
-                        if !will_meet_triangle(
+                        if !self.will_meet_triangle(
                             &raw,
                             mesh,
                             triangle,
@@ -312,20 +426,53 @@ impl ShapeAssets {
             return;
         }
         self.for_each_part(shape_a, rotation_a, |part_a, shape_a, at_a, turn_a| {
-            let reach_a = shape_a.bounding_radius();
+            let reach_a = self.bounding_radius(shape_a);
             self.for_each_part(shape_b, rotation_b, |part_b, shape_b, at_b, turn_b| {
                 let center = center_b + at_b - at_a;
-                let reach = reach_a + shape_b.bounding_radius() + margin;
+                let reach = reach_a + self.bounding_radius(shape_b) + margin;
                 if center.length_squared() > reach * reach {
                     return;
                 }
-                if let Some(raw) = contacts(shape_a, turn_a, shape_b, turn_b, center, margin)
-                    && will_meet(&raw, (shape_a, turn_a), (shape_b, turn_b), center, motion)
+                if let Some(raw) =
+                    self.part_contact((shape_a, turn_a), (shape_b, turn_b), center, margin)
+                    && self.will_meet(&raw, (shape_a, turn_a), (shape_b, turn_b), center, motion)
                 {
                     visit(part_a, part_b, &raw, at_a);
                 }
             });
         });
+    }
+
+    fn will_meet(
+        &self,
+        raw: &RawManifold,
+        (shape_a, turn_a): (&Shape, Quat),
+        (shape_b, turn_b): (&Shape, Quat),
+        center: Vec3,
+        travel: Option<Vec3>,
+    ) -> bool {
+        let target = self.hull_of(shape_a, turn_a, DVec3::ZERO);
+        let moving = self.hull_of(shape_b, turn_b, DVec3::from_vec3(center));
+        will_meet_hulls(moving, target, raw, travel)
+    }
+
+    fn will_meet_triangle(
+        &self,
+        raw: &RawManifold,
+        mesh: &TriMesh,
+        triangle: u32,
+        part: (&Shape, Quat),
+        center: Vec3,
+        travel: Option<Vec3>,
+    ) -> bool {
+        let [a, b, c] = mesh.triangle(triangle);
+        let target = Hull::Triangle(
+            DVec3::from_vec3(a),
+            DVec3::from_vec3(b),
+            DVec3::from_vec3(c),
+        );
+        let moving = self.hull_of(part.0, part.1, DVec3::from_vec3(center));
+        will_meet_hulls(moving, (target, 0.0), raw, travel)
     }
 
     pub(crate) fn any_contact(
@@ -362,36 +509,6 @@ fn will_meet_hulls(
     let direction = DVec3::from_vec3(travel) / f64::from(length);
     let reach = f64::from(length) + f64::from(CONTACT_MARGIN);
     sweep(&moving.0, moving.1, &target.0, target.1, direction, reach).is_some()
-}
-
-fn will_meet(
-    raw: &RawManifold,
-    (shape_a, turn_a): (&Shape, Quat),
-    (shape_b, turn_b): (&Shape, Quat),
-    center: Vec3,
-    travel: Option<Vec3>,
-) -> bool {
-    let target = Hull::of(shape_a, turn_a, DVec3::ZERO);
-    let moving = Hull::of(shape_b, turn_b, DVec3::from_vec3(center));
-    will_meet_hulls(moving, target, raw, travel)
-}
-
-fn will_meet_triangle(
-    raw: &RawManifold,
-    mesh: &TriMesh,
-    triangle: u32,
-    part: (&Shape, Quat),
-    center: Vec3,
-    travel: Option<Vec3>,
-) -> bool {
-    let [a, b, c] = mesh.triangle(triangle);
-    let target = Hull::Triangle(
-        DVec3::from_vec3(a),
-        DVec3::from_vec3(b),
-        DVec3::from_vec3(c),
-    );
-    let moving = Hull::of(part.0, part.1, DVec3::from_vec3(center));
-    will_meet_hulls(moving, (target, 0.0), raw, travel)
 }
 
 /// Eigenvalues and right handed eigenvector columns of a symmetric matrix (cyclic Jacobi).
@@ -543,6 +660,43 @@ impl PhysicsWorld {
             vertices.to_vec(),
             triangles.to_vec(),
         )?)
+    }
+
+    /// A convex shape from the hull of up to 64 points. Like a compound it is rebased, so place
+    /// it with [`CompoundInfo::placed`]. Convex shapes can not be parts of a compound yet.
+    ///
+    /// # Errors
+    /// Fails on too few or too many points, non finite ones or no volume.
+    pub fn add_convex(&mut self, points: &[Vec3]) -> Result<ConvexInfo, PhysicsError> {
+        let (volume, center, inertia) = ConvexHull::measure(points)?;
+        let (values, vectors) = principal_axes(inertia);
+        let column = |k: usize| {
+            Vec3::new(
+                vectors[0][k] as f32,
+                vectors[1][k] as f32,
+                vectors[2][k] as f32,
+            )
+        };
+        let axes = Quat::from_mat3(&Mat3::from_cols(column(0), column(1), column(2))).normalize();
+        let back = axes.conjugate();
+        let center = center.as_vec3();
+        let moved: Vec<Vec3> = points
+            .iter()
+            .map(|point| back.rotate_vec3(*point - center))
+            .collect();
+        let unit = MassProperties {
+            mass: volume as f32,
+            inertia: Vec3::new(values[0] as f32, values[1] as f32, values[2] as f32),
+        };
+        let hull = ConvexHull::from_rebased(&moved, unit)?;
+        let id = u32::try_from(self.bodies.assets.convexes.len())
+            .map_err(|_| PhysicsError::OutOfRange)?;
+        self.bodies.assets.convexes.push(hull);
+        Ok(CompoundInfo {
+            shape: Shape::Convex(ConvexId(id)),
+            center,
+            axes,
+        })
     }
 
     /// Registers a shape made of parts. Parts can not be compounds themselves.

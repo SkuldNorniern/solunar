@@ -121,7 +121,7 @@ fn rounded_segment(shape: &Shape, rotation: Quat) -> Option<(Vec3, f32)> {
             radius,
             half_height,
         } => Some((rotation.rotate_vec3(Vec3::Y * half_height), radius)),
-        Shape::Cuboid { .. } | Shape::Compound(_) | Shape::TriMesh(_) => None,
+        Shape::Cuboid { .. } | Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_) => None,
     }
 }
 
