@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 
 use algebrix::Vec3;
 
-use crate::{CompoundId, PhysicsError};
+use crate::{CompoundId, MeshId, PhysicsError};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Shape {
@@ -18,6 +18,8 @@ pub enum Shape {
     },
     /// Parts registered with PhysicsWorld::add_compound.
     Compound(CompoundId),
+    /// Static triangles from dd_heightfield or dd_mesh. Never on a dynamic body.
+    TriMesh(MeshId),
 }
 
 /// Mass and diagonal inertia of a shape in its own axes.
@@ -56,7 +58,7 @@ impl Shape {
                 radius,
                 half_height,
             } => positive(radius) && half_height.is_finite() && half_height >= 0.0,
-            Self::Compound(_) => true,
+            Self::Compound(_) | Self::TriMesh(_) => true,
         };
         if valid {
             Ok(())
@@ -75,7 +77,7 @@ impl Shape {
                 half_height,
             } => radius + half_height,
             // only the world knows it, this errs on the safe side
-            Self::Compound(_) => f32::INFINITY,
+            Self::Compound(_) | Self::TriMesh(_) => f32::INFINITY,
         }
     }
 
@@ -90,7 +92,7 @@ impl Shape {
                 let r2 = radius * radius;
                 PI * r2 * 2.0 * half_height + 4.0 / 3.0 * PI * r2 * radius
             }
-            Self::Compound(_) => 0.0,
+            Self::Compound(_) | Self::TriMesh(_) => 0.0,
         }
     }
 
@@ -117,7 +119,7 @@ impl Shape {
                     + caps * (0.4 * r2 + height * height / 4.0 + 3.0 * height * radius / 8.0);
                 Vec3::new(side, axial, side)
             }
-            Self::Compound(_) => Vec3::ZERO,
+            Self::Compound(_) | Self::TriMesh(_) => Vec3::ZERO,
         };
         MassProperties { mass, inertia }
     }

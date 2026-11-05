@@ -329,6 +329,9 @@ pub(crate) fn validate_desc(
     assets: &ShapeAssets,
 ) -> Result<(), PhysicsError> {
     assets.validate(&desc.shape)?;
+    if desc.kind == BodyKind::Dynamic && matches!(desc.shape, Shape::TriMesh(_)) {
+        return Err(PhysicsError::InvalidShape);
+    }
     desc.material.validate()?;
     if desc.kind == BodyKind::Dynamic {
         let (inverse_mass, inverse_inertia) = inverse_mass_properties(desc.kind, desc, assets);

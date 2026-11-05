@@ -11,6 +11,7 @@ const RELATIVE_TOLERANCE: f64 = 1e-10;
 pub(crate) enum Hull {
     Point(DVec3),
     Segment(DVec3, DVec3),
+    Triangle(DVec3, DVec3, DVec3),
     Box {
         center: DVec3,
         axes: [DVec3; 3],
@@ -51,7 +52,7 @@ impl Hull {
                 0.0,
             ),
             // callers go part by part, a compound never gets here
-            Shape::Compound(_) => (Self::Point(center), 0.0),
+            Shape::Compound(_) | Shape::TriMesh(_) => (Self::Point(center), 0.0),
         }
     }
 
@@ -59,6 +60,7 @@ impl Hull {
         match self {
             Self::Point(point) => Self::Point(point + offset),
             Self::Segment(start, end) => Self::Segment(start + offset, end + offset),
+            Self::Triangle(a, b, c) => Self::Triangle(a + offset, b + offset, c + offset),
             Self::Box {
                 center,
                 axes,
@@ -79,6 +81,16 @@ impl Hull {
                     end
                 } else {
                     start
+                }
+            }
+            Self::Triangle(a, b, c) => {
+                let (at_a, at_b, at_c) = (a.dot(direction), b.dot(direction), c.dot(direction));
+                if at_a >= at_b && at_a >= at_c {
+                    a
+                } else if at_b >= at_c {
+                    b
+                } else {
+                    c
                 }
             }
             Self::Box {
@@ -103,6 +115,7 @@ impl Hull {
         match *self {
             Self::Point(point) => point,
             Self::Segment(start, end) => (start + end) * 0.5,
+            Self::Triangle(a, b, c) => (a + b + c) / 3.0,
             Self::Box { center, .. } => center,
         }
     }

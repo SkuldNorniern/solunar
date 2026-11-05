@@ -1,5 +1,6 @@
 use algebrix::{DQuat, DVec3, Mat3, Quat, Vec3};
 
+use crate::collision::trimesh::{Aabb, TriMesh, triangle_contact};
 use crate::collision::{Bounds, RawManifold, contacts};
 use crate::{GridPosition, MassProperties, PhysicsError, PhysicsWorld, Shape};
 
@@ -8,6 +9,9 @@ const JACOBI_SWEEPS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CompoundId(pub(crate) u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MeshId(pub(crate) u32);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompoundChild {
@@ -97,7 +101,7 @@ impl Compound {
 
 fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
     let squared = child.rotation.length_squared();
-    let good = !matches!(child.shape, Shape::Compound(_))
+    let good = !matches!(child.shape, Shape::Compound(_) | Shape::TriMesh(_))
         && child.position.is_finite()
         && squared.is_finite()
         && squared > 1e-12
@@ -113,6 +117,7 @@ fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ShapeAssets {
     pub(crate) compounds: Vec<Compound>,
+    pub(crate) meshes: Vec<TriMesh>,
 }
 
 impl ShapeAssets {
@@ -120,8 +125,19 @@ impl ShapeAssets {
         self.compounds.get(id.0 as usize)
     }
 
+    pub(crate) fn mesh(&self, shape: &Shape) -> Option<&TriMesh> {
+        match *shape {
+            Shape::TriMesh(id) => self.meshes.get(id.0 as usize),
+            _ => None,
+        }
+    }
+
     pub(crate) fn validate(&self, shape: &Shape) -> Result<(), PhysicsError> {
         match *shape {
+            Shape::TriMesh(_) => self
+                .mesh(shape)
+                .map(|_| ())
+                .ok_or(PhysicsError::InvalidShape),
             Shape::Compound(id) => self
                 .compound(id)
                 .map(|_| ())
@@ -151,6 +167,7 @@ impl ShapeAssets {
             Shape::Compound(id) => self
                 .compound(id)
                 .map_or(f32::INFINITY, |compound| compound.radius),
+            Shape::TriMesh(_) => self.mesh(shape).map_or(f32::INFINITY, |mesh| mesh.radius),
             _ => shape.bounding_radius(),
         }
     }
@@ -162,15 +179,23 @@ impl ShapeAssets {
         rotation: Quat,
         margin: f32,
     ) -> Bounds {
-        if let Shape::Compound(id) = *shape
-            && let Some(compound) = self.compound(id)
-        {
-            let half = compound.box_half;
+        let local = match *shape {
+            Shape::Compound(id) => self
+                .compound(id)
+                .map(|compound| (compound.box_center, compound.box_half)),
+            Shape::TriMesh(_) => self.mesh(shape).map(|mesh| {
+                (
+                    (mesh.bounds.min + mesh.bounds.max) * 0.5,
+                    (mesh.bounds.max - mesh.bounds.min) * 0.5,
+                )
+            }),
+            _ => None,
+        };
+        if let Some((box_center, half)) = local {
             let extent = rotation.rotate_vec3(Vec3::X * half.x).abs()
                 + rotation.rotate_vec3(Vec3::Y * half.y).abs()
                 + rotation.rotate_vec3(Vec3::Z * half.z).abs();
-            let center =
-                position.to_dvec3() + DVec3::from_vec3(rotation.rotate_vec3(compound.box_center));
+            let center = position.to_dvec3() + DVec3::from_vec3(rotation.rotate_vec3(box_center));
             let extent = DVec3::from_vec3(extent + Vec3::splat(margin * 0.5));
             return Bounds {
                 min: center - extent,
@@ -200,6 +225,7 @@ impl ShapeAssets {
                     }
                 }
             }
+            Shape::TriMesh(_) => {}
             _ => visit(0, shape, Vec3::ZERO, rotation),
         }
     }
@@ -214,6 +240,45 @@ impl ShapeAssets {
         margin: f32,
         mut visit: impl FnMut(u32, u32, &RawManifold, Vec3),
     ) {
+        if let Some(mesh) = self.mesh(shape_a) {
+            let inverse = rotation_a.conjugate();
+            self.for_each_part(shape_b, rotation_b, |part_b, part, at_b, turn_b| {
+                let center = inverse.rotate_vec3(center_b + at_b);
+                let turn = inverse * turn_b;
+                let area = Aabb::around(center, part.bounding_radius() + margin);
+                mesh.for_each_near(area, |triangle| {
+                    if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
+                    {
+                        let mut world = RawManifold::new(rotation_a.rotate_vec3(raw.normal));
+                        for point in &raw.points[..raw.count] {
+                            world.push(rotation_a.rotate_vec3(point.position), point.depth);
+                        }
+                        visit(triangle, part_b, &world, Vec3::ZERO);
+                    }
+                });
+            });
+            return;
+        }
+        if let Some(mesh) = self.mesh(shape_b) {
+            let inverse = rotation_b.conjugate();
+            self.for_each_part(shape_a, rotation_a, |part_a, part, at_a, turn_a| {
+                let center = inverse.rotate_vec3(at_a - center_b);
+                let turn = inverse * turn_a;
+                let area = Aabb::around(center, part.bounding_radius() + margin);
+                mesh.for_each_near(area, |triangle| {
+                    if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
+                    {
+                        let mut world = RawManifold::new(-rotation_b.rotate_vec3(raw.normal));
+                        for point in &raw.points[..raw.count] {
+                            let position = rotation_b.rotate_vec3(point.position) + center_b - at_a;
+                            world.push(position, point.depth);
+                        }
+                        visit(part_a, triangle, &world, at_a);
+                    }
+                });
+            });
+            return;
+        }
         self.for_each_part(shape_a, rotation_a, |part_a, shape_a, at_a, turn_a| {
             let reach_a = shape_a.bounding_radius();
             self.for_each_part(shape_b, rotation_b, |part_b, shape_b, at_b, turn_b| {
@@ -353,6 +418,46 @@ fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), Physics
 }
 
 impl PhysicsWorld {
+    fn push_mesh(&mut self, mesh: TriMesh) -> Result<Shape, PhysicsError> {
+        let id =
+            u32::try_from(self.bodies.assets.meshes.len()).map_err(|_| PhysicsError::OutOfRange)?;
+        self.bodies.assets.meshes.push(mesh);
+        Ok(Shape::TriMesh(MeshId(id)))
+    }
+
+    /// Heights go row by row, x across, z down, `columns` by `rows`. The first post sits at the
+    /// body origin.
+    ///
+    /// # Errors
+    /// Fails on a bad size, spacing or height.
+    pub fn add_heightfield(
+        &mut self,
+        columns: u32,
+        rows: u32,
+        spacing_x: f32,
+        spacing_z: f32,
+        heights: &[f32],
+    ) -> Result<Shape, PhysicsError> {
+        self.push_mesh(TriMesh::from_heights(
+            columns, rows, spacing_x, spacing_z, heights,
+        )?)
+    }
+
+    /// Static triangles, front faces counter clockwise. Bodies collide from the front only.
+    ///
+    /// # Errors
+    /// Fails on no triangles, non finite vertices, bad indexes or triangles with no area.
+    pub fn add_mesh(
+        &mut self,
+        vertices: &[Vec3],
+        triangles: &[[u32; 3]],
+    ) -> Result<Shape, PhysicsError> {
+        self.push_mesh(TriMesh::from_triangles(
+            vertices.to_vec(),
+            triangles.to_vec(),
+        )?)
+    }
+
     /// Registers a shape made of parts. Parts can not be compounds themselves.
     /// Mass adds up part by part, so overlapping parts count twice.
     ///

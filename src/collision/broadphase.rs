@@ -39,7 +39,7 @@ fn shape_extent(shape: &Shape, rotation: Quat) -> Vec3 {
                 + rotation.rotate_vec3(Vec3::Y * half_extents.y).abs()
                 + rotation.rotate_vec3(Vec3::Z * half_extents.z).abs()
         }
-        Shape::Compound(_) => Vec3::splat(f32::MAX),
+        Shape::Compound(_) | Shape::TriMesh(_) => Vec3::splat(f32::MAX),
     }
 }
 

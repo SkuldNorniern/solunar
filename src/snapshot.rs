@@ -5,13 +5,14 @@ use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 
 use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
+use crate::collision::trimesh::{MAX_TRIANGLES, TriMesh};
 use crate::compound::{Compound, MAX_COMPOUND_CHILDREN};
 use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
     BodyHandle, BodyKind, CollisionFilter, CompoundChild, CompoundId, FrameDesc, FrameId, Frames,
     GridPosition, JointAxis, JointDesc, JointKind, JointLimit, JointMotor, Joints, MassProperties,
-    Material, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
+    Material, MeshId, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
@@ -119,6 +120,11 @@ impl PhysicsWorld {
                 out.quat(child.rotation);
                 out.f32(child.density_scale);
             }
+        }
+
+        out.len(self.bodies.assets.meshes.len());
+        for mesh in &self.bodies.assets.meshes {
+            out.mesh(mesh);
         }
 
         out.len(self.bodies.slots.len());
@@ -316,6 +322,11 @@ fn read_bodies(
     for _ in 0..compound_count {
         bodies.assets.compounds.push(read_compound(reader)?);
     }
+    let mesh_count = reader.count(1, limits.max_slots)?;
+    bodies.assets.meshes.reserve(mesh_count);
+    for _ in 0..mesh_count {
+        bodies.assets.meshes.push(read_mesh(reader, limits)?);
+    }
     let slot_count = reader.count(SLOT_BYTES, limits.max_slots)?;
     bodies.slots.reserve(slot_count);
     for _ in 0..slot_count {
@@ -481,6 +492,36 @@ fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
         });
     }
     Compound::from_rebased(children, unit).map_err(|_| SnapshotError::Invalid("compound"))
+}
+
+fn read_mesh(reader: &mut Reader<'_>, limits: &SnapshotLimits) -> Result<TriMesh, SnapshotError> {
+    let bad = |_| SnapshotError::Invalid("mesh");
+    match reader.u8()? {
+        0 => {
+            let vertex_count = reader.count(12, MAX_TRIANGLES)?;
+            let mut vertices = Vec::with_capacity(vertex_count);
+            for _ in 0..vertex_count {
+                vertices.push(reader.vec3()?);
+            }
+            let count = reader.count(12, MAX_TRIANGLES)?;
+            let mut triangles = Vec::with_capacity(count);
+            for _ in 0..count {
+                triangles.push([reader.u32()?, reader.u32()?, reader.u32()?]);
+            }
+            TriMesh::from_triangles(vertices, triangles).map_err(bad)
+        }
+        1 => {
+            let (columns, rows) = (reader.u32()?, reader.u32()?);
+            let (spacing_x, spacing_z) = (reader.f32()?, reader.f32()?);
+            let count = reader.count(4, limits.max_bytes)?;
+            let mut heights = Vec::with_capacity(count);
+            for _ in 0..count {
+                heights.push(reader.f32()?);
+            }
+            TriMesh::from_heights(columns, rows, spacing_x, spacing_z, &heights).map_err(bad)
+        }
+        _ => Err(SnapshotError::Invalid("mesh kind")),
+    }
 }
 
 fn read_contacts(
@@ -782,6 +823,32 @@ impl Writer {
         }
     }
 
+    fn mesh(&mut self, mesh: &TriMesh) {
+        if let Some((columns, rows, spacing_x, spacing_z)) = mesh.grid {
+            self.u8(1);
+            self.u32(columns);
+            self.u32(rows);
+            self.f32(spacing_x);
+            self.f32(spacing_z);
+            self.len(mesh.vertices.len());
+            for vertex in &mesh.vertices {
+                self.f32(vertex.y);
+            }
+        } else {
+            self.u8(0);
+            self.len(mesh.vertices.len());
+            for vertex in &mesh.vertices {
+                self.vec3(*vertex);
+            }
+            self.len(mesh.triangles.len());
+            for triangle in &mesh.triangles {
+                for index in triangle {
+                    self.u32(*index);
+                }
+            }
+        }
+    }
+
     fn shape(&mut self, shape: &Shape) {
         let (tag, values) = match *shape {
             Shape::Sphere { radius } => (0, [radius, 0.0, 0.0]),
@@ -791,6 +858,7 @@ impl Writer {
                 half_height,
             } => (2, [radius, half_height, 0.0]),
             Shape::Compound(id) => (3, [f32::from_bits(id.0), 0.0, 0.0]),
+            Shape::TriMesh(id) => (4, [f32::from_bits(id.0), 0.0, 0.0]),
         };
         self.u8(tag);
         for value in values {
@@ -923,6 +991,7 @@ impl Reader<'_> {
             1 => Ok(Shape::cuboid(Vec3::new(values[0], values[1], values[2]))),
             2 => Ok(Shape::capsule(values[0], values[1])),
             3 => Ok(Shape::Compound(CompoundId(values[0].to_bits()))),
+            4 => Ok(Shape::TriMesh(MeshId(values[0].to_bits()))),
             _ => Err(SnapshotError::Invalid("shape kind")),
         }
     }

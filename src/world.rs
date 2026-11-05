@@ -6,7 +6,7 @@ use algebrix::{DQuat, DVec3, Quat, Vec3};
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::joint::JointKind;
 use crate::profile::StepTimes;
-use crate::sleep::{SleepScratch, plan_wakes, update_sleep};
+use crate::sleep::{SleepScratch, is_slow, plan_wakes, update_sleep};
 use crate::solver::{
     CachedManifold, ContactScratch, find_broad_pairs, finish_contacts, prepare_contacts,
     solve_substep,
@@ -670,6 +670,10 @@ impl PhysicsWorld {
             self.bodies.force[dense] = Vec3::ZERO;
             self.bodies.torque[dense] = Vec3::ZERO;
             self.bodies.asleep[dense] = !self.sleep.awake()[dense];
+            // recovery moves a body with no velocity to show for it, that is not resting
+            if !is_slow(result.recovery_linear, result.recovery_angular) {
+                self.bodies.still_time[dense] = 0.0;
+            }
         }
         Ok(())
     }

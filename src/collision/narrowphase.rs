@@ -23,7 +23,7 @@ pub(crate) struct RawManifold {
 }
 
 impl RawManifold {
-    fn new(normal: Vec3) -> Self {
+    pub(crate) fn new(normal: Vec3) -> Self {
         Self {
             normal,
             points: [RawPoint {
@@ -34,15 +34,30 @@ impl RawManifold {
         }
     }
 
-    fn push(&mut self, position: Vec3, depth: f32) {
+    pub(crate) fn push(&mut self, position: Vec3, depth: f32) {
         if self.count < MAX_CONTACTS {
             self.points[self.count] = RawPoint { position, depth };
             self.count += 1;
         }
     }
 
-    fn filled(self) -> Option<Self> {
+    pub(crate) fn filled(self) -> Option<Self> {
         (self.count > 0).then_some(self)
+    }
+
+    pub(crate) fn reduce_from(&mut self, kept: &[(Vec3, f32)]) {
+        let mut points = [RawPoint {
+            position: Vec3::ZERO,
+            depth: 0.0,
+        }; MAX_CLIP_POINTS];
+        let count = kept.len().min(MAX_CLIP_POINTS);
+        for (out, (position, depth)) in points.iter_mut().zip(kept) {
+            *out = RawPoint {
+                position: *position,
+                depth: *depth,
+            };
+        }
+        reduce(&points[..count], self);
     }
 }
 
@@ -106,7 +121,7 @@ fn rounded_segment(shape: &Shape, rotation: Quat) -> Option<(Vec3, f32)> {
             radius,
             half_height,
         } => Some((rotation.rotate_vec3(Vec3::Y * half_height), radius)),
-        Shape::Cuboid { .. } | Shape::Compound(_) => None,
+        Shape::Cuboid { .. } | Shape::Compound(_) | Shape::TriMesh(_) => None,
     }
 }
 

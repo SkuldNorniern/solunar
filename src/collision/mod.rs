@@ -2,6 +2,7 @@ mod broadphase;
 mod gjk;
 mod narrowphase;
 mod query;
+pub(crate) mod trimesh;
 
 pub(crate) use broadphase::{Bounds, find_pairs};
 pub(crate) use narrowphase::{MAX_CONTACTS, RawManifold, contacts};

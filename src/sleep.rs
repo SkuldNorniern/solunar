@@ -45,6 +45,11 @@ impl SleepScratch {
     }
 }
 
+pub(crate) fn is_slow(linear: Vec3, angular: Vec3) -> bool {
+    linear.length_squared() < SLEEP_LINEAR_SQUARED
+        && angular.length_squared() < SLEEP_ANGULAR_SQUARED
+}
+
 fn is_moving(bodies: &Bodies, awake: &[bool], dense: usize) -> bool {
     match bodies.kind[dense] {
         BodyKind::Dynamic => awake[dense],
@@ -205,9 +210,7 @@ pub(crate) fn update_sleep(
         if bodies.kind[dense] != BodyKind::Dynamic || bodies.asleep[dense] {
             continue;
         }
-        let slow = bodies.can_sleep[dense]
-            && bodies.linear[dense].length_squared() < SLEEP_LINEAR_SQUARED
-            && bodies.angular[dense].length_squared() < SLEEP_ANGULAR_SQUARED;
+        let slow = bodies.can_sleep[dense] && is_slow(bodies.linear[dense], bodies.angular[dense]);
         bodies.still_time[dense] = if slow {
             (bodies.still_time[dense] + dt).min(SLEEP_TIME)
         } else {
@@ -348,6 +351,29 @@ mod tests {
             assert_eq!(world.body_state(*body).unwrap(), *old);
         }
         assert_eq!(world.contact_cache, cache);
+    }
+
+    #[test]
+    fn a_body_still_being_pushed_out_does_not_sleep() {
+        let mut world = world();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 20.0, 50.0)))
+                    .local_position(Vec3::new(0.0, -20.0, 0.0)),
+            )
+            .unwrap();
+        // 8 m deep at 3 m/s of recovery takes well past the sleep time, with no real velocity
+        let body = world
+            .spawn(cube().local_position(Vec3::new(0.0, -8.0, 0.0)))
+            .unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+            let state = world.body_state(body).unwrap();
+            if state.asleep {
+                assert!((state.position.local.y - 0.5).abs() < 0.05, "{state:?}");
+            }
+        }
+        assert!(world.body_state(body).unwrap().asleep);
     }
 
     #[test]

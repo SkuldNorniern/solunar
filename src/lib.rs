@@ -19,7 +19,7 @@ pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 pub use body::{BodyHandle, BodyKind, BodyState, RigidBodyDesc};
 pub use collision::{CastHit, CollisionFilter, PointHit, QueryFilter, Ray, ShapeCast};
 pub use command::{ApplyReport, Command, CommandBuffer};
-pub use compound::{CompoundChild, CompoundId, CompoundInfo};
+pub use compound::{CompoundChild, CompoundId, CompoundInfo, MeshId};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
