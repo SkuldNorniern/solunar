@@ -568,7 +568,8 @@ impl PhysicsWorld {
         let started = Instant::now();
         self.prepare_frame_gravity()?;
         self.joints.refresh_exclusions();
-        find_broad_pairs(&self.bodies, &mut self.contact_scratch);
+        let dt = self.settings.fixed_timestep;
+        find_broad_pairs(&self.bodies, &mut self.contact_scratch, dt);
         plan_wakes(
             &self.bodies,
             &self.contact_cache,
@@ -576,6 +577,7 @@ impl PhysicsWorld {
             self.contact_scratch.pairs(),
             self.recheck_sleepers,
             &mut self.sleep,
+            dt,
         );
         let count = self.bodies.len();
         self.scratch.clear();
@@ -588,7 +590,6 @@ impl PhysicsWorld {
         let bodies = &self.bodies;
         let frame_gravity = &self.frame_gravity;
         let awake = self.sleep.awake();
-        let dt = self.settings.fixed_timestep;
         let substeps = self.settings.substeps;
         let part = dt / substeps as f32;
         let mut next_cache = self.contact_cache.clone();
@@ -611,7 +612,7 @@ impl PhysicsWorld {
                 &self.joints,
                 &mut self.scratch,
                 &mut self.contact_scratch,
-                substep,
+                (substep, substep + 1 == substeps),
                 part,
             );
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {

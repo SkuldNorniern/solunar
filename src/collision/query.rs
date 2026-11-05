@@ -500,7 +500,7 @@ fn ray_box(origin: DVec3, direction: DVec3, extents: Vec3, max: f64) -> Option<(
 
 /// Conservative advancement. Hulls can close no faster than the speed along their separation.
 /// Returns time, normal facing the mover, and the contact relative to the cast origin.
-fn sweep(
+pub(crate) fn sweep(
     moving: &Hull,
     moving_radius: f64,
     target: &Hull,

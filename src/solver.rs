@@ -7,10 +7,12 @@ use crate::joint::{
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
 use crate::world::Integrated;
-use crate::{BodyHandle, BodyKind};
+use crate::{BodyHandle, BodyKind, Shape};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
+/// Past this much travel in one step a pair counts as fast, and contacts reach as far as it moves.
+const FAST_MOTION: f32 = 0.1;
 /// Per substep. Odd on purpose, 2 and 4 left stacks jittering far more than 3.
 const VELOCITY_ITERATIONS: usize = 3;
 const RECOVERY_ITERATIONS: usize = 1;
@@ -44,7 +46,6 @@ struct SolverPoint {
     mass: Vec3,
     target: f32,
     bounce: f32,
-    depth: f32,
     recovery: f32,
     recovery_impulse: f32,
     impulse: Vec3,
@@ -104,14 +105,52 @@ impl std::fmt::Debug for SolverManifold {
     }
 }
 
-pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch) {
+/// How far the surface of a body can travel in one step, turning included.
+fn step_motion(bodies: &Bodies, dense: usize, dt: f32) -> f32 {
+    if bodies.kind[dense] == BodyKind::Static {
+        return 0.0;
+    }
+    let shape = &bodies.shape[dense];
+    let reach = if matches!(shape, Shape::TriMesh(_)) {
+        0.0
+    } else {
+        bodies.assets.bounding_radius(shape)
+    };
+    (bodies.linear[dense].length() + bodies.angular[dense].length() * reach) * dt
+}
+
+/// Contacts of a pair exist this far apart. The bounds cover at least this much.
+pub(crate) fn pair_margin(bodies: &Bodies, a: usize, b: usize, dt: f32) -> f32 {
+    let motion = step_motion(bodies, a, dt) + step_motion(bodies, b, dt);
+    if motion > FAST_MOTION {
+        CONTACT_MARGIN + motion
+    } else {
+        CONTACT_MARGIN
+    }
+}
+
+/// Straight travel of B against A this step. `None` when turning matters, a straight sweep
+/// could not rule the contact out then.
+fn straight_motion(bodies: &Bodies, a: usize, b: usize, dt: f32) -> Option<Vec3> {
+    let turning = |dense: usize| {
+        let shape = &bodies.shape[dense];
+        if matches!(shape, Shape::TriMesh(_)) {
+            0.0
+        } else {
+            bodies.angular[dense].length() * bodies.assets.bounding_radius(shape) * dt
+        }
+    };
+    (turning(a) + turning(b) <= CONTACT_MARGIN).then(|| (bodies.linear[b] - bodies.linear[a]) * dt)
+}
+
+pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch, dt: f32) {
     scratch.bounds.clear();
     for dense in 0..bodies.len() {
         scratch.bounds.push(bodies.assets.bounds(
             &bodies.shape[dense],
             bodies.position(dense),
             bodies.rotation[dense],
-            CONTACT_MARGIN,
+            CONTACT_MARGIN + 2.0 * step_motion(bodies, dense, dt),
         ));
     }
     find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
@@ -144,7 +183,7 @@ pub(crate) fn solve_substep(
     joints: &Joints,
     state: &mut [Integrated],
     scratch: &mut ContactScratch,
-    substep: u32,
+    (substep, last): (u32, bool),
     dt: f32,
 ) {
     build_rows(
@@ -158,7 +197,7 @@ pub(crate) fn solve_substep(
         dt,
     );
     for manifold in &mut scratch.manifolds {
-        refresh_manifold(state, manifold, dt);
+        refresh_manifold(state, manifold, last, dt);
     }
     for point in &scratch.joint_points {
         warm_start_point(bodies, state, point);
@@ -212,16 +251,30 @@ pub(crate) fn solve_substep(
 }
 
 /// Bodies moved since the contacts were found, so gaps and arms follow them.
-fn refresh_manifold(state: &[Integrated], manifold: &mut SolverManifold, dt: f32) {
+fn refresh_manifold(state: &[Integrated], manifold: &mut SolverManifold, last: bool, dt: f32) {
     let (a, b) = (&state[manifold.a], &state[manifold.b]);
     let center_b = b.position.offset_from(a.position).as_vec3();
     let normal = manifold.axes[0];
     for point in &mut manifold.points[..manifold.count] {
         point.offset_a = a.rotation.rotate_vec3(point.local_a);
         point.offset_b = b.rotation.rotate_vec3(point.local_b);
-        let gap = (center_b + point.offset_b - point.offset_a).dot(normal) - point.depth;
-        // still apart it may close the gap, and only arriving can bounce
-        point.target = if gap > 0.0 { -gap / dt } else { point.bounce };
+        let gap = (center_b + point.offset_b - point.offset_a).dot(normal);
+        // still apart it may close the gap, and only arriving can bounce. arriving in the last
+        // substep would clamp the speed the next step's bounce is worked out from, so it bounces now
+        let speed = relative_velocity(
+            state,
+            manifold.a,
+            manifold.b,
+            point.offset_a,
+            point.offset_b,
+        )
+        .dot(normal);
+        let arrives = -speed * dt >= gap;
+        point.target = if gap > 0.0 && !(last && arrives && point.bounce > 0.0) {
+            -gap / dt
+        } else {
+            point.bounce
+        };
         point.recovery =
             (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
         point.recovery_impulse = 0.0;
@@ -295,7 +348,8 @@ fn build_manifolds(
             (&bodies.shape[a], bodies.rotation[a]),
             (&bodies.shape[b], bodies.rotation[b]),
             center_b,
-            CONTACT_MARGIN,
+            pair_margin(bodies, a, b, dt),
+            straight_motion(bodies, a, b, dt),
             |part_a, part_b, raw, at_a| {
                 manifolds.push(contact_manifold(
                     bodies,
@@ -362,8 +416,11 @@ fn contact_manifold(
     let inverse_rotation_b = bodies.rotation[b].conjugate();
     let mut claimed = [false; MAX_CONTACTS];
     for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
-        let offset_a = point.position + at_a;
-        let offset_b = offset_a - center_b;
+        // raw points sit between the surfaces, each side anchors on its own. an anchor out in the
+        // gap would swing on a long lever as soon as the body turned
+        let middle = point.position + at_a;
+        let offset_a = middle + normal * (point.depth * 0.5);
+        let offset_b = middle - normal * (point.depth * 0.5) - center_b;
         let local_a = inverse_rotation_a.rotate_vec3(offset_a);
         let local_b = inverse_rotation_b.rotate_vec3(offset_b);
         let mut mass = Vec3::ZERO;
@@ -393,7 +450,6 @@ fn contact_manifold(
             mass,
             target: 0.0,
             bounce,
-            depth: point.depth,
             recovery: 0.0,
             recovery_impulse: 0.0,
             impulse: matching_impulse(old, local_a, &mut claimed),
@@ -827,6 +883,199 @@ mod tests {
             assert!(state.position.local.z.abs() < 0.02);
             assert!(state.linear_velocity.length() < 0.1);
         }
+    }
+
+    fn wall(world: &mut PhysicsWorld, x: f32) -> BodyHandle {
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(0.05, 5.0, 5.0)))
+                    .local_position(Vec3::new(x, 0.0, 0.0)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn fast_bodies_do_not_pass_a_thin_wall() {
+        for speed in [50.0, 200.0, 1000.0, 5000.0] {
+            for shape in [
+                Shape::sphere(0.25),
+                Shape::cuboid(Vec3::splat(0.25)),
+                Shape::capsule(0.1, 0.5),
+            ] {
+                let mut world = no_gravity();
+                wall(&mut world, 3.0);
+                let bullet = world
+                    .spawn(
+                        RigidBodyDesc::dynamic(shape)
+                            .local_position(Vec3::new(-20.0, 0.1, 0.2))
+                            .linear_velocity(Vec3::new(speed, 0.0, 0.0)),
+                    )
+                    .unwrap();
+                run(&mut world, 1.0);
+                let at = world.body_state(bullet).unwrap().position.local.x;
+                assert!(at < 2.95, "{shape:?} at {speed} m/s ended at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn thin_bullet_stops_on_thin_plate_at_the_surface() {
+        let mut world = no_gravity();
+        wall(&mut world, 3.0);
+        let bullet = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.02))
+                    .local_position(Vec3::new(-10.0, 0.0, 0.0))
+                    .linear_velocity(Vec3::new(800.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        run(&mut world, 0.5);
+        let state = world.body_state(bullet).unwrap();
+        assert!((state.position.local.x - 2.93).abs() < 0.01, "{state:?}");
+        assert!(state.linear_velocity.x.abs() < 1.0, "{state:?}");
+    }
+
+    #[test]
+    fn fast_ball_keeps_its_restitution() {
+        let mut world = no_gravity();
+        wall(&mut world, 3.0);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.25))
+                    .material(Material {
+                        restitution: 0.5,
+                        ..Material::default()
+                    })
+                    .local_position(Vec3::new(-20.0, 0.0, 0.0))
+                    .linear_velocity(Vec3::new(200.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        run(&mut world, 0.5);
+        let speed = world.body_state(ball).unwrap().linear_velocity.x;
+        assert!((speed + 100.0).abs() < 2.0, "{speed}");
+    }
+
+    #[test]
+    fn fast_ball_flying_past_a_corner_is_not_touched() {
+        let mut world = no_gravity();
+        world
+            .spawn(RigidBodyDesc::fixed(Shape::cuboid(Vec3::splat(1.0))))
+            .unwrap();
+        // the path closes in on the box and leaves it 0.3 m clear of the corner
+        let start = Vec3::new(-6.0, 2.3 - 0.5, 0.0);
+        let velocity = Vec3::new(100.0, 100.0 * 0.5 / 6.0, 0.0);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.05))
+                    .local_position(start)
+                    .linear_velocity(velocity),
+            )
+            .unwrap();
+        run(&mut world, 0.5);
+        let state = world.body_state(ball).unwrap();
+        assert_eq!(state.linear_velocity, velocity, "{state:?}");
+    }
+
+    #[test]
+    fn fast_ball_hits_a_body_and_momentum_stays() {
+        let mut world = no_gravity();
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.1))
+                    .density(1000.0)
+                    .local_position(Vec3::new(-30.0, 0.0, 0.0))
+                    .linear_velocity(Vec3::new(300.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        let target = world
+            .spawn(RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(0.05, 1.0, 1.0))).density(1000.0))
+            .unwrap();
+        run(&mut world, 0.5);
+        let mass_ball = 1000.0 * 4.0 / 3.0 * std::f32::consts::PI * 0.001;
+        let mass_target = 1000.0 * 0.1 * 2.0 * 2.0;
+        let total = world.body_state(ball).unwrap().linear_velocity.x * mass_ball
+            + world.body_state(target).unwrap().linear_velocity.x * mass_target;
+        let expected = 300.0 * mass_ball;
+        assert!(
+            (total - expected).abs() < expected * 1e-2,
+            "{total} {expected}"
+        );
+        assert!(world.body_state(target).unwrap().linear_velocity.x > 0.1);
+    }
+
+    #[test]
+    fn fast_spinning_bar_does_not_pass_a_ball() {
+        let mut world = no_gravity();
+        world
+            .spawn(
+                RigidBodyDesc::kinematic(Shape::cuboid(Vec3::new(4.0, 0.02, 0.2)))
+                    .angular_velocity(Vec3::new(0.0, 0.0, 200.0)),
+            )
+            .unwrap();
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.1)).local_position(Vec3::new(3.0, 0.5, 0.0)),
+            )
+            .unwrap();
+        run(&mut world, 0.2);
+        let speed = world.body_state(ball).unwrap().linear_velocity.length();
+        assert!(speed > 1.0, "{speed}");
+    }
+
+    #[test]
+    fn fast_hit_wakes_a_sleeping_stack_cleanly() {
+        let mut world = world();
+        ground(&mut world);
+        let boxes: Vec<_> = (0..3)
+            .map(|level| {
+                world
+                    .spawn(
+                        RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))
+                            .local_position(Vec3::new(0.0, 0.5 + level as f32, 0.0)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        run(&mut world, 2.0);
+        assert!(world.body_state(boxes[0]).unwrap().asleep);
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.2))
+                    .density(5000.0)
+                    .local_position(Vec3::new(-20.0, 1.5, 0.0))
+                    .linear_velocity(Vec3::new(300.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+            for body in &boxes {
+                let state = world.body_state(*body).unwrap();
+                if state.asleep {
+                    assert_eq!(state.linear_velocity, Vec3::ZERO, "{state:?}");
+                }
+            }
+        }
+        assert!(world.body_state(boxes[1]).unwrap().linear_velocity.x > 0.1);
+    }
+
+    #[test]
+    fn fast_drop_stays_on_terrain() {
+        let mut world = world();
+        let heights = vec![0.0; 25];
+        let shape = world.add_heightfield(5, 5, 4.0, 4.0, &heights).unwrap();
+        world
+            .spawn(RigidBodyDesc::fixed(shape).local_position(Vec3::new(-8.0, 0.0, -8.0)))
+            .unwrap();
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.25))
+                    .local_position(Vec3::new(0.3, 40.0, 0.2))
+                    .linear_velocity(Vec3::new(0.0, -500.0, 0.0)),
+            )
+            .unwrap();
+        run(&mut world, 1.0);
+        let y = world.body_state(ball).unwrap().position.local.y;
+        assert!((y - 0.25).abs() < 0.02, "{y}");
     }
 
     #[test]

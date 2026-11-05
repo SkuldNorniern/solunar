@@ -5,7 +5,9 @@ mod query;
 pub(crate) mod trimesh;
 
 pub(crate) use broadphase::{Bounds, find_pairs};
+pub(crate) use gjk::Hull;
 pub(crate) use narrowphase::{MAX_CONTACTS, RawManifold, contacts};
+pub(crate) use query::sweep;
 pub use query::{CastHit, PointHit, QueryFilter, Ray, ShapeCast};
 
 /// A pair collides when each body's `layers` hits the other's `mask`.

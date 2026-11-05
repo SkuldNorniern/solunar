@@ -2,8 +2,8 @@ use algebrix::Vec3;
 
 use crate::body::Bodies;
 use crate::joint::Joints;
-use crate::solver::CONTACT_MARGIN;
 use crate::solver::CachedManifold;
+use crate::solver::pair_margin;
 use crate::{BodyHandle, BodyKind};
 
 const SLEEP_TIME: f32 = 0.5;
@@ -69,6 +69,7 @@ pub(crate) fn plan_wakes(
     pairs: &[(u32, u32)],
     recheck: bool,
     scratch: &mut SleepScratch,
+    dt: f32,
 ) {
     scratch.awake.clear();
     scratch
@@ -127,7 +128,7 @@ pub(crate) fn plan_wakes(
                     .position(other)
                     .offset_from(bodies.position(sleeper))
                     .as_vec3(),
-                CONTACT_MARGIN,
+                pair_margin(bodies, sleeper, other, dt),
             )
         {
             scratch.flagged[sleeper] = true;

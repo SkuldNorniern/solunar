@@ -1,7 +1,8 @@
 use algebrix::{DQuat, DVec3, Mat3, Quat, Vec3};
 
 use crate::collision::trimesh::{Aabb, TriMesh, triangle_contact};
-use crate::collision::{Bounds, RawManifold, contacts};
+use crate::collision::{Bounds, Hull, RawManifold, contacts, sweep};
+use crate::solver::CONTACT_MARGIN;
 use crate::{GridPosition, MassProperties, PhysicsError, PhysicsWorld, Shape};
 
 pub(crate) const MAX_COMPOUND_CHILDREN: usize = 1 << 16;
@@ -245,6 +246,7 @@ impl ShapeAssets {
         (shape_b, rotation_b): (&Shape, Quat),
         center_b: Vec3,
         margin: f32,
+        motion: Option<Vec3>,
         mut visit: impl FnMut(u32, u32, &RawManifold, Vec3),
     ) {
         if let Some(mesh) = self.mesh(shape_a) {
@@ -253,9 +255,20 @@ impl ShapeAssets {
                 let center = inverse.rotate_vec3(center_b + at_b);
                 let turn = inverse * turn_b;
                 let area = Aabb::around(center, part.bounding_radius() + margin);
+                let local_motion = motion.map(|travel| inverse.rotate_vec3(travel));
                 mesh.for_each_near(area, |triangle| {
                     if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
                     {
+                        if !will_meet_triangle(
+                            &raw,
+                            mesh,
+                            triangle,
+                            (part, turn),
+                            center,
+                            local_motion,
+                        ) {
+                            return;
+                        }
                         let mut world = RawManifold::new(rotation_a.rotate_vec3(raw.normal));
                         for point in &raw.points[..raw.count] {
                             world.push(rotation_a.rotate_vec3(point.position), point.depth);
@@ -272,9 +285,21 @@ impl ShapeAssets {
                 let center = inverse.rotate_vec3(at_a - center_b);
                 let turn = inverse * turn_a;
                 let area = Aabb::around(center, part.bounding_radius() + margin);
+                // the part moves against the mesh, so its travel is the opposite of B's
+                let local_motion = motion.map(|travel| inverse.rotate_vec3(-travel));
                 mesh.for_each_near(area, |triangle| {
                     if let Some(raw) = triangle_contact(mesh, triangle, part, turn, center, margin)
                     {
+                        if !will_meet_triangle(
+                            &raw,
+                            mesh,
+                            triangle,
+                            (part, turn),
+                            center,
+                            local_motion,
+                        ) {
+                            return;
+                        }
                         let mut world = RawManifold::new(-rotation_b.rotate_vec3(raw.normal));
                         for point in &raw.points[..raw.count] {
                             let position = rotation_b.rotate_vec3(point.position) + center_b - at_a;
@@ -294,7 +319,9 @@ impl ShapeAssets {
                 if center.length_squared() > reach * reach {
                     return;
                 }
-                if let Some(raw) = contacts(shape_a, turn_a, shape_b, turn_b, center, margin) {
+                if let Some(raw) = contacts(shape_a, turn_a, shape_b, turn_b, center, margin)
+                    && will_meet(&raw, (shape_a, turn_a), (shape_b, turn_b), center, motion)
+                {
                     visit(part_a, part_b, &raw, at_a);
                 }
             });
@@ -309,9 +336,62 @@ impl ShapeAssets {
         margin: f32,
     ) -> bool {
         let mut found = false;
-        self.for_each_contact(a, b, center_b, margin, |_, _, _, _| found = true);
+        self.for_each_contact(a, b, center_b, margin, None, |_, _, _, _| found = true);
         found
     }
+}
+
+/// A far contact only stays when the sweep really reaches the other shape. A flat contact
+/// plane reaches past a corner, so a body flying by would hit nothing and still get stopped.
+fn will_meet_hulls(
+    moving: (Hull, f64),
+    target: (Hull, f64),
+    raw: &RawManifold,
+    travel: Option<Vec3>,
+) -> bool {
+    let touching = raw.points[..raw.count]
+        .iter()
+        .any(|point| point.depth >= -CONTACT_MARGIN);
+    let Some(travel) = travel else {
+        return true;
+    };
+    let length = travel.length();
+    if touching || length <= 1e-6 {
+        return true;
+    }
+    let direction = DVec3::from_vec3(travel) / f64::from(length);
+    let reach = f64::from(length) + f64::from(CONTACT_MARGIN);
+    sweep(&moving.0, moving.1, &target.0, target.1, direction, reach).is_some()
+}
+
+fn will_meet(
+    raw: &RawManifold,
+    (shape_a, turn_a): (&Shape, Quat),
+    (shape_b, turn_b): (&Shape, Quat),
+    center: Vec3,
+    travel: Option<Vec3>,
+) -> bool {
+    let target = Hull::of(shape_a, turn_a, DVec3::ZERO);
+    let moving = Hull::of(shape_b, turn_b, DVec3::from_vec3(center));
+    will_meet_hulls(moving, target, raw, travel)
+}
+
+fn will_meet_triangle(
+    raw: &RawManifold,
+    mesh: &TriMesh,
+    triangle: u32,
+    part: (&Shape, Quat),
+    center: Vec3,
+    travel: Option<Vec3>,
+) -> bool {
+    let [a, b, c] = mesh.triangle(triangle);
+    let target = Hull::Triangle(
+        DVec3::from_vec3(a),
+        DVec3::from_vec3(b),
+        DVec3::from_vec3(c),
+    );
+    let moving = Hull::of(part.0, part.1, DVec3::from_vec3(center));
+    will_meet_hulls(moving, (target, 0.0), raw, travel)
 }
 
 /// Eigenvalues and right handed eigenvector columns of a symmetric matrix (cyclic Jacobi).
