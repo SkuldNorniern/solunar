@@ -540,16 +540,19 @@ impl PhysicsWorld {
         }
         self.accumulator += real_seconds;
         let timestep = f64::from(self.settings.fixed_timestep);
+        // 1/60 as f32 is a hair over 1/60 as f64, and the gap grows with queued steps, so exact
+        // multiples of the step would come up one short
+        let due = timestep * (1.0 - 1e-3);
         let mut steps = 0;
-        while self.accumulator >= timestep && steps < self.settings.max_steps_per_advance {
+        while self.accumulator >= due && steps < self.settings.max_steps_per_advance {
             self.step_fixed()?;
-            self.accumulator -= timestep;
+            self.accumulator = (self.accumulator - timestep).max(0.0);
             steps += 1;
         }
         Ok(Advance {
             steps,
             alpha: (self.accumulator / timestep).min(1.0) as f32,
-            overloaded: self.accumulator >= timestep,
+            overloaded: self.accumulator >= due,
         })
     }
 
@@ -1178,6 +1181,22 @@ mod tests {
             world.apply_torque(body, Vec3::splat(f32::MAX)),
             Err(PhysicsError::NonFinite("torque"))
         );
+    }
+
+    #[test]
+    fn whole_seconds_of_real_time_give_whole_steps() {
+        let mut world = world();
+        let mut steps = 0;
+        for _ in 0..180 {
+            steps += world.advance(1.0 / 60.0).unwrap().steps;
+        }
+        assert_eq!(steps, 180);
+        let mut world = self::world();
+        assert_eq!(world.advance(3.0).unwrap().steps, 8);
+        for _ in 0..30 {
+            world.advance(0.0).unwrap();
+        }
+        assert_eq!(world.tick(), 180);
     }
 
     #[test]
