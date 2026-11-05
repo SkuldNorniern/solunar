@@ -3,7 +3,7 @@ use algebrix::Vec3;
 use crate::body::{Bodies, apply_diagonal};
 use crate::collision::{Bounds, MAX_CONTACTS, collide, find_pairs};
 use crate::world::Integrated;
-use crate::{BodyHandle, BodyKind, CELL_SIZE, GridPosition};
+use crate::{BodyHandle, BodyKind};
 
 const VELOCITY_ITERATIONS: usize = 10;
 const RECOVERY_RATE: f32 = 0.2;
@@ -113,7 +113,7 @@ fn build_manifolds(
     for dense in 0..bodies.len() {
         scratch.bounds.push(Bounds::of(
             &bodies.shape[dense],
-            position_of(bodies, dense),
+            bodies.position(dense),
             bodies.rotation[dense],
         ));
     }
@@ -131,7 +131,7 @@ fn build_manifolds(
         if bodies.handle_at(a) > bodies.handle_at(b) {
             std::mem::swap(&mut a, &mut b);
         }
-        let center_b = relative(position_of(bodies, a), position_of(bodies, b));
+        let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
         let Some(raw) = collide(
             &bodies.shape[a],
             bodies.rotation[a],
@@ -367,27 +367,6 @@ fn tangent_of(normal: Vec3) -> Vec3 {
         Vec3::Y
     };
     normal.cross(helper).normalize()
-}
-
-fn position_of(bodies: &Bodies, dense: usize) -> GridPosition {
-    GridPosition {
-        cell: bodies.cell[dense],
-        local: bodies.local[dense],
-    }
-}
-
-/// Difference of cells first, so it stays exact far from the origin.
-fn relative(from: GridPosition, to: GridPosition) -> Vec3 {
-    let size = f64::from(CELL_SIZE);
-    let axis = |cell_to: i32, cell_from: i32, local_to: f32, local_from: f32| {
-        ((f64::from(cell_to) - f64::from(cell_from)) * size + f64::from(local_to)
-            - f64::from(local_from)) as f32
-    };
-    Vec3::new(
-        axis(to.cell.x, from.cell.x, to.local.x, from.local.x),
-        axis(to.cell.y, from.cell.y, to.local.y, from.local.y),
-        axis(to.cell.z, from.cell.z, to.local.z, from.local.z),
-    )
 }
 
 #[cfg(test)]

@@ -1,8 +1,11 @@
 mod broadphase;
+mod gjk;
 mod narrowphase;
+mod query;
 
 pub(crate) use broadphase::{Bounds, find_pairs};
 pub(crate) use narrowphase::{MAX_CONTACTS, collide};
+pub use query::{CastHit, PointHit, QueryFilter, Ray, ShapeCast};
 
 /// A pair collides when each body's `layers` hits the other's `mask`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

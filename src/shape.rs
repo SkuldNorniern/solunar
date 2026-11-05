@@ -55,6 +55,18 @@ impl Shape {
         }
     }
 
+    /// Radius of a sphere around the center that holds the whole shape.
+    pub fn bounding_radius(&self) -> f32 {
+        match *self {
+            Self::Sphere { radius } => radius,
+            Self::Cuboid { half_extents } => half_extents.length(),
+            Self::Capsule {
+                radius,
+                half_height,
+            } => radius + half_height,
+        }
+    }
+
     pub fn volume(&self) -> f32 {
         match *self {
             Self::Sphere { radius } => 4.0 / 3.0 * PI * radius * radius * radius,

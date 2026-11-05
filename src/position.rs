@@ -47,6 +47,33 @@ impl GridPosition {
         )
     }
 
+    /// Difference of cells first, so it stays exact far from the origin.
+    pub fn offset_from(self, from: Self) -> DVec3 {
+        let size = f64::from(CELL_SIZE);
+        let axis = |cell_to: i32, cell_from: i32, local_to: f32, local_from: f32| {
+            (f64::from(cell_to) - f64::from(cell_from)) * size + f64::from(local_to)
+                - f64::from(local_from)
+        };
+        DVec3::new(
+            axis(self.cell.x, from.cell.x, self.local.x, from.local.x),
+            axis(self.cell.y, from.cell.y, self.local.y, from.local.y),
+            axis(self.cell.z, from.cell.z, self.local.z, from.local.z),
+        )
+    }
+
+    /// `None` if the cell overflows.
+    pub fn shifted(self, offset: DVec3) -> Option<Self> {
+        let moved = Self::from_dvec3(DVec3::from_vec3(self.local) + offset)?;
+        Some(Self {
+            cell: IVec3::new(
+                self.cell.x.checked_add(moved.cell.x)?,
+                self.cell.y.checked_add(moved.cell.y)?,
+                self.cell.z.checked_add(moved.cell.z)?,
+            ),
+            local: moved.local,
+        })
+    }
+
     /// Moves whole cells out of `local`. `None` if not finite or the cell overflows.
     pub fn rebased(self) -> Option<Self> {
         let (x, local_x) = rebase_axis(self.cell.x, self.local.x)?;

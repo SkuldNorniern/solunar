@@ -172,6 +172,13 @@ impl Bodies {
         }
     }
 
+    pub(crate) fn position(&self, dense: usize) -> GridPosition {
+        GridPosition {
+            cell: self.cell[dense],
+            local: self.local[dense],
+        }
+    }
+
     /// Desc must be validated by the caller.
     pub(crate) fn insert(&mut self, desc: &RigidBodyDesc) -> Result<BodyHandle, PhysicsError> {
         let dense = u32::try_from(self.len())

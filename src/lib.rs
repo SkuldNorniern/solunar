@@ -14,7 +14,7 @@ mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 pub use body::{BodyHandle, BodyKind, BodyState, RigidBodyDesc};
-pub use collision::CollisionFilter;
+pub use collision::{CastHit, CollisionFilter, PointHit, QueryFilter, Ray, ShapeCast};
 pub use command::{ApplyReport, Command, CommandBuffer};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
