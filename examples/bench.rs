@@ -189,9 +189,11 @@ fn rb01() -> Result<Outcome> {
         times,
         unit: "ms",
         check: format!(
-            "{} awake, fastest {:.2} m/s",
+            "{} awake, fastest {:.2} m/s, {} islands, largest {}",
             world.body_count() - 1 - world.sleeping_body_count(),
-            max_speed(&world)?
+            max_speed(&world)?,
+            world.island_stats().count,
+            world.island_stats().largest_bodies
         ),
     })
 }
