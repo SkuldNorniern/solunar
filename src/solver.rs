@@ -1,7 +1,7 @@
 use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
-use crate::collision::{Bounds, MAX_CONTACTS, RawManifold, find_pairs};
+use crate::collision::{Bounds, MAX_CONTACTS, MovingPairs, RawManifold, find_pairs};
 use crate::joint::{
     JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
@@ -72,6 +72,7 @@ pub(crate) struct ContactScratch {
     bounds: Vec<Bounds>,
     order: Vec<u32>,
     pairs: Vec<(u32, u32)>,
+    moving: MovingPairs,
     manifolds: Vec<SolverManifold>,
     joint_points: Vec<JointPoint>,
     joint_rows: Vec<JointRow>,
@@ -239,7 +240,14 @@ fn straight_motion(bodies: &Bodies, a: usize, b: usize, dt: f32) -> Option<Vec3>
     (turning(a) + turning(b) <= CONTACT_MARGIN).then(|| (bodies.linear[b] - bodies.linear[a]) * dt)
 }
 
-pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch, dt: f32) {
+/// With `every`, all overlapping pairs. Otherwise only pairs with a moving body, the rest stay
+/// still, and `add_woken_pairs` fills in what wakes.
+pub(crate) fn find_broad_pairs(
+    bodies: &Bodies,
+    scratch: &mut ContactScratch,
+    every: bool,
+    dt: f32,
+) {
     scratch.bounds.clear();
     for dense in 0..bodies.len() {
         scratch.bounds.push(bodies.assets.bounds(
@@ -249,7 +257,22 @@ pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch, dt
             CONTACT_MARGIN + 2.0 * step_motion(bodies, dense, dt),
         ));
     }
-    find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
+    if every {
+        find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
+    } else {
+        let moving = |dense: usize| bodies.kind[dense] != BodyKind::Static && !bodies.asleep[dense];
+        scratch
+            .moving
+            .find(&scratch.bounds, moving, &mut scratch.pairs);
+    }
+}
+
+/// Pairs for sleepers that `awake` wakes this step.
+pub(crate) fn add_woken_pairs(bodies: &Bodies, awake: &[bool], scratch: &mut ContactScratch) {
+    let woken = (0..bodies.len()).filter(|dense| bodies.asleep[*dense] && awake[*dense]);
+    scratch
+        .moving
+        .add_woken(&scratch.bounds, woken, &mut scratch.pairs);
 }
 
 /// Finds contacts once per step and loads the working joint impulses.

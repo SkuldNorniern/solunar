@@ -19,6 +19,10 @@ impl Bounds {
         }
     }
 
+    fn overlaps(&self, other: &Self) -> bool {
+        self.min.x <= other.max.x && other.min.x <= self.max.x && self.overlaps_yz(other)
+    }
+
     fn overlaps_yz(&self, other: &Self) -> bool {
         self.min.y <= other.max.y
             && other.min.y <= self.max.y
@@ -43,10 +47,19 @@ fn shape_extent(shape: &Shape, rotation: Quat) -> Vec3 {
     }
 }
 
+/// Passive bodies wider than this on x are checked against every mover, not swept.
+const WIDE: f64 = 16.0;
+
 /// Sort and sweep on x. Fills `pairs` with overlapping index pairs, low index first, sorted.
 pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Vec<(u32, u32)>) {
     order.clear();
     order.extend(0..bounds.len() as u32);
+    pairs.clear();
+    sweep(bounds, order, pairs);
+    pairs.sort_unstable();
+}
+
+fn sort_by_min_x(bounds: &[Bounds], order: &mut [u32]) {
     order.sort_unstable_by(|a, b| {
         bounds[*a as usize]
             .min
@@ -54,7 +67,11 @@ pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Ve
             .total_cmp(&bounds[*b as usize].min.x)
             .then(a.cmp(b))
     });
-    pairs.clear();
+}
+
+/// Pairs among `order`, which it sorts. Adds to `pairs` unsorted.
+fn sweep(bounds: &[Bounds], order: &mut [u32], pairs: &mut Vec<(u32, u32)>) {
+    sort_by_min_x(bounds, order);
     for (at, a) in order.iter().enumerate() {
         let first = &bounds[*a as usize];
         for b in &order[at + 1..] {
@@ -67,7 +84,88 @@ pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Ve
             }
         }
     }
-    pairs.sort_unstable();
+}
+
+/// Pairs that have at least one mover. Static and sleeping bodies never pair with each other,
+/// they stay still, so a field of sleepers costs a sort and not a sweep.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MovingPairs {
+    movers: Vec<u32>,
+    narrow: Vec<u32>,
+    wide: Vec<u32>,
+    reach: f64,
+}
+
+impl MovingPairs {
+    /// Fills `pairs`, sorted, low index first.
+    pub(crate) fn find(
+        &mut self,
+        bounds: &[Bounds],
+        moving: impl Fn(usize) -> bool,
+        pairs: &mut Vec<(u32, u32)>,
+    ) {
+        self.movers.clear();
+        self.narrow.clear();
+        self.wide.clear();
+        self.reach = 0.0;
+        for (index, bound) in bounds.iter().enumerate() {
+            let width = bound.max.x - bound.min.x;
+            if moving(index) {
+                self.movers.push(index as u32);
+            } else if width.is_finite() && width <= WIDE {
+                self.narrow.push(index as u32);
+                self.reach = self.reach.max(width);
+            } else {
+                self.wide.push(index as u32);
+            }
+        }
+        pairs.clear();
+        sweep(bounds, &mut self.movers, pairs);
+        sort_by_min_x(bounds, &mut self.narrow);
+        for at in 0..self.movers.len() {
+            self.against_passive(bounds, self.movers[at] as usize, pairs);
+        }
+        pairs.sort_unstable();
+    }
+
+    /// Adds pairs of bodies that stopped being passive this step, with everything passive.
+    pub(crate) fn add_woken(
+        &self,
+        bounds: &[Bounds],
+        woken: impl Iterator<Item = usize>,
+        pairs: &mut Vec<(u32, u32)>,
+    ) {
+        let before = pairs.len();
+        for index in woken {
+            self.against_passive(bounds, index, pairs);
+        }
+        if pairs.len() > before {
+            pairs.sort_unstable();
+            pairs.dedup();
+        }
+    }
+
+    fn against_passive(&self, bounds: &[Bounds], index: usize, pairs: &mut Vec<(u32, u32)>) {
+        let bound = &bounds[index];
+        let pair = |other: u32| ((index as u32).min(other), (index as u32).max(other));
+        let start = self
+            .narrow
+            .partition_point(|other| bounds[*other as usize].min.x < bound.min.x - self.reach);
+        for &other in &self.narrow[start..] {
+            let second = &bounds[other as usize];
+            if second.min.x > bound.max.x {
+                break;
+            }
+            if other as usize != index && bound.overlaps(second) {
+                pairs.push(pair(other));
+            }
+        }
+        for &other in &self.wide {
+            if other as usize != index && bound.overlaps(&bounds[other as usize]) {
+                pairs.push(pair(other));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +209,50 @@ mod tests {
             let (mut order, mut pairs) = (Vec::new(), Vec::new());
             find_pairs(&bounds, &mut order, &mut pairs);
             assert_eq!(pairs, brute_force(&bounds));
+        }
+    }
+
+    #[test]
+    fn moving_pairs_are_the_brute_force_pairs_with_a_mover() {
+        let mut state = 0x9abc_def1_2345_6789_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 10_000) as f64 / 100.0
+        };
+        for count in [0, 1, 2, 50, 400] {
+            let mut bounds: Vec<Bounds> = (0..count)
+                .map(|_| at(next(), next(), next(), next() / 20.0))
+                .collect();
+            if count > 2 {
+                bounds[1] = at(50.0, 50.0, 50.0, 40.0);
+                bounds[2].min.x = f64::NEG_INFINITY;
+                bounds[2].max.x = f64::INFINITY;
+            }
+            let moving = |index: usize| index % 7 == 3;
+            let woken = |index: usize| index % 11 == 5;
+            let mut search = MovingPairs::default();
+            let mut pairs = Vec::new();
+            search.find(&bounds, moving, &mut pairs);
+            let mut wanted: Vec<(u32, u32)> = brute_force(&bounds)
+                .into_iter()
+                .filter(|(a, b)| moving(*a as usize) || moving(*b as usize))
+                .collect();
+            assert_eq!(pairs, wanted);
+            search.add_woken(
+                &bounds,
+                (0..count).filter(|i| woken(*i) && !moving(*i)),
+                &mut pairs,
+            );
+            wanted = brute_force(&bounds)
+                .into_iter()
+                .filter(|(a, b)| {
+                    let live = |i: u32| moving(i as usize) || woken(i as usize);
+                    live(*a) || live(*b)
+                })
+                .collect();
+            assert_eq!(pairs, wanted);
         }
     }
 

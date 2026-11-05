@@ -8,8 +8,8 @@ use crate::joint::JointKind;
 use crate::profile::{PhaseTimes, StepTimes};
 use crate::sleep::{SleepScratch, is_slow, plan_wakes, update_sleep};
 use crate::solver::{
-    CachedManifold, ContactScratch, find_broad_pairs, finish_contacts, prepare_contacts,
-    solve_substep,
+    CachedManifold, ContactScratch, add_woken_pairs, find_broad_pairs, finish_contacts,
+    prepare_contacts, solve_substep,
 };
 use crate::{
     ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
@@ -645,7 +645,12 @@ impl PhysicsWorld {
             *into += now - mark;
             mark = now;
         };
-        find_broad_pairs(&self.bodies, &mut self.contact_scratch, dt);
+        find_broad_pairs(
+            &self.bodies,
+            &mut self.contact_scratch,
+            self.recheck_sleepers,
+            dt,
+        );
         plan_wakes(
             &self.bodies,
             &self.contact_cache,
@@ -655,6 +660,9 @@ impl PhysicsWorld {
             &mut self.sleep,
             dt,
         );
+        if !self.recheck_sleepers {
+            add_woken_pairs(&self.bodies, self.sleep.awake(), &mut self.contact_scratch);
+        }
         let count = self.bodies.len();
         self.scratch.clear();
         self.scratch
