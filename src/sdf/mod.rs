@@ -19,6 +19,9 @@ use crate::{
 const MAX_BRICKS: u64 = 1 << 20;
 /// A body counts as swallowed when its center is nearer the surface than this share of its radius.
 const EJECT_DEPTH: f32 = 0.25;
+/// How far inside the material a body's center must be before it is rescued, meters. Its sample
+/// is the nearest one, so a little under a surface is not told apart from on it.
+const RESCUE_DEPTH: f32 = 0.3;
 /// Room left between an ejected body and the surface it lands on, meters.
 const EJECT_GAP: f32 = 0.02;
 /// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
@@ -322,6 +325,44 @@ impl SdfVolume {
         distance
             .min(at.y - FLOOR_STEPS * step)
             .max(self.outside(at))
+    }
+
+    /// [`Self::distance`] from the nearest sample of the brick there, so its cost does not grow
+    /// with the edits. Exact on lattice samples.
+    fn quick_distance(&self, at: Vec3) -> f32 {
+        let step = self.desc.voxel;
+        let sample = IVec3::new(
+            (at.x / step).round() as i32,
+            (at.y / step).round() as i32,
+            (at.z / step).round() as i32,
+        );
+        let n = self.cells();
+        let [bx, by, bz] = self.desc.bricks.map(|count| count as i32);
+        let brick = |g: i32, count: i32| g.div_euclid(n).clamp(0, count - 1) as u32;
+        let key = BrickKey([
+            brick(sample.x, bx),
+            brick(sample.y, by),
+            brick(sample.z, bz),
+        ]);
+        let point = Vec3::new(sample.x as f32, sample.y as f32, sample.z as f32) * step;
+        let (low, high) = self.brick_samples(key);
+        let raw = match self
+            .bricks
+            .get(&key)
+            .and_then(|brick| brick.values.as_ref())
+        {
+            Some(values) if inside(sample, low, high) => {
+                let side = self.side();
+                let local = sample - low;
+                values[local.x as usize + side * (local.y as usize + side * local.z as usize)]
+            }
+            _ => {
+                let (height, slope) = self.desc.base.column(point.x, point.z, step * 0.5);
+                field::base_distance(height, slope, point.y)
+            }
+        };
+        raw.min(point.y - FLOOR_STEPS * step)
+            .max(self.outside(point))
     }
 
     /// Above zero outside the volume, so the ground closes into a solid with no open edge.
@@ -1031,6 +1072,52 @@ impl SdfTerrain {
                 buried.push((body, at, radius));
             }
         }
+        self.lift(world, buried)
+    }
+
+    /// Lifts awake dynamic bodies whose center got inside the material or under the volume.
+    /// Triangles only push from the front, so hard pressure or a fast small body can get past
+    /// them, and then nothing would stop it. Asleep bodies are left out, they did not move. Call
+    /// it between steps. Returns how many were lifted.
+    ///
+    /// # Errors
+    /// Fails when a body can not be placed in range.
+    pub fn rescue(&self, world: &mut PhysicsWorld) -> Result<usize, PhysicsError> {
+        let origin = self.volume.desc.origin;
+        let top = self.volume.brick_corner(BrickKey(self.volume.desc.bricks));
+        let mut lost = Vec::new();
+        for dense in 0..world.bodies.len() {
+            if world.bodies.kind[dense] != BodyKind::Dynamic || world.bodies.asleep[dense] {
+                continue;
+            }
+            let mut at = world.bodies.position(dense).offset_from(origin).as_vec3();
+            if at.x < 0.0 || at.z < 0.0 || at.x > top.x || at.z > top.z || at.y > top.y {
+                continue;
+            }
+            let under = at.y < 0.0;
+            if under || self.volume.quick_distance(at) < -RESCUE_DEPTH {
+                at.y = at.y.max(0.0);
+                let radius = world
+                    .bodies
+                    .assets
+                    .bounding_radius(&world.bodies.shape[dense]);
+                lost.push((world.bodies.handle_at(dense), at, radius));
+            }
+        }
+        if lost.is_empty() {
+            return Ok(0);
+        }
+        self.lift(world, lost)
+    }
+
+    /// Moves bodies straight up until each is clear of the ground and of the others.
+    fn lift(
+        &self,
+        world: &mut PhysicsWorld,
+        mut buried: Vec<(BodyHandle, Vec3, f32)>,
+    ) -> Result<usize, PhysicsError> {
+        let step = self.volume.desc.voxel;
+        let origin = self.volume.desc.origin;
         // lowest first, so a column of bodies lands in the order it stood
         buried.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
         let mut placed: Vec<(Vec3, f32)> = Vec::with_capacity(buried.len());
@@ -1706,6 +1793,62 @@ mod tests {
         terrain.edit(&mut world, dig_at(9.0, 9.0)).unwrap();
         assert_eq!(terrain.volume().edit_count(), 1);
         assert_matches_reference(terrain.volume());
+    }
+
+    #[test]
+    fn quick_distance_agrees_with_distance_on_samples() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        for edit in edits() {
+            terrain.edit(&mut world, edit).unwrap();
+        }
+        let volume = terrain.volume();
+        let step = volume.desc.voxel;
+        for z in (0..96).step_by(5) {
+            for y in (0..64).step_by(3) {
+                for x in (0..96).step_by(5) {
+                    let at = Vec3::new(x as f32, y as f32, z as f32) * step;
+                    let (full, quick) = (volume.distance(at), volume.quick_distance(at));
+                    assert_eq!(full < 0.0, quick < 0.0, "{at:?} {full} {quick}");
+                    // kept samples may skip an edit far away, near a surface they are exact
+                    if full.abs() < step {
+                        assert_eq!(full, quick, "{at:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rescue_lifts_what_got_through_and_leaves_the_rest() {
+        let mut world = world();
+        let terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let resting = ball_at(&mut world, Vec3::new(4.0, 8.5, 4.0));
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+        }
+        assert_eq!(terrain.rescue(&mut world).unwrap(), 0);
+        let inside = ball_at(&mut world, Vec3::new(12.0, 5.0, 12.0));
+        let under = ball_at(&mut world, Vec3::new(14.0, -3.0, 14.0));
+        // off the side of the block is not ours
+        let beside = ball_at(&mut world, Vec3::new(-5.0, 3.0, 12.0));
+        let rest_y = height(&world, resting);
+        assert_eq!(terrain.rescue(&mut world).unwrap(), 2);
+        assert!(height(&world, inside) > 8.3, "{}", height(&world, inside));
+        assert!(height(&world, under) > 8.3, "{}", height(&world, under));
+        assert!((height(&world, beside) - 3.0).abs() < 1e-3);
+        assert!((height(&world, resting) - rest_y).abs() < 1e-3);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+            terrain.rescue(&mut world).unwrap();
+        }
+        for body in [inside, under, resting] {
+            assert!(
+                (height(&world, body) - 8.4).abs() < 0.1,
+                "{}",
+                height(&world, body)
+            );
+        }
     }
 
     #[test]
