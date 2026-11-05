@@ -1,4 +1,4 @@
-//! Fixed rigid body suites rb-01 to rb-08. `cargo run --release --example bench [rb-01 ...]`.
+//! Fixed rigid body scenes, timed per step. `cargo run --release --example bench [pile ...]`.
 
 use std::time::{Duration, Instant};
 
@@ -19,14 +19,14 @@ struct Outcome {
 type Suite = fn() -> Result<Outcome>;
 
 const SUITES: [(&str, Suite); 8] = [
-    ("rb-01", rb01),
-    ("rb-02", rb02),
-    ("rb-03", rb03),
-    ("rb-04", rb04),
-    ("rb-05", rb05),
-    ("rb-06", rb06),
-    ("rb-07", rb07),
-    ("rb-08", rb08),
+    ("pile", pile),
+    ("sleepers", sleepers),
+    ("stacks", stacks),
+    ("chains", chains),
+    ("net", net),
+    ("compound", compound),
+    ("queries", queries),
+    ("bullets", bullets),
 ];
 
 thread_local! {
@@ -166,7 +166,7 @@ fn ball_joint(
 }
 
 /// 2,000 spheres, boxes and capsules falling into a pile, all awake.
-fn rb01() -> Result<Outcome> {
+fn pile() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
     let shapes = [
@@ -199,7 +199,7 @@ fn rb01() -> Result<Outcome> {
 }
 
 /// 10,000 boxes resting apart, asleep, and 100 balls dropped among them.
-fn rb02() -> Result<Outcome> {
+fn sleepers() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 200.0)?;
     for i in 0..10_000 {
@@ -228,7 +228,7 @@ fn rb02() -> Result<Outcome> {
 }
 
 /// 30 stacks of 10 boxes.
-fn rb03() -> Result<Outcome> {
+fn stacks() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
     let mut tops = Vec::new();
@@ -264,7 +264,7 @@ fn rb03() -> Result<Outcome> {
 }
 
 /// 20 chains of 15 balls, let go level so they swing.
-fn rb04() -> Result<Outcome> {
+fn chains() -> Result<Outcome> {
     let mut world = world()?;
     let mut joints = Vec::new();
     for chain in 0..20 {
@@ -293,7 +293,7 @@ fn rb04() -> Result<Outcome> {
 }
 
 /// A 20 by 20 net of balls, each tied to its right and lower neighbour, held at two corners.
-fn rb05() -> Result<Outcome> {
+fn net() -> Result<Outcome> {
     let mut world = world()?;
     let mut grid = Vec::new();
     let spacing = 0.5;
@@ -340,7 +340,7 @@ fn rb05() -> Result<Outcome> {
 }
 
 /// A compound of 2,000 small boxes dropped on the ground, then 50 boxes onto it.
-fn rb06() -> Result<Outcome> {
+fn compound() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
     let mut parts = Vec::new();
@@ -371,8 +371,8 @@ fn rb06() -> Result<Outcome> {
     })
 }
 
-/// The rb-01 pile at rest, then 10,000 rays and 1,000 sphere casts, timed one by one.
-fn rb07() -> Result<Outcome> {
+/// The falling pile at rest, then 10,000 rays and 1,000 sphere casts, timed one by one.
+fn queries() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
     let shapes = [
@@ -437,7 +437,7 @@ fn rb07() -> Result<Outcome> {
 }
 
 /// 200 small spheres at 300 m/s into a 1 cm plate.
-fn rb08() -> Result<Outcome> {
+fn bullets() -> Result<Outcome> {
     let mut world = PhysicsWorld::new(PhysicsSettings {
         gravity: Vec3::ZERO,
         ..PhysicsSettings::default()
