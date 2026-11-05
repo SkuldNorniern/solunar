@@ -336,6 +336,25 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Moves a body without any physics in between. It wakes, and so does what touched it.
+    ///
+    /// # Errors
+    /// Fails on a stale handle or a position out of range.
+    pub fn teleport(
+        &mut self,
+        body: BodyHandle,
+        position: GridPosition,
+    ) -> Result<(), PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        let position = position.rebased().ok_or(PhysicsError::OutOfRange)?;
+        self.bodies.cell[dense] = position.cell;
+        self.bodies.local[dense] = position.local;
+        self.bodies.wake(dense);
+        self.recheck_sleepers |= self.bodies.kind[dense] != BodyKind::Dynamic;
+        self.wake_contacts_of(body);
+        Ok(())
+    }
+
     /// Whatever rested on `body` loses it, so it can not stay asleep.
     fn wake_contacts_of(&mut self, body: BodyHandle) {
         for entry in &self.contact_cache {

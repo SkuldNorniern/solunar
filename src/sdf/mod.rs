@@ -10,11 +10,13 @@ pub use field::{Base, Edit, EditOp, EditShape};
 pub use nets::BrickMesh;
 
 use crate::{
-    BodyHandle, CastHit, CollisionFilter, GridPosition, JobDispatch, Material, PhysicsError,
-    PhysicsWorld, QueryFilter, Ray, RigidBodyDesc, Sequential, Shape,
+    BodyHandle, BodyKind, CastHit, CollisionFilter, GridPosition, JobDispatch, Material,
+    PhysicsError, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc, Sequential, Shape,
 };
 
 const MAX_BRICKS: u64 = 1 << 20;
+/// Room left between an ejected body and the surface it lands on, meters.
+const EJECT_GAP: f32 = 0.02;
 /// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
 /// Bodies a host puts on this bit look like ground to [`SdfTerrain::raycast`].
 pub const GROUND_LAYER: u32 = 1 << 31;
@@ -93,6 +95,8 @@ pub struct EditReport {
     pub volume_change: f64,
     /// Mass an excavation took out, zero for other edits.
     pub removed_mass: f64,
+    /// Bodies the new material swallowed and that were moved up to its surface.
+    pub ejected: usize,
 }
 
 /// A brick built again but not yet in the volume.
@@ -643,6 +647,9 @@ impl SdfTerrain {
             report.removed_mass =
                 (-report.volume_change).max(0.0) * f64::from(self.volume.desc.material.density);
         }
+        if edit.op == EditOp::Add {
+            report.ejected = self.eject(world, &entry)?;
+        }
         Ok(report)
     }
 
@@ -680,7 +687,60 @@ impl SdfTerrain {
         let mut report = self.swap(world, rebuilt, |edits| edits.retain(|other| *other != id))?;
         self.volume.edits.remove(&id);
         report.edit = id;
+        report.ejected = self.eject(world, &entry)?;
         Ok(report)
+    }
+
+    /// Moves dynamic bodies whose center ended up inside new material straight up to the surface.
+    /// Triangles only push from the front, so a body left under them would fall out of the world.
+    fn eject(&self, world: &mut PhysicsWorld, entry: &EditEntry) -> Result<usize, PhysicsError> {
+        let step = self.volume.desc.voxel;
+        let origin = self.volume.desc.origin;
+        let (low, high) = (
+            Vec3::new(entry.low.x as f32, entry.low.y as f32, entry.low.z as f32) * step,
+            Vec3::new(
+                entry.high.x as f32,
+                entry.high.y as f32,
+                entry.high.z as f32,
+            ) * step,
+        );
+        let mut buried = Vec::new();
+        for body in world.body_handles() {
+            let state = world.body_state(body)?;
+            if state.kind != BodyKind::Dynamic {
+                continue;
+            }
+            let at = state.position.offset_from(origin).as_vec3();
+            if at.max(low) == at && at.min(high) == at && self.volume.distance(at) < 0.0 {
+                let shape = world.body_shape(body)?;
+                buried.push((body, at, world.bodies.assets.bounding_radius(&shape)));
+            }
+        }
+        // lowest first, so a column of bodies lands in the order it stood
+        buried.sort_by(|a, b| a.1.y.total_cmp(&b.1.y));
+        let mut placed: Vec<(Vec3, f32)> = Vec::with_capacity(buried.len());
+        let top = self
+            .volume
+            .brick_corner(BrickKey(self.volume.desc.bricks))
+            .y;
+        for (body, mut at, radius) in buried {
+            let clear = |at: Vec3, placed: &[(Vec3, f32)]| {
+                self.volume.distance(at) >= radius + EJECT_GAP
+                    && placed
+                        .iter()
+                        .all(|(other, reach)| (at - *other).length() >= radius + reach)
+            };
+            while at.y < top && !clear(at, &placed) {
+                at.y += step;
+            }
+            placed.push((at, radius));
+            let position = origin
+                .shifted(DVec3::from_vec3(at))
+                .ok_or(PhysicsError::OutOfRange)?;
+            world.teleport(body, position)?;
+            world.set_velocity(body, Vec3::ZERO, Vec3::ZERO)?;
+        }
+        Ok(placed.len())
     }
 
     /// Puts all new brick bodies in, then takes the old ones out. On failure nothing changed.
@@ -717,6 +777,7 @@ impl SdfTerrain {
             bricks: keys.len(),
             volume_change: change as f64 * cell,
             removed_mass: 0.0,
+            ejected: 0,
         })
     }
 
@@ -1114,6 +1175,96 @@ mod tests {
         }
         let y = world.body_state(balls[0]).unwrap().position.to_dvec3().y;
         assert!((y - 8.5).abs() < 0.1, "{y}");
+    }
+
+    fn ball_at(world: &mut PhysicsWorld, at: Vec3) -> BodyHandle {
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.4))
+                    .position(GridPosition::from_local(at).unwrap()),
+            )
+            .unwrap()
+    }
+
+    fn height(world: &PhysicsWorld, body: BodyHandle) -> f64 {
+        world.body_state(body).unwrap().position.to_dvec3().y
+    }
+
+    #[test]
+    fn filling_over_bodies_lifts_them_out_and_they_stay_up() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let first = ball_at(&mut world, Vec3::new(12.0, 8.5, 12.0));
+        let second = ball_at(&mut world, Vec3::new(12.0, 9.4, 12.0));
+        let away = ball_at(&mut world, Vec3::new(20.0, 8.5, 20.0));
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let report = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Sphere {
+                        center: Vec3::new(12.0, 9.0, 12.0),
+                        radius: 2.5,
+                    },
+                    op: EditOp::Add,
+                },
+            )
+            .unwrap();
+        assert_eq!(report.ejected, 2);
+        // on top of the lump, not inside it or inside each other
+        let (a, b) = (height(&world, first), height(&world, second));
+        assert!(a > 11.5 && b > 11.5, "{a} {b}");
+        assert!((a - b).abs() >= 0.79, "{a} {b}");
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        for body in [first, second, away] {
+            let y = height(&world, body);
+            assert!(y > 8.0, "{y}");
+            let at = world
+                .body_state(body)
+                .unwrap()
+                .position
+                .to_dvec3()
+                .as_vec3();
+            assert!(terrain.volume().distance(at) > -0.1, "{at:?}");
+        }
+    }
+
+    #[test]
+    fn closing_a_tunnel_lifts_what_was_inside_it() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let tunnel = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Capsule {
+                        a: Vec3::new(4.0, 4.0, 12.0),
+                        b: Vec3::new(20.0, 4.0, 12.0),
+                        radius: 1.5,
+                    },
+                    op: EditOp::Tunnel,
+                },
+            )
+            .unwrap();
+        assert_eq!(tunnel.ejected, 0);
+        let inside = ball_at(&mut world, Vec3::new(12.0, 3.5, 12.0));
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+        }
+        let closed = terrain.remove_tunnel(&mut world, tunnel.edit).unwrap();
+        assert_eq!(closed.ejected, 1);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        assert!(
+            (height(&world, inside) - 8.4).abs() < 0.1,
+            "{}",
+            height(&world, inside)
+        );
     }
 
     #[test]
