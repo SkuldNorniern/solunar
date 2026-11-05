@@ -328,7 +328,7 @@ mod tests {
     use algebrix::Vec3;
 
     use super::*;
-    use crate::collision::collide;
+    use crate::collision::narrowphase::collide;
 
     fn near(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-6, "{a} != {b}");

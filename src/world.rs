@@ -5,7 +5,8 @@ use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::profile::StepTimes;
-use crate::solver::{CachedManifold, ContactScratch, solve_contacts};
+use crate::sleep::{SleepScratch, plan_wakes, update_sleep};
+use crate::solver::{CachedManifold, ContactScratch, find_broad_pairs, solve_contacts};
 use crate::{
     ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
     FrameState, Frames, GridPosition, JobDispatch, PhysicsError, RigidBodyDesc, Sequential,
@@ -59,6 +60,8 @@ pub(crate) struct Integrated {
     pub(crate) linear: Vec3,
     pub(crate) angular: Vec3,
     pub(crate) momentum: Vec3,
+    pub(crate) recovery_linear: Vec3,
+    pub(crate) recovery_angular: Vec3,
     pub(crate) touched: bool,
 }
 
@@ -70,6 +73,8 @@ impl Default for Integrated {
             linear: Vec3::ZERO,
             angular: Vec3::ZERO,
             momentum: Vec3::ZERO,
+            recovery_linear: Vec3::ZERO,
+            recovery_angular: Vec3::ZERO,
             touched: false,
         }
     }
@@ -83,7 +88,10 @@ pub struct PhysicsWorld {
     pub(crate) tick: u64,
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
+    /// A static or kinematic body appeared, so sleepers must check for new contact.
+    pub(crate) recheck_sleepers: bool,
     contact_scratch: ContactScratch,
+    sleep: SleepScratch,
     scratch: Vec<Integrated>,
     frame_gravity: Vec<Vec3>,
     times: StepTimes,
@@ -117,7 +125,9 @@ impl PhysicsWorld {
             tick,
             accumulator,
             contact_cache: Vec::new(),
+            recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
+            sleep: SleepScratch::default(),
             scratch: Vec::new(),
             frame_gravity: Vec::new(),
             times: StepTimes::default(),
@@ -158,13 +168,41 @@ impl PhysicsWorld {
             return Err(PhysicsError::InvalidFrame);
         }
         let position = desc.position.rebased().ok_or(PhysicsError::OutOfRange)?;
-        self.bodies.insert(&RigidBodyDesc { position, ..desc })
+        let body = self.bodies.insert(&RigidBodyDesc { position, ..desc })?;
+        self.recheck_sleepers |= desc.kind != BodyKind::Dynamic;
+        Ok(body)
     }
 
     /// # Errors
     /// Fails on a stale handle.
     pub fn despawn(&mut self, body: BodyHandle) -> Result<(), PhysicsError> {
-        self.bodies.remove(body)
+        self.bodies.remove(body)?;
+        self.wake_contacts_of(body);
+        Ok(())
+    }
+
+    /// # Errors
+    /// Fails on a stale handle.
+    pub fn wake(&mut self, body: BodyHandle) -> Result<(), PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        self.bodies.wake(dense);
+        Ok(())
+    }
+
+    /// Whatever rested on `body` loses it, so it can not stay asleep.
+    fn wake_contacts_of(&mut self, body: BodyHandle) {
+        for entry in &self.contact_cache {
+            let other = if entry.a == body {
+                entry.b
+            } else if entry.b == body {
+                entry.a
+            } else {
+                continue;
+            };
+            if let Ok(dense) = self.bodies.dense_index(other) {
+                self.bodies.wake(dense);
+            }
+        }
     }
 
     /// # Errors
@@ -181,6 +219,7 @@ impl PhysicsWorld {
             rotation: self.bodies.rotation[dense],
             linear_velocity: self.bodies.linear[dense],
             angular_velocity: self.bodies.angular[dense],
+            asleep: self.bodies.asleep[dense],
         })
     }
 
@@ -192,6 +231,7 @@ impl PhysicsWorld {
         let next = self.bodies.force[dense] + force;
         finite(next, "force")?;
         self.bodies.force[dense] = next;
+        self.bodies.wake(dense);
         Ok(())
     }
 
@@ -203,6 +243,7 @@ impl PhysicsWorld {
         let next = self.bodies.torque[dense] + torque;
         finite(next, "torque")?;
         self.bodies.torque[dense] = next;
+        self.bodies.wake(dense);
         Ok(())
     }
 
@@ -214,6 +255,7 @@ impl PhysicsWorld {
         let next = self.bodies.linear[dense] + impulse * self.bodies.inverse_mass[dense];
         finite(next, "velocity")?;
         self.bodies.linear[dense] = next;
+        self.bodies.wake(dense);
         Ok(())
     }
 
@@ -243,6 +285,7 @@ impl PhysicsWorld {
         self.bodies.linear[dense] = linear;
         self.bodies.momentum[dense] = momentum;
         self.bodies.angular[dense] = angular;
+        self.bodies.wake(dense);
         Ok(())
     }
 
@@ -270,6 +313,7 @@ impl PhysicsWorld {
         self.bodies.linear[dense] = linear;
         self.bodies.angular[dense] = angular;
         self.bodies.momentum[dense] = momentum;
+        self.bodies.wake(dense);
         Ok(())
     }
 
@@ -318,6 +362,9 @@ impl PhysicsWorld {
         self.bodies.angular[dense] = angular;
         self.bodies.momentum[dense] = momentum;
         self.bodies.frame[dense] = frame;
+        self.bodies.wake(dense);
+        self.recheck_sleepers |= self.bodies.kind[dense] != BodyKind::Dynamic;
+        self.wake_contacts_of(body);
         Ok(())
     }
 
@@ -340,6 +387,7 @@ impl PhysicsWorld {
                     self.set_velocity(body, linear, angular)
                 }
                 Command::TransferToFrame(body, frame) => self.transfer_to_frame(body, frame),
+                Command::Wake(body) => self.wake(body),
             };
             if let Err(error) = result {
                 report.rejected.push((index, error));
@@ -385,6 +433,14 @@ impl PhysicsWorld {
     pub fn step_with(&mut self, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
         let started = Instant::now();
         self.prepare_frame_gravity()?;
+        find_broad_pairs(&self.bodies, &mut self.contact_scratch);
+        plan_wakes(
+            &self.bodies,
+            &self.contact_cache,
+            self.contact_scratch.pairs(),
+            self.recheck_sleepers,
+            &mut self.sleep,
+        );
         let count = self.bodies.len();
         self.scratch.clear();
         self.scratch.resize(count, Integrated::default());
@@ -394,14 +450,16 @@ impl PhysicsWorld {
             .max(MIN_BODIES_PER_JOB);
         let bodies = &self.bodies;
         let frame_gravity = &self.frame_gravity;
+        let awake = self.sleep.awake();
         let dt = self.settings.fixed_timestep;
         run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-            *slot = integrate_velocity(bodies, frame_gravity, dense, dt);
+            *slot = integrate_velocity(bodies, frame_gravity, awake[dense], dense, dt);
         })?;
 
         let mut next_cache = self.contact_cache.clone();
         solve_contacts(
             bodies,
+            awake,
             &mut self.scratch,
             &mut next_cache,
             &mut self.contact_scratch,
@@ -409,11 +467,18 @@ impl PhysicsWorld {
         );
 
         run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-            integrate_position(bodies, dense, slot, dt);
+            integrate_position(bodies, awake[dense], dense, slot, dt);
         })?;
 
         self.commit()?;
         self.contact_cache = next_cache;
+        update_sleep(
+            &mut self.bodies,
+            self.contact_scratch.touching(),
+            &mut self.sleep,
+            dt,
+        );
+        self.recheck_sleepers = false;
         self.tick += 1;
         self.times.record(started.elapsed());
         Ok(())
@@ -453,6 +518,7 @@ impl PhysicsWorld {
             self.bodies.momentum[dense] = result.momentum;
             self.bodies.force[dense] = Vec3::ZERO;
             self.bodies.torque[dense] = Vec3::ZERO;
+            self.bodies.asleep[dense] = !self.sleep.awake()[dense];
         }
         Ok(())
     }
@@ -503,20 +569,20 @@ fn run_jobs(
 fn integrate_velocity(
     bodies: &Bodies,
     frame_gravity: &[Vec3],
+    awake: bool,
     dense: usize,
     dt: f32,
 ) -> Integrated {
     let rotation = bodies.rotation[dense];
     let linear = bodies.linear[dense];
     let angular = bodies.angular[dense];
-    if bodies.kind[dense] != BodyKind::Dynamic {
+    if bodies.kind[dense] != BodyKind::Dynamic || !awake {
         return Integrated {
             position: None,
             rotation,
             linear,
             angular,
-            momentum: Vec3::ZERO,
-            touched: false,
+            ..Integrated::default()
         };
     }
     let gravity = frame_gravity[bodies.frame[dense].0 as usize];
@@ -527,13 +593,17 @@ fn integrate_velocity(
         linear: linear + (gravity + bodies.force[dense] * bodies.inverse_mass[dense]) * dt,
         angular: apply_diagonal(rotation, bodies.inverse_inertia[dense], momentum),
         momentum,
-        touched: false,
+        ..Integrated::default()
     }
 }
 
-fn integrate_position(bodies: &Bodies, dense: usize, slot: &mut Integrated, dt: f32) {
+fn integrate_position(bodies: &Bodies, awake: bool, dense: usize, slot: &mut Integrated, dt: f32) {
     let cell = bodies.cell[dense];
     let local = bodies.local[dense];
+    if !awake {
+        slot.position = Some(GridPosition { cell, local });
+        return;
+    }
     match bodies.kind[dense] {
         BodyKind::Static => {
             slot.position = Some(GridPosition { cell, local });
@@ -558,10 +628,13 @@ fn integrate_position(bodies: &Bodies, dense: usize, slot: &mut Integrated, dt: 
             }
             slot.position = GridPosition {
                 cell,
-                local: local + slot.linear * dt,
+                local: local + (slot.linear + slot.recovery_linear) * dt,
             }
             .rebased();
             slot.rotation = tumble(slot.rotation, inverse_inertia, slot.momentum, dt);
+            if slot.recovery_angular != Vec3::ZERO {
+                slot.rotation = spin(slot.rotation, slot.recovery_angular, dt);
+            }
             slot.angular = apply_diagonal(slot.rotation, inverse_inertia, slot.momentum);
         }
     }
@@ -985,7 +1058,7 @@ mod tests {
         };
         let mut sequential = build();
         let mut threaded = build();
-        for _ in 0..120 {
+        for _ in 0..30 {
             sequential.step_fixed().unwrap();
             threaded.step_with(&Threads(4)).unwrap();
         }

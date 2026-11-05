@@ -30,6 +30,7 @@ pub struct RigidBodyDesc {
     pub rotation: Quat,
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
+    pub can_sleep: bool,
 }
 
 impl RigidBodyDesc {
@@ -44,6 +45,7 @@ impl RigidBodyDesc {
             rotation: Quat::IDENTITY,
             linear_velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
+            can_sleep: true,
         }
     }
 
@@ -103,6 +105,11 @@ impl RigidBodyDesc {
         self.angular_velocity = velocity;
         self
     }
+
+    pub fn can_sleep(mut self, can_sleep: bool) -> Self {
+        self.can_sleep = can_sleep;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -113,6 +120,7 @@ pub struct BodyState {
     pub rotation: Quat,
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
+    pub asleep: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,6 +156,9 @@ pub(crate) struct Bodies {
     pub(crate) shape: Vec<Shape>,
     pub(crate) material: Vec<Material>,
     pub(crate) filter: Vec<CollisionFilter>,
+    pub(crate) asleep: Vec<bool>,
+    pub(crate) can_sleep: Vec<bool>,
+    pub(crate) still_time: Vec<f32>,
 }
 
 impl Bodies {
@@ -177,6 +188,11 @@ impl Bodies {
             cell: self.cell[dense],
             local: self.local[dense],
         }
+    }
+
+    pub(crate) fn wake(&mut self, dense: usize) {
+        self.asleep[dense] = false;
+        self.still_time[dense] = 0.0;
     }
 
     /// Desc must be validated by the caller.
@@ -226,6 +242,9 @@ impl Bodies {
         self.shape.push(desc.shape);
         self.material.push(desc.material);
         self.filter.push(desc.filter);
+        self.asleep.push(false);
+        self.can_sleep.push(desc.can_sleep);
+        self.still_time.push(0.0);
         Ok(BodyHandle { index, generation })
     }
 
@@ -247,6 +266,9 @@ impl Bodies {
         self.shape.swap_remove(dense);
         self.material.swap_remove(dense);
         self.filter.swap_remove(dense);
+        self.asleep.swap_remove(dense);
+        self.can_sleep.swap_remove(dense);
+        self.still_time.swap_remove(dense);
         if let Some(moved) = self.owner.get(dense) {
             self.slots[*moved as usize].dense = dense as u32;
         }

@@ -1,11 +1,14 @@
 use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
-use crate::collision::{Bounds, MAX_CONTACTS, collide, find_pairs};
+use crate::collision::{Bounds, MAX_CONTACTS, contacts, find_pairs};
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind};
 
+/// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
+pub(crate) const CONTACT_MARGIN: f32 = 0.02;
 const VELOCITY_ITERATIONS: usize = 10;
+const RECOVERY_ITERATIONS: usize = 10;
 const RECOVERY_RATE: f32 = 0.2;
 const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
@@ -33,6 +36,8 @@ struct SolverPoint {
     offset_b: Vec3,
     mass: Vec3,
     target: f32,
+    recovery: f32,
+    recovery_impulse: f32,
     impulse: Vec3,
     local_a: Vec3,
 }
@@ -57,6 +62,19 @@ pub(crate) struct ContactScratch {
     manifolds: Vec<SolverManifold>,
 }
 
+impl ContactScratch {
+    pub(crate) fn pairs(&self) -> &[(u32, u32)] {
+        &self.pairs
+    }
+
+    /// Dense pairs that made contact in the last solve.
+    pub(crate) fn touching(&self) -> impl Iterator<Item = (usize, usize)> + Clone + '_ {
+        self.manifolds
+            .iter()
+            .map(|manifold| (manifold.a, manifold.b))
+    }
+}
+
 impl std::fmt::Debug for SolverManifold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SolverManifold")
@@ -67,24 +85,57 @@ impl std::fmt::Debug for SolverManifold {
     }
 }
 
+pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch) {
+    scratch.bounds.clear();
+    for dense in 0..bodies.len() {
+        scratch.bounds.push(Bounds::of(
+            &bodies.shape[dense],
+            bodies.position(dense),
+            bodies.rotation[dense],
+            CONTACT_MARGIN,
+        ));
+    }
+    find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
+}
+
 /// Finds contacts and solves velocities in `state`. `cache` goes in old and comes out new.
+/// Pairs with nothing awake are skipped, and keep their cache entry for the wake up.
 pub(crate) fn solve_contacts(
     bodies: &Bodies,
+    awake: &[bool],
     state: &mut [Integrated],
     cache: &mut Vec<CachedManifold>,
     scratch: &mut ContactScratch,
     dt: f32,
 ) {
-    build_manifolds(bodies, state, cache, scratch, dt);
+    build_manifolds(bodies, awake, state, cache, scratch, dt);
     for manifold in &scratch.manifolds {
         warm_start(bodies, state, manifold);
     }
-    for _ in 0..VELOCITY_ITERATIONS {
-        for manifold in &mut scratch.manifolds {
-            solve_manifold(bodies, state, manifold);
+    // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
+    for iteration in 0..VELOCITY_ITERATIONS {
+        if iteration % 2 == 0 {
+            for manifold in &mut scratch.manifolds {
+                solve_manifold(bodies, state, manifold);
+            }
+        } else {
+            for manifold in scratch.manifolds.iter_mut().rev() {
+                solve_manifold(bodies, state, manifold);
+            }
         }
     }
-    cache.clear();
+    for _ in 0..RECOVERY_ITERATIONS {
+        for manifold in &mut scratch.manifolds {
+            solve_recovery(bodies, state, manifold);
+        }
+    }
+    let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
+    cache.retain(
+        |entry| match (bodies.dense_index(entry.a), bodies.dense_index(entry.b)) {
+            (Ok(a), Ok(b)) => !active(a) && !active(b),
+            _ => false,
+        },
+    );
     for manifold in &scratch.manifolds {
         let mut points = [CachedPoint::default(); MAX_CONTACTS];
         for (out, point) in points.iter_mut().zip(&manifold.points[..manifold.count]) {
@@ -100,28 +151,22 @@ pub(crate) fn solve_contacts(
             count: manifold.count,
         });
     }
+    cache.sort_unstable_by_key(|entry| (entry.a, entry.b));
 }
 
 fn build_manifolds(
     bodies: &Bodies,
+    awake: &[bool],
     state: &[Integrated],
     cache: &[CachedManifold],
     scratch: &mut ContactScratch,
     dt: f32,
 ) {
-    scratch.bounds.clear();
-    for dense in 0..bodies.len() {
-        scratch.bounds.push(Bounds::of(
-            &bodies.shape[dense],
-            bodies.position(dense),
-            bodies.rotation[dense],
-        ));
-    }
-    find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
+    let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
     scratch.manifolds.clear();
     for &(first, second) in &scratch.pairs {
         let (mut a, mut b) = (first as usize, second as usize);
-        if bodies.kind[a] != BodyKind::Dynamic && bodies.kind[b] != BodyKind::Dynamic {
+        if !active(a) && !active(b) {
             continue;
         }
         if bodies.frame[a] != bodies.frame[b] || !bodies.filter[a].allows(bodies.filter[b]) {
@@ -132,12 +177,13 @@ fn build_manifolds(
             std::mem::swap(&mut a, &mut b);
         }
         let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
-        let Some(raw) = collide(
+        let Some(raw) = contacts(
             &bodies.shape[a],
             bodies.rotation[a],
             &bodies.shape[b],
             bodies.rotation[b],
             center_b,
+            CONTACT_MARGIN,
         ) else {
             continue;
         };
@@ -163,6 +209,7 @@ fn build_manifolds(
             count: raw.count,
         };
         let inverse_rotation_a = bodies.rotation[a].conjugate();
+        let mut claimed = [false; MAX_CONTACTS];
         for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
             let offset_a = point.position;
             let offset_b = point.position - center_b;
@@ -184,17 +231,23 @@ fn build_manifolds(
             let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
             let recovery = (RECOVERY_RATE / dt * (point.depth - PENETRATION_SLOP).max(0.0))
                 .min(MAX_RECOVERY_SPEED);
-            let bounce = if approach < -RESTITUTION_THRESHOLD {
+            // still apart it may close the gap this step, and only reaching it can bounce
+            let gap = -point.depth;
+            let target = if gap > 0.0 && -approach * dt < gap {
+                -gap / dt
+            } else if approach < -RESTITUTION_THRESHOLD {
                 -restitution * approach
             } else {
-                0.0
+                -gap.max(0.0) / dt
             };
             *out = SolverPoint {
                 offset_a,
                 offset_b,
                 mass,
-                target: recovery.max(bounce),
-                impulse: matching_impulse(old, local_a),
+                target,
+                recovery,
+                recovery_impulse: 0.0,
+                impulse: matching_impulse(old, local_a, &mut claimed),
                 local_a,
             };
         }
@@ -205,20 +258,28 @@ fn build_manifolds(
         .sort_unstable_by_key(|manifold| (manifold.handle_a, manifold.handle_b));
 }
 
-fn matching_impulse(old: Option<&CachedManifold>, local_a: Vec3) -> Vec3 {
+/// Each old point goes to one new point, two sharing it would double its load.
+fn matching_impulse(
+    old: Option<&CachedManifold>,
+    local_a: Vec3,
+    claimed: &mut [bool; MAX_CONTACTS],
+) -> Vec3 {
     let Some(old) = old else {
         return Vec3::ZERO;
     };
-    let mut best = Vec3::ZERO;
+    let mut best = None;
     let mut closest = MATCH_DISTANCE_SQUARED;
-    for point in &old.points[..old.count] {
+    for (index, point) in old.points[..old.count].iter().enumerate() {
         let distance = (point.local_a - local_a).length_squared();
-        if distance < closest {
+        if distance < closest && !claimed[index] {
             closest = distance;
-            best = point.impulse;
+            best = Some(index);
         }
     }
-    best
+    best.map_or(Vec3::ZERO, |index| {
+        claimed[index] = true;
+        old.points[index].impulse
+    })
 }
 
 fn warm_start(bodies: &Bodies, state: &mut [Integrated], manifold: &SolverManifold) {
@@ -282,6 +343,41 @@ fn solve_manifold(bodies: &Bodies, state: &mut [Integrated], manifold: &mut Solv
             normal * change,
         );
     }
+}
+
+/// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
+fn solve_recovery(bodies: &Bodies, state: &mut [Integrated], manifold: &mut SolverManifold) {
+    let (a, b) = (manifold.a, manifold.b);
+    let normal = manifold.axes[0];
+    for point in &mut manifold.points[..manifold.count] {
+        let at_a = state[a].recovery_linear + state[a].recovery_angular.cross(point.offset_a);
+        let at_b = state[b].recovery_linear + state[b].recovery_angular.cross(point.offset_b);
+        let speed = (at_b - at_a).dot(normal);
+        let next = (point.recovery_impulse + (point.recovery - speed) * point.mass.x).max(0.0);
+        let change = normal * (next - point.recovery_impulse);
+        point.recovery_impulse = next;
+        apply_recovery(bodies, state, a, point.offset_a, -change);
+        apply_recovery(bodies, state, b, point.offset_b, change);
+    }
+}
+
+fn apply_recovery(
+    bodies: &Bodies,
+    state: &mut [Integrated],
+    dense: usize,
+    offset: Vec3,
+    impulse: Vec3,
+) {
+    if bodies.kind[dense] != BodyKind::Dynamic {
+        return;
+    }
+    let body = &mut state[dense];
+    body.recovery_linear += impulse * bodies.inverse_mass[dense];
+    body.recovery_angular += apply_diagonal(
+        bodies.rotation[dense],
+        bodies.inverse_inertia[dense],
+        offset.cross(impulse),
+    );
 }
 
 fn apply_pair(
@@ -409,6 +505,46 @@ mod tests {
 
     fn y(world: &PhysicsWorld, body: BodyHandle) -> f32 {
         world.body_state(body).unwrap().position.local.y
+    }
+
+    #[test]
+    fn gap_inside_the_margin_does_not_stop_a_slow_fall_early() {
+        let mut world = world();
+        ground(&mut world);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.5))
+                    .local_position(Vec3::new(0.0, 0.51, 0.0)),
+            )
+            .unwrap();
+        world.step_fixed().unwrap();
+        // one step of gravity still fits in the gap, so it falls freely
+        let dt = world.settings().fixed_timestep;
+        let speed = world.body_state(ball).unwrap().linear_velocity.y;
+        assert!((speed + 9.81 * dt).abs() < 1e-4, "{speed}");
+        run(&mut world, 1.0);
+        assert!((y(&world, ball) - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn fast_body_in_the_margin_is_stopped_and_bounces_once_it_arrives() {
+        let mut world = world();
+        ground(&mut world);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.5))
+                    .material(Material {
+                        restitution: 1.0,
+                        ..Material::default()
+                    })
+                    .local_position(Vec3::new(0.0, 0.51, 0.0))
+                    .linear_velocity(Vec3::new(0.0, -10.0, 0.0)),
+            )
+            .unwrap();
+        world.step_fixed().unwrap();
+        let state = world.body_state(ball).unwrap();
+        assert!(state.linear_velocity.y > 9.0, "{state:?}");
+        assert!(state.position.local.y > 0.5, "{state:?}");
     }
 
     #[test]

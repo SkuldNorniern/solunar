@@ -46,7 +46,7 @@ impl RawManifold {
     }
 }
 
-/// `center_b` is the center of B relative to the center of A.
+/// `center_b` is the center of B relative to the center of A. Reports real overlap only.
 pub(crate) fn collide(
     shape_a: &Shape,
     rotation_a: Quat,
@@ -54,20 +54,32 @@ pub(crate) fn collide(
     rotation_b: Quat,
     center_b: Vec3,
 ) -> Option<RawManifold> {
+    contacts(shape_a, rotation_a, shape_b, rotation_b, center_b, 0.0)
+}
+
+/// Also reports points up to `margin` apart, those have a negative depth.
+pub(crate) fn contacts(
+    shape_a: &Shape,
+    rotation_a: Quat,
+    shape_b: &Shape,
+    rotation_b: Quat,
+    center_b: Vec3,
+    margin: f32,
+) -> Option<RawManifold> {
     match (
         rounded_segment(shape_a, rotation_a),
         rounded_segment(shape_b, rotation_b),
     ) {
         (Some((half_a, radius_a)), Some((half_b, radius_b))) => {
-            segment_segment(half_a, radius_a, half_b, radius_b, center_b)
+            segment_segment(half_a, radius_a, half_b, radius_b, center_b, margin)
         }
         (None, Some((half_b, radius_b))) => {
             let extents = half_extents(shape_a)?;
-            box_segment(extents, rotation_a, center_b, half_b, radius_b)
+            box_segment(extents, rotation_a, center_b, half_b, radius_b, margin)
         }
         (Some((half_a, radius_a)), None) => {
             let extents = half_extents(shape_b)?;
-            let flipped = box_segment(extents, rotation_b, -center_b, half_a, radius_a)?;
+            let flipped = box_segment(extents, rotation_b, -center_b, half_a, radius_a, margin)?;
             let mut result = RawManifold::new(-flipped.normal);
             for point in &flipped.points[..flipped.count] {
                 result.push(point.position + center_b, point.depth);
@@ -80,6 +92,7 @@ pub(crate) fn collide(
             half_extents(shape_b)?,
             rotation_b,
             center_b,
+            margin,
         ),
     }
 }
@@ -147,12 +160,13 @@ fn segment_segment(
     half_b: Vec3,
     radius_b: f32,
     center_b: Vec3,
+    margin: f32,
 ) -> Option<RawManifold> {
     let (on_a, on_b) = closest_on_segments(-half_a, half_a, center_b - half_b, center_b + half_b);
     let gap = on_b - on_a;
     let distance = gap.length();
     let radii = radius_a + radius_b;
-    if distance >= radii {
+    if distance >= radii + margin {
         return None;
     }
     let normal = if distance > 1e-6 {
@@ -175,7 +189,7 @@ fn segment_segment(
                     let point_a = axis_a * s;
                     let point_b = center_b + axis_b * (point_a - center_b).dot(axis_b);
                     let depth = radii - (point_b - point_a).dot(normal);
-                    if depth > 0.0 {
+                    if depth > -margin {
                         result.push(point_a + normal * (radius_a - depth * 0.5), depth);
                     }
                 }
@@ -227,6 +241,7 @@ fn box_segment(
     center: Vec3,
     half: Vec3,
     radius: f32,
+    margin: f32,
 ) -> Option<RawManifold> {
     let inverse = rotation.conjugate();
     let center = inverse.rotate_vec3(center);
@@ -248,7 +263,7 @@ fn box_segment(
     }
     let best = (low + high) * 0.5;
     let (distance, normal) = box_distance(extents, at(best));
-    if distance >= radius {
+    if distance >= radius + margin {
         return None;
     }
 
@@ -256,7 +271,7 @@ fn box_segment(
     let add = |result: &mut RawManifold, t: f32| {
         let point = at(t);
         let (distance, other) = box_distance(extents, point);
-        if distance < radius && other.dot(normal) > 0.9 {
+        if distance < radius + margin && other.dot(normal) > 0.9 {
             let contact = point - other * ((distance + radius) * 0.5);
             result.push(rotation.rotate_vec3(contact), radius - distance);
         }
@@ -346,6 +361,7 @@ fn box_box(
     extents_b: Vec3,
     rotation_b: Quat,
     center_b: Vec3,
+    margin: f32,
 ) -> Option<RawManifold> {
     let a = Oriented::new(extents_a, rotation_a, Vec3::ZERO);
     let b = Oriented::new(extents_b, rotation_b, center_b);
@@ -361,7 +377,7 @@ fn box_box(
             (b.axes[i - 3], Axis::FaceB(i - 3))
         };
         let gap = separation(axis);
-        if gap > 0.0 {
+        if gap > margin {
             return None;
         }
         if gap > best_face {
@@ -380,7 +396,7 @@ fn box_box(
             }
             let axis = crossed * length.recip();
             let gap = separation(axis);
-            if gap > 0.0 {
+            if gap > margin {
                 return None;
             }
             // faces win ties, they give full manifolds
@@ -398,8 +414,8 @@ fn box_box(
     };
 
     match best {
-        Axis::FaceA(index) => Some(face_contact(&a, &b, index, normal, normal)),
-        Axis::FaceB(index) => Some(face_contact(&b, &a, index, -normal, normal)),
+        Axis::FaceA(index) => Some(face_contact(&a, &b, index, normal, normal, margin)),
+        Axis::FaceB(index) => Some(face_contact(&b, &a, index, -normal, normal, margin)),
         Axis::Edge(i, j) => {
             let (a0, a1) = a.support_edge(i, normal);
             let (b0, b1) = b.support_edge(j, -normal);
@@ -419,6 +435,7 @@ fn face_contact(
     index: usize,
     outward: Vec3,
     normal: Vec3,
+    margin: f32,
 ) -> RawManifold {
     let plane_at = reference.center.dot(outward) + reference.extents[index];
 
@@ -456,7 +473,7 @@ fn face_contact(
     let mut kept_count = 0;
     for point in &polygon[..count] {
         let depth = plane_at - point.dot(outward);
-        if depth >= 0.0 {
+        if depth >= -margin {
             kept[kept_count] = RawPoint {
                 position: *point + outward * (depth * 0.5),
                 depth,

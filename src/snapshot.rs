@@ -12,13 +12,16 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 const HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
 const FRAME_BYTES: usize = 4 + 8 * 13;
 const SLOT_BYTES: usize = 8;
-const BODY_BYTES: usize = 4 + 1 + 1 + 4 * 3 + 4 * 3 + 4 * 2 + 4 + 4 * 3 + 4 * 3 + 4 * 4 + 4 * 3 * 5;
+const BODY_BYTES: usize =
+    4 + 1 + 1 + 4 * 3 + 4 * 3 + 4 * 2 + 4 + 4 * 3 + 4 * 3 + 4 * 4 + 4 * 3 * 5 + 1 + 4;
+const FLAG_ASLEEP: u8 = 1;
+const FLAG_CAN_SLEEP: u8 = 2;
 const MANIFOLD_BYTES: usize = 4 * 4 + 1;
 const FREE_SLOT: u32 = u32::MAX;
 
@@ -83,6 +86,7 @@ impl PhysicsWorld {
         out.u32(self.settings.max_steps_per_advance);
         out.u64(self.tick);
         out.f64(self.accumulator);
+        out.u8(u8::from(self.recheck_sleepers));
 
         let frames = &self.frames.descs()[1..];
         out.len(frames.len());
@@ -133,6 +137,15 @@ impl PhysicsWorld {
             out.vec3(bodies.momentum[dense]);
             out.vec3(bodies.force[dense]);
             out.vec3(bodies.torque[dense]);
+            let mut flags = 0;
+            if bodies.asleep[dense] {
+                flags |= FLAG_ASLEEP;
+            }
+            if bodies.can_sleep[dense] {
+                flags |= FLAG_CAN_SLEEP;
+            }
+            out.u8(flags);
+            out.f32(bodies.still_time[dense]);
         }
 
         out.len(self.contact_cache.len());
@@ -211,6 +224,11 @@ impl PhysicsWorld {
         if !accumulator.is_finite() || accumulator < 0.0 {
             return Err(SnapshotError::Invalid("accumulator"));
         }
+        let recheck_sleepers = match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(SnapshotError::Invalid("recheck flag")),
+        };
 
         let frames = read_frames(&mut reader, limits)?;
         let bodies = read_bodies(&mut reader, &frames, limits)?;
@@ -220,6 +238,7 @@ impl PhysicsWorld {
         }
         let mut world = Self::from_parts(settings, frames, bodies, tick, accumulator);
         world.contact_cache = contact_cache;
+        world.recheck_sleepers = recheck_sleepers;
         Ok(world)
     }
 }
@@ -346,6 +365,23 @@ fn read_body(
     if !momentum.is_finite() || !force.is_finite() || !torque.is_finite() {
         return Err(SnapshotError::Invalid("body state"));
     }
+    let flags = reader.u8()?;
+    if flags & !(FLAG_ASLEEP | FLAG_CAN_SLEEP) != 0 {
+        return Err(SnapshotError::Invalid("body flags"));
+    }
+    let asleep = flags & FLAG_ASLEEP != 0;
+    let can_sleep = flags & FLAG_CAN_SLEEP != 0;
+    let still_time = reader.f32()?;
+    if !still_time.is_finite() || still_time < 0.0 {
+        return Err(SnapshotError::Invalid("body still time"));
+    }
+    // a sleeper is skipped by the step, so it must have nothing left to apply
+    let at_rest = [linear, angular, momentum, force, torque]
+        .iter()
+        .all(|value| *value == Vec3::ZERO);
+    if asleep && (kind != BodyKind::Dynamic || !can_sleep || !at_rest) {
+        return Err(SnapshotError::Invalid("sleeping body"));
+    }
 
     let desc = RigidBodyDesc {
         kind,
@@ -357,6 +393,7 @@ fn read_body(
         rotation,
         linear_velocity: linear,
         angular_velocity: angular,
+        can_sleep,
     };
     validate_desc(&desc).map_err(|_| SnapshotError::Invalid("body"))?;
     let (inverse_mass, inverse_inertia) = inverse_mass_properties(kind, &desc);
@@ -377,6 +414,9 @@ fn read_body(
     bodies.shape.push(shape);
     bodies.material.push(material);
     bodies.filter.push(filter);
+    bodies.asleep.push(asleep);
+    bodies.can_sleep.push(can_sleep);
+    bodies.still_time.push(still_time);
     Ok(())
 }
 
@@ -733,7 +773,7 @@ mod tests {
         );
     }
 
-    const GOLDEN_HASH: u64 = 4417293472329182613;
+    const GOLDEN_HASH: u64 = 8567880626527914801;
 
     #[test]
     fn every_truncation_fails() {
@@ -836,6 +876,38 @@ mod tests {
     }
 
     #[test]
+    fn asleep_body_with_motion_fails() {
+        let mut world = sample_in_contact();
+        for _ in 0..180 {
+            world.step_fixed().unwrap();
+        }
+        assert!(world.bodies.asleep.contains(&true));
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.bodies, world.bodies);
+        let dense = world
+            .bodies
+            .asleep
+            .iter()
+            .position(|asleep| *asleep)
+            .unwrap();
+        world.bodies.linear[dense] = Vec3::X;
+        assert_eq!(
+            PhysicsWorld::load_snapshot(&world.save_snapshot()).err(),
+            Some(SnapshotError::Invalid("sleeping body"))
+        );
+    }
+
+    #[test]
+    fn asleep_static_body_fails() {
+        let mut world = sample_in_contact();
+        world.bodies.asleep[0] = true;
+        assert_eq!(
+            PhysicsWorld::load_snapshot(&world.save_snapshot()).err(),
+            Some(SnapshotError::Invalid("sleeping body"))
+        );
+    }
+
+    #[test]
     fn unsorted_contact_cache_fails() {
         let mut world = sample_in_contact();
         world.contact_cache.reverse();
@@ -875,8 +947,8 @@ mod tests {
     #[test]
     fn huge_counts_fail_before_allocating() {
         let bytes = sample().0.save_snapshot();
-        // gravity, timestep, step limit, tick, accumulator
-        let frame_count_at = HEADER_BYTES + 12 + 4 + 4 + 8 + 8;
+        // gravity, timestep, step limit, tick, accumulator, recheck flag
+        let frame_count_at = HEADER_BYTES + 12 + 4 + 4 + 8 + 8 + 1;
         let mut bad = bytes;
         bad[frame_count_at..frame_count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(PhysicsWorld::load_snapshot(&resealed(bad)).is_err());

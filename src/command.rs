@@ -12,6 +12,7 @@ pub enum Command {
     ApplyImpulseAt(BodyHandle, Vec3, Vec3),
     SetVelocity(BodyHandle, Vec3, Vec3),
     TransferToFrame(BodyHandle, FrameId),
+    Wake(BodyHandle),
 }
 
 /// Commands recorded between steps, applied in order at a safe boundary.

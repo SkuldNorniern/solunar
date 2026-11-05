@@ -10,8 +10,8 @@ pub(crate) struct Bounds {
 }
 
 impl Bounds {
-    pub(crate) fn of(shape: &Shape, position: GridPosition, rotation: Quat) -> Self {
-        let extent = DVec3::from_vec3(shape_extent(shape, rotation));
+    pub(crate) fn of(shape: &Shape, position: GridPosition, rotation: Quat, margin: f32) -> Self {
+        let extent = DVec3::from_vec3(shape_extent(shape, rotation) + Vec3::splat(margin * 0.5));
         let center = position.to_dvec3();
         Self {
             min: center - extent,
@@ -129,7 +129,7 @@ mod tests {
     fn rotated_cuboid_bounds_grow() {
         let shape = Shape::cuboid(Vec3::new(1.0, 1.0, 1.0));
         let turned = Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_4);
-        let bounds = Bounds::of(&shape, GridPosition::ORIGIN, turned);
+        let bounds = Bounds::of(&shape, GridPosition::ORIGIN, turned, 0.0);
         assert!((bounds.max.x - 2.0_f64.sqrt()).abs() < 1e-5);
         assert!((bounds.max.z - 1.0).abs() < 1e-5);
     }
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn capsule_bounds_follow_its_axis() {
         let shape = Shape::capsule(0.5, 2.0);
-        let upright = Bounds::of(&shape, GridPosition::ORIGIN, Quat::IDENTITY);
+        let upright = Bounds::of(&shape, GridPosition::ORIGIN, Quat::IDENTITY, 0.0);
         assert!((upright.max.y - 2.5).abs() < 1e-5);
         assert!((upright.max.x - 0.5).abs() < 1e-5);
     }
