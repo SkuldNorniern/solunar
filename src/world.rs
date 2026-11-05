@@ -7,7 +7,10 @@ use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc}
 use crate::joint::JointKind;
 use crate::profile::StepTimes;
 use crate::sleep::{SleepScratch, plan_wakes, update_sleep};
-use crate::solver::{CachedManifold, ContactScratch, find_broad_pairs, solve_contacts};
+use crate::solver::{
+    CachedManifold, ContactScratch, find_broad_pairs, finish_contacts, prepare_contacts,
+    solve_substep,
+};
 use crate::{
     ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
     FrameState, Frames, GridPosition, JobDispatch, JointDesc, JointDof, JointHandle, JointMotor,
@@ -15,12 +18,15 @@ use crate::{
 };
 
 const MIN_BODIES_PER_JOB: usize = 256;
+const MAX_SUBSTEPS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PhysicsSettings {
     pub gravity: Vec3,
     pub fixed_timestep: f32,
     pub max_steps_per_advance: u32,
+    /// Solver passes per step. More costs time and keeps joints tighter with less energy loss.
+    pub substeps: u32,
 }
 
 impl Default for PhysicsSettings {
@@ -29,6 +35,7 @@ impl Default for PhysicsSettings {
             gravity: Vec3::new(0.0, -9.81, 0.0),
             fixed_timestep: 1.0 / 60.0,
             max_steps_per_advance: 8,
+            substeps: 4,
         }
     }
 }
@@ -39,6 +46,8 @@ impl PhysicsSettings {
             || !self.fixed_timestep.is_finite()
             || self.fixed_timestep <= 0.0
             || self.max_steps_per_advance == 0
+            || self.substeps == 0
+            || self.substeps > MAX_SUBSTEPS
         {
             return Err(PhysicsError::InvalidSettings);
         }
@@ -56,7 +65,8 @@ pub struct Advance {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Integrated {
-    pub(crate) position: Option<GridPosition>,
+    pub(crate) position: GridPosition,
+    pub(crate) out_of_range: bool,
     pub(crate) rotation: Quat,
     pub(crate) linear: Vec3,
     pub(crate) angular: Vec3,
@@ -69,7 +79,8 @@ pub(crate) struct Integrated {
 impl Default for Integrated {
     fn default() -> Self {
         Self {
-            position: None,
+            position: GridPosition::ORIGIN,
+            out_of_range: false,
             rotation: Quat::IDENTITY,
             linear: Vec3::ZERO,
             angular: Vec3::ZERO,
@@ -568,7 +579,8 @@ impl PhysicsWorld {
         );
         let count = self.bodies.len();
         self.scratch.clear();
-        self.scratch.resize(count, Integrated::default());
+        self.scratch
+            .extend((0..count).map(|dense| starting_state(&self.bodies, dense)));
 
         let chunk_size = count
             .div_ceil(dispatch.parallelism().max(1))
@@ -577,29 +589,41 @@ impl PhysicsWorld {
         let frame_gravity = &self.frame_gravity;
         let awake = self.sleep.awake();
         let dt = self.settings.fixed_timestep;
-        run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-            *slot = integrate_velocity(bodies, frame_gravity, awake[dense], dense, dt);
-        })?;
-
+        let substeps = self.settings.substeps;
+        let part = dt / substeps as f32;
         let mut next_cache = self.contact_cache.clone();
-        solve_contacts(
+        prepare_contacts(
             bodies,
             awake,
             &self.joints,
-            &mut self.scratch,
-            &mut next_cache,
+            &self.scratch,
+            &self.contact_cache,
             &mut self.contact_scratch,
             dt,
         );
-
-        run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-            integrate_position(bodies, awake[dense], dense, slot, dt);
-        })?;
+        for substep in 0..substeps {
+            run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+                integrate_velocity(bodies, frame_gravity, awake[dense], dense, slot, part);
+            })?;
+            solve_substep(
+                bodies,
+                awake,
+                &self.joints,
+                &mut self.scratch,
+                &mut self.contact_scratch,
+                substep,
+                part,
+            );
+            run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+                integrate_position(bodies, awake[dense], dense, slot, part);
+            })?;
+        }
+        finish_contacts(bodies, awake, &mut next_cache, &self.contact_scratch);
 
         self.commit()?;
         self.contact_cache = next_cache;
-        let (points, rows) = self.contact_scratch.joint_parts();
-        self.joints.store(points, rows, dt);
+        let (points, rows, impulses) = self.contact_scratch.joint_parts();
+        self.joints.store(impulses, points, rows, part);
         update_sleep(
             &mut self.bodies,
             &self.joints,
@@ -626,7 +650,7 @@ impl PhysicsWorld {
 
     fn commit(&mut self) -> Result<(), PhysicsError> {
         for result in &self.scratch {
-            if result.position.is_none() {
+            if result.out_of_range {
                 return Err(PhysicsError::OutOfRange);
             }
             finite(result.linear, "velocity")?;
@@ -637,10 +661,8 @@ impl PhysicsWorld {
             }
         }
         for (dense, result) in self.scratch.iter().enumerate() {
-            if let Some(position) = result.position {
-                self.bodies.cell[dense] = position.cell;
-                self.bodies.local[dense] = position.local;
-            }
+            self.bodies.cell[dense] = result.position.cell;
+            self.bodies.local[dense] = result.position.local;
             self.bodies.rotation[dense] = result.rotation;
             self.bodies.linear[dense] = result.linear;
             self.bodies.angular[dense] = result.angular;
@@ -695,54 +717,56 @@ fn run_jobs(
     }
 }
 
+fn starting_state(bodies: &Bodies, dense: usize) -> Integrated {
+    Integrated {
+        position: bodies.position(dense),
+        rotation: bodies.rotation[dense],
+        linear: bodies.linear[dense],
+        angular: bodies.angular[dense],
+        momentum: bodies.momentum[dense],
+        ..Integrated::default()
+    }
+}
+
 fn integrate_velocity(
     bodies: &Bodies,
     frame_gravity: &[Vec3],
     awake: bool,
     dense: usize,
+    slot: &mut Integrated,
     dt: f32,
-) -> Integrated {
-    let rotation = bodies.rotation[dense];
-    let linear = bodies.linear[dense];
-    let angular = bodies.angular[dense];
+) {
+    slot.recovery_linear = Vec3::ZERO;
+    slot.recovery_angular = Vec3::ZERO;
     if bodies.kind[dense] != BodyKind::Dynamic || !awake {
-        return Integrated {
-            position: None,
-            rotation,
-            linear,
-            angular,
-            ..Integrated::default()
-        };
+        return;
     }
     let gravity = frame_gravity[bodies.frame[dense].0 as usize];
-    let momentum = bodies.momentum[dense] + bodies.torque[dense] * dt;
-    Integrated {
-        position: None,
-        rotation,
-        linear: linear + (gravity + bodies.force[dense] * bodies.inverse_mass[dense]) * dt,
-        angular: apply_diagonal(rotation, bodies.inverse_inertia[dense], momentum),
-        momentum,
-        ..Integrated::default()
+    slot.momentum += bodies.torque[dense] * dt;
+    slot.linear += (gravity + bodies.force[dense] * bodies.inverse_mass[dense]) * dt;
+    slot.angular = apply_diagonal(slot.rotation, bodies.inverse_inertia[dense], slot.momentum);
+}
+
+fn move_slot(slot: &mut Integrated, velocity: Vec3, dt: f32) {
+    let moved = GridPosition {
+        cell: slot.position.cell,
+        local: slot.position.local + velocity * dt,
+    }
+    .rebased();
+    match moved {
+        Some(position) => slot.position = position,
+        None => slot.out_of_range = true,
     }
 }
 
 fn integrate_position(bodies: &Bodies, awake: bool, dense: usize, slot: &mut Integrated, dt: f32) {
-    let cell = bodies.cell[dense];
-    let local = bodies.local[dense];
     if !awake {
-        slot.position = Some(GridPosition { cell, local });
         return;
     }
     match bodies.kind[dense] {
-        BodyKind::Static => {
-            slot.position = Some(GridPosition { cell, local });
-        }
+        BodyKind::Static => {}
         BodyKind::Kinematic => {
-            slot.position = GridPosition {
-                cell,
-                local: local + slot.linear * dt,
-            }
-            .rebased();
+            move_slot(slot, slot.linear, dt);
             slot.rotation = spin(slot.rotation, slot.angular, dt);
         }
         BodyKind::Dynamic => {
@@ -755,11 +779,7 @@ fn integrate_position(bodies: &Bodies, awake: bool, dense: usize, slot: &mut Int
                     slot.angular,
                 );
             }
-            slot.position = GridPosition {
-                cell,
-                local: local + (slot.linear + slot.recovery_linear) * dt,
-            }
-            .rebased();
+            move_slot(slot, slot.linear + slot.recovery_linear, dt);
             slot.rotation = tumble(slot.rotation, inverse_inertia, slot.momentum, dt);
             if slot.recovery_angular != Vec3::ZERO {
                 slot.rotation = spin(slot.rotation, slot.recovery_angular, dt);
@@ -872,9 +892,11 @@ mod tests {
             world.step_fixed().unwrap();
         }
         let state = world.body_state(body).unwrap();
-        let n = steps as f32;
-        let expected_velocity = -9.81 * dt * n;
-        let expected_y = 100.0 - 9.81 * dt * dt * n * (n + 1.0) / 2.0;
+        let parts = world.settings().substeps as f32;
+        let n = steps as f32 * parts;
+        let part = dt / parts;
+        let expected_velocity = -9.81 * part * n;
+        let expected_y = 100.0 - 9.81 * part * part * n * (n + 1.0) / 2.0;
         assert!((state.linear_velocity.y - expected_velocity).abs() < 1e-3);
         assert!((state.position.local.y - expected_y).abs() < 1e-2);
         assert_eq!(world.tick(), steps);

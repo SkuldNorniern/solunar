@@ -418,11 +418,11 @@ mod tests {
 
     #[test]
     fn falling_ball_wakes_the_whole_stack_at_once() {
-        let (mut world, _, boxes) = sleeping_stack(4);
+        let (mut world, floor, boxes) = sleeping_stack(4);
         let ball = world
             .spawn(
                 RigidBodyDesc::dynamic(Shape::sphere(0.5))
-                    .density(5.0)
+                    .density(5000.0)
                     .local_position(Vec3::new(0.0, 6.0, 0.0)),
             )
             .unwrap();
@@ -436,8 +436,26 @@ mod tests {
             }
         }
         assert!(!asleep(&world, ball));
-        // the bottom box took the hit through the stack, it did not act like a wall
-        assert!(world.body_state(boxes[3]).unwrap().linear_velocity.y < 0.0);
+        // a stack that really woke carries the hit down to the floor, a sleeper would act like a wall
+        let load = |world: &PhysicsWorld| {
+            world
+                .contact_cache
+                .iter()
+                .filter(|entry| entry.a == floor)
+                .flat_map(|entry| entry.points[..entry.count].iter())
+                .map(|point| point.impulse.x)
+                .sum::<f32>()
+        };
+        run(&mut world, 1.0);
+        // four boxes of 1000 kg and the ball, per substep
+        let part = world.settings().fixed_timestep / world.settings().substeps as f32;
+        let ball_mass = 5000.0 * 4.0 / 3.0 * std::f32::consts::PI * 0.125;
+        let expected = (4000.0 + ball_mass) * 9.81 * part;
+        let measured = load(&world);
+        assert!(
+            (measured - expected).abs() < expected * 0.02,
+            "{measured} {expected}"
+        );
     }
 
     #[test]

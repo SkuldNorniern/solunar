@@ -3,16 +3,17 @@ use algebrix::Vec3;
 use crate::body::{Bodies, apply_diagonal};
 use crate::collision::{Bounds, MAX_CONTACTS, contacts, find_pairs};
 use crate::joint::{
-    JointPoint, JointRow, Joints, build_rows, solve_point, solve_point_recovery, solve_row,
-    solve_row_recovery, warm_start_point, warm_start_row,
+    JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
+    solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
-const VELOCITY_ITERATIONS: usize = 10;
-const RECOVERY_ITERATIONS: usize = 10;
+/// Per substep. Odd on purpose, 2 and 4 left stacks jittering far more than 3.
+const VELOCITY_ITERATIONS: usize = 3;
+const RECOVERY_ITERATIONS: usize = 1;
 const RECOVERY_RATE: f32 = 0.2;
 const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
@@ -40,10 +41,13 @@ struct SolverPoint {
     offset_b: Vec3,
     mass: Vec3,
     target: f32,
+    bounce: f32,
+    depth: f32,
     recovery: f32,
     recovery_impulse: f32,
     impulse: Vec3,
     local_a: Vec3,
+    local_b: Vec3,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +70,7 @@ pub(crate) struct ContactScratch {
     manifolds: Vec<SolverManifold>,
     joint_points: Vec<JointPoint>,
     joint_rows: Vec<JointRow>,
+    joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
 }
 
 impl ContactScratch {
@@ -73,8 +78,8 @@ impl ContactScratch {
         &self.pairs
     }
 
-    pub(crate) fn joint_parts(&self) -> (&[JointPoint], &[JointRow]) {
-        (&self.joint_points, &self.joint_rows)
+    pub(crate) fn joint_parts(&self) -> (&[JointPoint], &[JointRow], &[[f32; JOINT_IMPULSES]]) {
+        (&self.joint_points, &self.joint_rows, &self.joint_impulses)
     }
 
     /// Dense pairs that made contact in the last solve.
@@ -108,26 +113,49 @@ pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch) {
     find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
 }
 
-/// Finds contacts and solves velocities in `state`. `cache` goes in old and comes out new.
-/// Pairs with nothing awake are skipped, and keep their cache entry for the wake up.
-pub(crate) fn solve_contacts(
+/// Finds contacts once per step and loads the working joint impulses.
+pub(crate) fn prepare_contacts(
     bodies: &Bodies,
     awake: &[bool],
     joints: &Joints,
-    state: &mut [Integrated],
-    cache: &mut Vec<CachedManifold>,
+    state: &[Integrated],
+    cache: &[CachedManifold],
     scratch: &mut ContactScratch,
     dt: f32,
 ) {
     build_manifolds(bodies, awake, joints, state, cache, scratch, dt);
+    scratch.joint_impulses.clear();
+    scratch
+        .joint_impulses
+        .extend(joints.slots.iter().map(|slot| {
+            slot.state
+                .map_or([0.0; JOINT_IMPULSES], |live| live.impulses)
+        }));
+}
+
+/// One substep of velocities. Joints rebuild from the moved bodies, contacts refresh their gaps.
+pub(crate) fn solve_substep(
+    bodies: &Bodies,
+    awake: &[bool],
+    joints: &Joints,
+    state: &mut [Integrated],
+    scratch: &mut ContactScratch,
+    substep: u32,
+    dt: f32,
+) {
     build_rows(
         joints,
+        &scratch.joint_impulses,
         bodies,
+        state,
         awake,
         &mut scratch.joint_points,
         &mut scratch.joint_rows,
         dt,
     );
+    for manifold in &mut scratch.manifolds {
+        refresh_manifold(state, manifold, dt);
+    }
     for point in &scratch.joint_points {
         warm_start_point(bodies, state, point);
     }
@@ -139,7 +167,7 @@ pub(crate) fn solve_contacts(
     }
     // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
     for iteration in 0..VELOCITY_ITERATIONS {
-        if iteration % 2 == 0 {
+        if (substep as usize + iteration).is_multiple_of(2) {
             for point in &mut scratch.joint_points {
                 solve_point(bodies, state, point);
             }
@@ -172,6 +200,38 @@ pub(crate) fn solve_contacts(
             solve_recovery(bodies, state, manifold);
         }
     }
+    capture_impulses(
+        &scratch.joint_points,
+        &scratch.joint_rows,
+        &mut scratch.joint_impulses,
+    );
+}
+
+/// Bodies moved since the contacts were found, so gaps and arms follow them.
+fn refresh_manifold(state: &[Integrated], manifold: &mut SolverManifold, dt: f32) {
+    let (a, b) = (&state[manifold.a], &state[manifold.b]);
+    let center_b = b.position.offset_from(a.position).as_vec3();
+    let normal = manifold.axes[0];
+    for point in &mut manifold.points[..manifold.count] {
+        point.offset_a = a.rotation.rotate_vec3(point.local_a);
+        point.offset_b = b.rotation.rotate_vec3(point.local_b);
+        let gap = (center_b + point.offset_b - point.offset_a).dot(normal) - point.depth;
+        // still apart it may close the gap, and only arriving can bounce
+        point.target = if gap > 0.0 { -gap / dt } else { point.bounce };
+        point.recovery =
+            (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
+        point.recovery_impulse = 0.0;
+    }
+}
+
+/// `cache` goes in old and comes out new.
+/// Pairs with nothing awake were skipped, and keep their entry for the wake up.
+pub(crate) fn finish_contacts(
+    bodies: &Bodies,
+    awake: &[bool],
+    cache: &mut Vec<CachedManifold>,
+    scratch: &ContactScratch,
+) {
     let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
     cache.retain(
         |entry| match (bodies.dense_index(entry.a), bodies.dense_index(entry.b)) {
@@ -256,11 +316,13 @@ fn build_manifolds(
             count: raw.count,
         };
         let inverse_rotation_a = bodies.rotation[a].conjugate();
+        let inverse_rotation_b = bodies.rotation[b].conjugate();
         let mut claimed = [false; MAX_CONTACTS];
         for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
             let offset_a = point.position;
             let offset_b = point.position - center_b;
             let local_a = inverse_rotation_a.rotate_vec3(offset_a);
+            let local_b = inverse_rotation_b.rotate_vec3(offset_b);
             let mut mass = Vec3::ZERO;
             for (index, axis) in axes.iter().enumerate() {
                 let inverse = effective_inverse_mass(bodies, a, b, offset_a, offset_b, *axis);
@@ -276,26 +338,24 @@ fn build_manifolds(
                 }
             }
             let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
-            let recovery = (RECOVERY_RATE / dt * (point.depth - PENETRATION_SLOP).max(0.0))
-                .min(MAX_RECOVERY_SPEED);
-            // still apart it may close the gap this step, and only reaching it can bounce
-            let gap = -point.depth;
-            let target = if gap > 0.0 && -approach * dt < gap {
-                -gap / dt
-            } else if approach < -RESTITUTION_THRESHOLD {
+            let reaches = -approach * dt >= -point.depth;
+            let bounce = if reaches && approach < -RESTITUTION_THRESHOLD {
                 -restitution * approach
             } else {
-                -gap.max(0.0) / dt
+                0.0
             };
             *out = SolverPoint {
                 offset_a,
                 offset_b,
                 mass,
-                target,
-                recovery,
+                target: 0.0,
+                bounce,
+                depth: point.depth,
+                recovery: 0.0,
                 recovery_impulse: 0.0,
                 impulse: matching_impulse(old, local_a, &mut claimed),
                 local_a,
+                local_b,
             };
         }
         scratch.manifolds.push(manifold);
@@ -420,8 +480,9 @@ fn apply_recovery(
     }
     let body = &mut state[dense];
     body.recovery_linear += impulse * bodies.inverse_mass[dense];
+    let rotation = body.rotation;
     body.recovery_angular += apply_diagonal(
-        bodies.rotation[dense],
+        rotation,
         bodies.inverse_inertia[dense],
         offset.cross(impulse),
     );
@@ -463,8 +524,9 @@ fn apply_one(bodies: &Bodies, state: &mut [Integrated], dense: usize, offset: Ve
     }
     let body = &mut state[dense];
     body.linear += impulse * bodies.inverse_mass[dense];
+    let rotation = body.rotation;
     body.angular += apply_diagonal(
-        bodies.rotation[dense],
+        rotation,
         bodies.inverse_inertia[dense],
         offset.cross(impulse),
     );
@@ -725,6 +787,39 @@ mod tests {
             assert!(state.position.local.x.abs() < 0.02);
             assert!(state.position.local.z.abs() < 0.02);
             assert!(state.linear_velocity.length() < 0.1);
+        }
+    }
+
+    #[test]
+    fn sixteen_box_stack_stands() {
+        let mut world = world();
+        ground(&mut world);
+        let boxes: Vec<_> = (0..16)
+            .map(|level| {
+                world
+                    .spawn(
+                        RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))
+                            .local_position(Vec3::new(0.0, 0.5 + level as f32, 0.0)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        run(&mut world, 10.0);
+        for (level, body) in boxes.iter().enumerate() {
+            let at = world.body_state(*body).unwrap().position.local;
+            assert!((at.y - (0.5 + level as f32)).abs() < 0.05, "{level} {at:?}");
+            assert!(at.x.hypot(at.z) < 0.1, "{level} {at:?}");
+        }
+    }
+
+    #[test]
+    fn bad_substep_counts_fail() {
+        for substeps in [0, 65] {
+            let settings = PhysicsSettings {
+                substeps,
+                ..PhysicsSettings::default()
+            };
+            assert!(PhysicsWorld::new(settings).is_err());
         }
     }
 

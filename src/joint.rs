@@ -399,7 +399,18 @@ impl Joints {
     }
 
     /// Runs after the step commits, so a failed step keeps the old impulses.
-    pub(crate) fn store(&mut self, points: &[JointPoint], rows: &[JointRow], dt: f32) {
+    pub(crate) fn store(
+        &mut self,
+        impulses: &[[f32; JOINT_IMPULSES]],
+        points: &[JointPoint],
+        rows: &[JointRow],
+        dt: f32,
+    ) {
+        for (slot, working) in self.slots.iter_mut().zip(impulses) {
+            if let Some(state) = slot.state.as_mut() {
+                state.impulses = *working;
+            }
+        }
         let touched = points
             .iter()
             .map(|point| point.joint)
@@ -414,22 +425,34 @@ impl Joints {
             let Some(state) = self.slots[point.joint as usize].state.as_mut() else {
                 continue;
             };
-            for (slot, axis) in state.impulses.iter_mut().zip(&point.axes) {
-                *slot = point.impulse.dot(*axis);
-            }
             state.force += point.impulse * dt.recip();
         }
         for row in rows {
             let Some(state) = self.slots[row.joint as usize].state.as_mut() else {
                 continue;
             };
-            state.impulses[row.slot] = row.impulse;
             if row.linear == Vec3::ZERO {
                 state.torque += row.ang_b * (row.impulse / dt);
             } else {
                 state.force += row.linear * (row.impulse / dt);
             }
         }
+    }
+}
+
+/// Keeps this substep's impulses for the next one to start from.
+pub(crate) fn capture_impulses(
+    points: &[JointPoint],
+    rows: &[JointRow],
+    impulses: &mut [[f32; JOINT_IMPULSES]],
+) {
+    for point in points {
+        for (slot, axis) in impulses[point.joint as usize].iter_mut().zip(&point.axes) {
+            *slot = point.impulse.dot(*axis);
+        }
+    }
+    for row in rows {
+        impulses[row.joint as usize][row.slot] = row.impulse;
     }
 }
 
@@ -471,9 +494,11 @@ fn inverted(columns: &[Vec3; 3]) -> Option<[Vec3; 3]> {
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_point(
     bodies: &Bodies,
-    state: &JointState,
+    poses: &[Integrated],
+    impulses: &[f32; JOINT_IMPULSES],
     joint: u32,
     pair: (usize, usize),
     arms: (Vec3, Vec3),
@@ -486,7 +511,7 @@ fn build_point(
     let column = |unit: Vec3| {
         let part = |dense: usize, arm: Vec3| {
             apply_diagonal(
-                bodies.rotation[dense],
+                poses[dense].rotation,
                 bodies.inverse_inertia[dense],
                 arm.cross(unit),
             )
@@ -505,9 +530,7 @@ fn build_point(
         inverse_mass: inverted(&matrix).unwrap_or([Vec3::ZERO; 3]),
         inverse_a,
         inverse_b,
-        impulse: axes[0] * state.impulses[0]
-            + axes[1] * state.impulses[1]
-            + axes[2] * state.impulses[2],
+        impulse: axes[0] * impulses[0] + axes[1] * impulses[1] + axes[2] * impulses[2],
         recovery,
         recovery_impulse: Vec3::ZERO,
     }
@@ -527,16 +550,18 @@ pub(crate) fn warm_start_point(bodies: &Bodies, state: &mut [Integrated], point:
     let impulse = point.impulse;
     let body = &mut state[point.a];
     body.linear -= impulse * point.inverse_a;
+    let rotation = body.rotation;
     body.angular -= apply_diagonal(
-        bodies.rotation[point.a],
+        rotation,
         bodies.inverse_inertia[point.a],
         point.arm_a.cross(impulse),
     );
     body.touched = true;
     let body = &mut state[point.b];
     body.linear += impulse * point.inverse_b;
+    let rotation = body.rotation;
     body.angular += apply_diagonal(
-        bodies.rotation[point.b],
+        rotation,
         bodies.inverse_inertia[point.b],
         point.arm_b.cross(impulse),
     );
@@ -568,15 +593,17 @@ pub(crate) fn solve_point_recovery(
     point.recovery_impulse += change;
     let body = &mut state[point.a];
     body.recovery_linear -= change * point.inverse_a;
+    let rotation = body.rotation;
     body.recovery_angular -= apply_diagonal(
-        bodies.rotation[point.a],
+        rotation,
         bodies.inverse_inertia[point.a],
         point.arm_a.cross(change),
     );
     let body = &mut state[point.b];
     body.recovery_linear += change * point.inverse_b;
+    let rotation = body.rotation;
     body.recovery_angular += apply_diagonal(
-        bodies.rotation[point.b],
+        rotation,
         bodies.inverse_inertia[point.b],
         point.arm_b.cross(change),
     );
@@ -621,7 +648,8 @@ struct RowGoal {
 
 struct RowBuilder<'a> {
     bodies: &'a Bodies,
-    state: &'a JointState,
+    poses: &'a [Integrated],
+    impulses: &'a [f32; JOINT_IMPULSES],
     joint: u32,
     a: usize,
     b: usize,
@@ -632,8 +660,8 @@ impl RowBuilder<'_> {
     fn push(&mut self, linear: Vec3, ang_a: Vec3, ang_b: Vec3, goal: RowGoal) {
         let (a, b) = (self.a, self.b);
         let bodies = self.bodies;
-        let turn_a = apply_diagonal(bodies.rotation[a], bodies.inverse_inertia[a], ang_a);
-        let turn_b = apply_diagonal(bodies.rotation[b], bodies.inverse_inertia[b], ang_b);
+        let turn_a = apply_diagonal(self.poses[a].rotation, bodies.inverse_inertia[a], ang_a);
+        let turn_b = apply_diagonal(self.poses[b].rotation, bodies.inverse_inertia[b], ang_b);
         let (inverse_a, inverse_b) = (bodies.inverse_mass[a], bodies.inverse_mass[b]);
         let inverse = linear.length_squared() * (inverse_a + inverse_b)
             + ang_a.dot(turn_a)
@@ -660,7 +688,7 @@ impl RowBuilder<'_> {
             low: goal.low,
             high: goal.high,
             // not `clamp`, a limit may have changed side and old values come from outside
-            impulse: self.state.impulses[goal.slot].min(goal.high).max(goal.low),
+            impulse: self.impulses[goal.slot].min(goal.high).max(goal.low),
             recovery: goal.recovery,
             recovery_low: goal.recovery_low,
             recovery_high: goal.recovery_high,
@@ -783,9 +811,12 @@ fn relative_angles(relative: Quat, axes: &[JointAxis; 6]) -> [f32; 3] {
     [2.0 * x.atan2(w), 2.0 * y.atan2(w), 2.0 * z.atan2(w)]
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_rows(
     joints: &Joints,
+    impulses: &[[f32; JOINT_IMPULSES]],
     bodies: &Bodies,
+    poses: &[Integrated],
     awake: &[bool],
     points: &mut Vec<JointPoint>,
     rows: &mut Vec<JointRow>,
@@ -802,14 +833,15 @@ pub(crate) fn build_rows(
         if !active(a) && !active(b) {
             continue;
         }
-        let (rotation_a, rotation_b) = (bodies.rotation[a], bodies.rotation[b]);
+        let (rotation_a, rotation_b) = (poses[a].rotation, poses[b].rotation);
         let arm_a = rotation_a.rotate_vec3(desc.anchor_a);
         let arm_b = rotation_b.rotate_vec3(desc.anchor_b);
-        let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
+        let center_b = poses[b].position.offset_from(poses[a].position).as_vec3();
         let gap = center_b + arm_b - arm_a;
         let mut builder = RowBuilder {
             bodies,
-            state,
+            poses,
+            impulses: &impulses[index],
             joint: index as u32,
             a,
             b,
@@ -841,7 +873,8 @@ pub(crate) fn build_rows(
                 if point_joint {
                     points.push(build_point(
                         bodies,
-                        state,
+                        poses,
+                        &impulses[index],
                         index as u32,
                         (a, b),
                         (arm_a, arm_b),
@@ -1050,7 +1083,7 @@ mod tests {
         for pair in peaks.windows(2) {
             assert!(pair[1] <= pair[0], "{peaks:?}");
         }
-        assert!(worst < 0.02, "{worst}");
+        assert!(worst < 0.002, "{worst}");
     }
 
     #[test]
@@ -1350,9 +1383,9 @@ mod tests {
                 fastest = fastest.max(speed);
             }
         }
-        // measured 0.21 while the tip whips past 20 m/s
+        // measured 0.036 while the tip whips past 15 m/s
         assert!(fastest > 15.0, "{fastest}");
-        assert!(worst < 0.25, "{worst}");
+        assert!(worst < 0.06, "{worst}");
     }
 
     fn hang_load(ratio: f32) -> (f32, f32) {
@@ -1385,8 +1418,15 @@ mod tests {
     #[test]
     fn light_chain_holds_a_load_of_a_hundred_links() {
         let (worst, sag) = hang_load(100.0);
-        assert!(worst < 0.1, "{worst}");
-        assert!(sag < 0.1, "{sag}");
+        assert!(worst < 0.03, "{worst}");
+        assert!(sag < 0.05, "{sag}");
+    }
+
+    #[test]
+    fn light_chain_with_a_thousand_times_load_sags_but_holds() {
+        let (worst, sag) = hang_load(1000.0);
+        assert!(worst < 0.3, "{worst}");
+        assert!(sag < 0.5, "{sag}");
     }
 
     #[test]
