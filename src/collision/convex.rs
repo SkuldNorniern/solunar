@@ -262,6 +262,24 @@ impl ConvexHull {
     }
 
     /// Each outline edge once, in hull axes.
+    /// Each face as a fan of triangles.
+    pub(crate) fn triangles(&self, out: &mut Vec<[Vec3; 3]>) {
+        out.clear();
+        for face in self.face_starts.windows(2) {
+            let corners = &self.face_corners[face[0] as usize..face[1] as usize];
+            let Some((first, rest)) = corners.split_first() else {
+                continue;
+            };
+            for pair in rest.windows(2) {
+                out.push([
+                    self.vertices[*first as usize],
+                    self.vertices[pair[0] as usize],
+                    self.vertices[pair[1] as usize],
+                ]);
+            }
+        }
+    }
+
     pub(crate) fn outline(&self, out: &mut Vec<(Vec3, Vec3)>) {
         out.clear();
         for face in self.face_starts.windows(2) {

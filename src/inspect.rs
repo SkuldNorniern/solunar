@@ -68,6 +68,20 @@ impl PhysicsWorld {
         Some((&mesh.vertices, &mesh.triangles))
     }
 
+    /// Triangles of a hull in body axes, for drawing. False when the shape is not a known hull.
+    pub fn convex_triangles(&self, shape: &Shape, out: &mut Vec<[Vec3; 3]>) -> bool {
+        match self.bodies.assets.convex(shape) {
+            Some(hull) => {
+                hull.triangles(out);
+                true
+            }
+            None => {
+                out.clear();
+                false
+            }
+        }
+    }
+
     /// Fills out with the hull's edges in body axes. False when the shape is not a known hull.
     pub fn convex_edges(&self, shape: &Shape, out: &mut Vec<(Vec3, Vec3)>) -> bool {
         match self.bodies.assets.convex(shape) {
@@ -193,6 +207,17 @@ mod tests {
             assert!(((*a - *b).length() - 1.0).abs() < 1e-4);
         }
         assert!(!world.convex_edges(&mesh, &mut edges));
+        let mut triangles = Vec::new();
+        assert!(world.convex_triangles(&cube.shape, &mut triangles));
+        // six square faces of two triangles, total area is the surface of the 1 m cube
+        assert_eq!(triangles.len(), 12);
+        let area: f32 = triangles
+            .iter()
+            .map(|[a, b, c]| (*b - *a).cross(*c - *a).length() * 0.5)
+            .sum();
+        assert!((area - 6.0).abs() < 1e-3, "{area}");
+        assert!(!world.convex_triangles(&mesh, &mut triangles));
+        assert!(triangles.is_empty());
         assert!(edges.is_empty());
     }
 
