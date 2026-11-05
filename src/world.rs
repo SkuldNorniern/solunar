@@ -606,8 +606,18 @@ impl PhysicsWorld {
             dt,
         );
         for substep in 0..substeps {
+            // outside forces were worked out at the start of the step, so they go in whole before
+            // the first move. spread over substeps they would lag the motion and add energy
+            let push = if substep == 0 { dt } else { 0.0 };
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-                integrate_velocity(bodies, frame_gravity, awake[dense], dense, slot, part);
+                integrate_velocity(
+                    bodies,
+                    frame_gravity,
+                    awake[dense],
+                    dense,
+                    slot,
+                    (part, push),
+                );
             })?;
             solve_substep(
                 bodies,
@@ -742,7 +752,7 @@ fn integrate_velocity(
     awake: bool,
     dense: usize,
     slot: &mut Integrated,
-    dt: f32,
+    (dt, push): (f32, f32),
 ) {
     slot.recovery_linear = Vec3::ZERO;
     slot.recovery_angular = Vec3::ZERO;
@@ -750,8 +760,8 @@ fn integrate_velocity(
         return;
     }
     let gravity = frame_gravity[bodies.frame[dense].0 as usize];
-    slot.momentum += bodies.torque[dense] * dt;
-    slot.linear += (gravity + bodies.force[dense] * bodies.inverse_mass[dense]) * dt;
+    slot.momentum += bodies.torque[dense] * push;
+    slot.linear += gravity * dt + bodies.force[dense] * (bodies.inverse_mass[dense] * push);
     slot.angular = apply_diagonal(slot.rotation, bodies.inverse_inertia[dense], slot.momentum);
 }
 
@@ -922,6 +932,24 @@ mod tests {
         let analytic = -0.5 * 9.81 * time * time;
         let error = (coarse.body_state(body).unwrap().position.local.y - analytic).abs();
         assert!(error < 0.5 * 9.81 * time * coarse.settings().fixed_timestep + 1e-3);
+    }
+
+    #[test]
+    fn a_spring_force_from_outside_keeps_its_energy() {
+        // a pull toward the origin read once per step, like any game force
+        let mut world = no_gravity();
+        let body = world
+            .spawn(cube().density(1.0).local_position(Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        let stiffness = 40.0;
+        let mut farthest = 0.0_f32;
+        for _ in 0..1200 {
+            let at = world.body_state(body).unwrap().position.local;
+            world.apply_force(body, at * -stiffness).unwrap();
+            world.step_fixed().unwrap();
+            farthest = farthest.max(world.body_state(body).unwrap().position.local.length());
+        }
+        assert!(farthest < 1.02, "{farthest}");
     }
 
     #[test]
