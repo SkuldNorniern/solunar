@@ -413,6 +413,37 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Mass an impulse along `direction` at `offset` from the center of mass meets, turning
+    /// included. Infinite for static and kinematic bodies.
+    ///
+    /// # Errors
+    /// Fails on a stale handle or non finite input.
+    pub fn mass_at(
+        &self,
+        body: BodyHandle,
+        offset: Vec3,
+        direction: Vec3,
+    ) -> Result<f32, PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        finite(offset, "offset")?;
+        finite(direction, "direction")?;
+        if self.bodies.kind[dense] != BodyKind::Dynamic {
+            return Ok(f32::INFINITY);
+        }
+        let arm = offset.cross(direction);
+        let turn = apply_diagonal(
+            self.bodies.rotation[dense],
+            self.bodies.inverse_inertia[dense],
+            arm,
+        );
+        let inverse = self.bodies.inverse_mass[dense] * direction.length_squared() + arm.dot(turn);
+        Ok(if inverse > 0.0 {
+            1.0 / inverse
+        } else {
+            f32::INFINITY
+        })
+    }
+
     /// # Errors
     /// Fails on a stale handle, a static body or non finite input.
     pub fn set_velocity(
@@ -896,6 +927,34 @@ mod tests {
         }
 
         fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
+    }
+
+    #[test]
+    fn an_impulse_of_mass_at_changes_the_point_speed_by_one() {
+        let mut world = no_gravity();
+        let body = world
+            .spawn(RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(
+                0.5, 1.0, 0.25,
+            ))))
+            .unwrap();
+        let wall = world
+            .spawn(RigidBodyDesc::fixed(Shape::sphere(1.0)).local_position(Vec3::X * 10.0))
+            .unwrap();
+        let offset = Vec3::new(0.3, 0.8, -0.1);
+        let direction = Vec3::new(1.0, 0.2, 0.4).normalize();
+        let mass = world.mass_at(body, offset, direction).unwrap();
+        world
+            .apply_impulse_at(body, direction * mass, offset)
+            .unwrap();
+        let state = world.body_state(body).unwrap();
+        let speed = (state.linear_velocity + state.angular_velocity.cross(offset)).dot(direction);
+        assert!((speed - 1.0).abs() < 1e-5, "{speed}");
+        assert_eq!(world.mass_at(wall, offset, direction), Ok(f32::INFINITY));
+        assert!(
+            world
+                .mass_at(body, Vec3::splat(f32::NAN), direction)
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use algebrix::{DVec3, Quat, Vec3};
 
-use crate::{BodyHandle, GridPosition, PhysicsError, PhysicsWorld, QueryFilter, Shape, ShapeCast};
+use crate::{
+    BodyHandle, BodyKind, GridPosition, PhysicsError, PhysicsWorld, QueryFilter, Shape, ShapeCast,
+};
 
 const SLIDE_ITERATIONS: usize = 4;
 const PUSH_OUT_ROUNDS: usize = 4;
@@ -16,6 +18,8 @@ pub struct CharacterDesc {
     pub step_height: f32,
     /// Gap kept to every surface, so the next cast does not start touching.
     pub skin: f32,
+    /// Most force `push` puts on one body, in newtons. 0 pushes nothing.
+    pub push_force: f32,
     pub filter: QueryFilter,
 }
 
@@ -27,6 +31,7 @@ impl Default for CharacterDesc {
             max_slope: 50.0_f32.to_radians(),
             step_height: 0.35,
             skin: 0.01,
+            push_force: 400.0,
             filter: QueryFilter::default(),
         }
     }
@@ -37,6 +42,7 @@ impl CharacterDesc {
         let good = |value: f32| value.is_finite() && value >= 0.0;
         if good(self.half_height)
             && good(self.step_height)
+            && good(self.push_force)
             && self.radius.is_finite()
             && self.radius > 0.0
             && self.skin.is_finite()
@@ -62,7 +68,7 @@ pub struct Ground {
     pub normal: Vec3,
 }
 
-/// Where a move ended up and what it ran into.
+/// Where a move ended up and what it ran into. `moved` counts the ride on a platform too.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MoveReport {
     pub moved: Vec3,
@@ -71,17 +77,37 @@ pub struct MoveReport {
     pub stepped: bool,
 }
 
+/// A wall or ceiling the last move ran into. `pushing` is the part of the asked motion going into it,
+/// pointing into the body.
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Touch {
+    pub body: BodyHandle,
+    pub point: GridPosition,
+    pub normal: Vec3,
+    pub pushing: Vec3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Platform {
+    body: BodyHandle,
+    /// Center of the character in the body's axes.
+    local: Vec3,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Character {
     desc: CharacterDesc,
     position: GridPosition,
     ground: Option<Ground>,
+    platform: Option<Platform>,
+    touches: Vec<Touch>,
 }
 
 struct Slide {
     at: GridPosition,
     report: MoveReport,
     ground: Option<Ground>,
+    touches: Vec<Touch>,
 }
 
 impl Character {
@@ -99,6 +125,8 @@ impl Character {
             desc,
             position,
             ground: None,
+            platform: None,
+            touches: Vec::new(),
         })
     }
 
@@ -126,6 +154,10 @@ impl Character {
         self.ground.is_some()
     }
 
+    pub fn touches(&self) -> &[Touch] {
+        &self.touches
+    }
+
     /// Puts it somewhere else, for spawning and teleports. Ground is found on the next move.
     ///
     /// # Errors
@@ -136,12 +168,14 @@ impl Character {
         }
         self.position = position.rebased().ok_or(PhysicsError::OutOfRange)?;
         self.ground = None;
+        self.platform = None;
+        self.touches.clear();
         Ok(())
     }
 
-    /// Moves by `motion`, usually velocity times the step. Pushes out of overlaps first, slides
-    /// along what it hits, walks up steps, and keeps to the ground going down slopes. The world
-    /// is only read.
+    /// Moves by `motion`, usually velocity times the step. Rides along with the body it stands
+    /// on, pushes out of overlaps, slides along what it hits, walks up steps, and keeps to the
+    /// ground going down slopes. The world is only read.
     ///
     /// # Errors
     /// Fails on non finite motion, an unknown frame or a result out of range.
@@ -155,7 +189,9 @@ impl Character {
         }
         let start = self.position;
         let was_grounded = self.ground.is_some();
-        let mut at = self.push_out(world, self.position)?;
+        let mut at = shift(start, self.ride(world))?;
+        at = self.push_out(world, at)?;
+        let mut touches = Vec::new();
 
         let horizontal = Vec3::new(motion.x, 0.0, motion.z);
         let rising = motion.y.max(0.0);
@@ -166,11 +202,13 @@ impl Character {
             let up = self.slide(world, at, Vec3::Y * rising)?;
             report.hit_ceiling = up.report.hit_ceiling || up.report.hit_wall;
             at = up.at;
+            touches.extend(up.touches);
         }
         let before = at;
         let plain = self.slide(world, at, horizontal)?;
         at = plain.at;
         report.hit_wall = plain.report.hit_wall;
+        touches.extend_from_slice(&plain.touches);
 
         if was_grounded
             && plain.report.hit_wall
@@ -199,10 +237,75 @@ impl Character {
                 .map(|(_, found)| found);
         }
 
+        self.platform = ground.and_then(|ground| {
+            let state = world.body_state(ground.body).ok()?;
+            (state.kind != BodyKind::Static).then(|| Platform {
+                body: ground.body,
+                local: state
+                    .rotation
+                    .conjugate()
+                    .rotate_vec3(at.offset_from(state.position).as_vec3()),
+            })
+        });
         self.position = at;
         self.ground = ground;
+        self.touches = touches;
         report.moved = at.offset_from(start).as_vec3();
         Ok(report)
+    }
+
+    /// Pushes the dynamic bodies the last move ran into, toward the speed it wanted, with at
+    /// most `push_force` each for `dt`. Call it between `move_by` and the world step.
+    ///
+    /// # Errors
+    /// Fails on a bad `dt`.
+    pub fn push(&self, world: &mut PhysicsWorld, dt: f32) -> Result<(), PhysicsError> {
+        if !dt.is_finite() {
+            return Err(PhysicsError::NonFinite("dt"));
+        }
+        if dt <= 0.0 {
+            return Err(PhysicsError::InvalidSettings);
+        }
+        for touch in &self.touches {
+            let Ok(state) = world.body_state(touch.body) else {
+                continue;
+            };
+            let length = touch.pushing.length();
+            if state.kind != BodyKind::Dynamic || length < 1e-6 {
+                continue;
+            }
+            let direction = touch.pushing / length;
+            let offset = touch.point.offset_from(state.position).as_vec3();
+            let speed =
+                (state.linear_velocity + state.angular_velocity.cross(offset)).dot(direction);
+            let short = length / dt - speed;
+            if short <= 0.0 {
+                continue;
+            }
+            let mass = world.mass_at(touch.body, offset, direction)?;
+            let impulse = (short * mass).min(self.desc.push_force * dt);
+            if impulse > 0.0 {
+                world.apply_impulse_at(touch.body, direction * impulse, offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How far the body it stood on carried it since the last move.
+    fn ride(&self, world: &PhysicsWorld) -> Vec3 {
+        let Some(platform) = self.platform else {
+            return Vec3::ZERO;
+        };
+        let Ok(state) = world.body_state(platform.body) else {
+            return Vec3::ZERO;
+        };
+        let Some(carried) = state
+            .position
+            .shifted(DVec3::from_vec3(state.rotation.rotate_vec3(platform.local)))
+        else {
+            return Vec3::ZERO;
+        };
+        carried.offset_from(self.position).as_vec3()
     }
 
     fn walkable(&self, normal: Vec3) -> bool {
@@ -258,6 +361,7 @@ impl Character {
     ) -> Result<Slide, PhysicsError> {
         let mut report = MoveReport::default();
         let mut ground = None;
+        let mut touches = Vec::new();
         let original = motion;
         for _ in 0..SLIDE_ITERATIONS {
             let length = motion.length();
@@ -298,6 +402,14 @@ impl Character {
             let into = left.dot(normal);
             if into < 0.0 {
                 left -= normal * into;
+                if !walkable {
+                    touches.push(Touch {
+                        body: hit.body,
+                        point: hit.point,
+                        normal,
+                        pushing: normal * (direction * length).dot(normal),
+                    });
+                }
             }
             // up a walkable slope it keeps its flat speed, it does not slow down climbing
             let flat_left = Vec3::new(left.x, 0.0, left.z).length();
@@ -311,7 +423,12 @@ impl Character {
             }
             motion = left;
         }
-        Ok(Slide { at, report, ground })
+        Ok(Slide {
+            at,
+            report,
+            ground,
+            touches,
+        })
     }
 
     /// Up by the step height, across, then down onto walkable ground. Taken only if it got
@@ -731,6 +848,144 @@ mod tests {
                 .is_err()
         );
         assert_eq!(character.position(), at(0.0, 0.0, 0.0));
+    }
+
+    fn crate_box(world: &mut PhysicsWorld, x: f32, half: f32, density: f32) -> BodyHandle {
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(half)))
+                    .density(density)
+                    .local_position(Vec3::new(x, half, 0.0)),
+            )
+            .unwrap()
+    }
+
+    fn walk_and_push(
+        character: &mut Character,
+        world: &mut PhysicsWorld,
+        step: Vec3,
+        count: usize,
+    ) {
+        let dt = 1.0 / 60.0;
+        for _ in 0..count {
+            character
+                .move_by(world, step + Vec3::new(0.0, -0.05, 0.0))
+                .unwrap();
+            character.push(world, dt).unwrap();
+            world.step_fixed().unwrap();
+        }
+    }
+
+    #[test]
+    fn walking_into_a_light_box_pushes_it() {
+        let mut world = world();
+        floor(&mut world);
+        let light = crate_box(&mut world, 2.0, 0.4, 50.0);
+        let mut character = walker(&world, 0.0, 0.0);
+        walk_and_push(&mut character, &mut world, Vec3::new(0.03, 0.0, 0.0), 180);
+        let state = world.body_state(light).unwrap();
+        assert!(state.position.local.x > 5.5, "{:?}", state.position);
+        // close to the walking speed, friction takes one step of it
+        near(state.linear_velocity.x, 1.8, 0.15);
+        assert!(character.touches().iter().any(|touch| touch.body == light));
+        // it walks behind the box, not through it
+        let gap = state.position.local.x - character.position().local.x;
+        assert!(gap > 0.4 + 0.3 - 0.05, "{gap}");
+        assert!(character.position().local.x > 3.0);
+    }
+
+    #[test]
+    fn a_heavy_box_or_no_push_force_stays_put() {
+        for (half, density, force) in [(0.5, 1000.0, 400.0), (0.4, 50.0, 0.0)] {
+            let mut world = world();
+            floor(&mut world);
+            let block = crate_box(&mut world, 2.0, half, density);
+            let mut character = Character::new(
+                CharacterDesc {
+                    push_force: force,
+                    ..CharacterDesc::default()
+                },
+                at(0.0, STAND, 0.0),
+            )
+            .unwrap();
+            walk_and_push(&mut character, &mut world, Vec3::new(0.03, 0.0, 0.0), 180);
+            let x = world.body_state(block).unwrap().position.local.x;
+            near(x, 2.0, 0.02);
+            near(character.position().local.x, 2.0 - half - 0.3 - 0.01, 0.02);
+        }
+    }
+
+    #[test]
+    fn rides_a_moving_platform() {
+        let mut world = world();
+        floor(&mut world);
+        let platform = world
+            .spawn(
+                RigidBodyDesc::kinematic(Shape::cuboid(Vec3::new(2.0, 0.25, 2.0)))
+                    .local_position(Vec3::new(0.0, 1.0, 0.0))
+                    .linear_velocity(Vec3::new(1.0, 0.5, 0.0)),
+            )
+            .unwrap();
+        let mut character = Character::new(CharacterDesc::default(), at(0.0, 3.0, 0.0)).unwrap();
+        for _ in 0..30 {
+            character
+                .move_by(&world, Vec3::new(0.0, -0.2, 0.0))
+                .unwrap();
+        }
+        assert_eq!(character.ground().map(|g| g.body), Some(platform));
+        let start = character.position().local;
+        let base = world.body_state(platform).unwrap().position.local;
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+            character
+                .move_by(&world, Vec3::new(0.0, -0.05, 0.0))
+                .unwrap();
+            assert!(character.is_grounded());
+        }
+        let moved = world.body_state(platform).unwrap().position.local - base;
+        let carried = character.position().local - start;
+        assert!((carried - moved).length() < 5e-3, "{carried:?} {moved:?}");
+    }
+
+    #[test]
+    fn turns_with_a_spinning_platform() {
+        let mut world = world();
+        floor(&mut world);
+        world
+            .spawn(
+                RigidBodyDesc::kinematic(Shape::cuboid(Vec3::new(3.0, 0.25, 3.0)))
+                    .local_position(Vec3::new(0.0, 0.25, 0.0))
+                    .angular_velocity(Vec3::new(0.0, 1.0, 0.0)),
+            )
+            .unwrap();
+        let mut character = Character::new(CharacterDesc::default(), at(2.0, 2.0, 0.0)).unwrap();
+        for _ in 0..30 {
+            character
+                .move_by(&world, Vec3::new(0.0, -0.2, 0.0))
+                .unwrap();
+        }
+        let height = character.position().local.y;
+        // a quarter turn
+        let steps = (std::f32::consts::FRAC_PI_2 * 60.0).round() as usize;
+        for _ in 0..steps {
+            world.step_fixed().unwrap();
+            character.move_by(&world, Vec3::ZERO).unwrap();
+        }
+        let position = character.position().local;
+        let angle = steps as f32 / 60.0;
+        let wanted = Vec3::new(2.0 * angle.cos(), height, -2.0 * angle.sin());
+        assert!(
+            (position - wanted).length() < 0.02,
+            "{position:?} {wanted:?}"
+        );
+    }
+
+    #[test]
+    fn push_rejects_a_bad_dt() {
+        let mut world = world();
+        let character = Character::new(CharacterDesc::default(), at(0.0, 0.0, 0.0)).unwrap();
+        assert!(character.push(&mut world, 0.0).is_err());
+        assert!(character.push(&mut world, f32::NAN).is_err());
     }
 
     #[test]
