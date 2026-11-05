@@ -11,6 +11,17 @@ pub struct StepReport {
     pub max: Duration,
 }
 
+/// Where the last step spent its time. `narrowphase` is finding contacts and islands, `solve`
+/// and `integrate` add up over substeps, `finish` is commit, contact cache and sleep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTimes {
+    pub broadphase: Duration,
+    pub narrowphase: Duration,
+    pub solve: Duration,
+    pub integrate: Duration,
+    pub finish: Duration,
+}
+
 /// Keeps the last 4096 step times.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StepTimes {

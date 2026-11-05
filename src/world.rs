@@ -1,11 +1,11 @@
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::joint::JointKind;
-use crate::profile::StepTimes;
+use crate::profile::{PhaseTimes, StepTimes};
 use crate::sleep::{SleepScratch, is_slow, plan_wakes, update_sleep};
 use crate::solver::{
     CachedManifold, ContactScratch, find_broad_pairs, finish_contacts, prepare_contacts,
@@ -108,6 +108,7 @@ pub struct PhysicsWorld {
     scratch: Vec<Integrated>,
     frame_gravity: Vec<Vec3>,
     times: StepTimes,
+    phases: PhaseTimes,
 }
 
 impl PhysicsWorld {
@@ -145,6 +146,7 @@ impl PhysicsWorld {
             scratch: Vec::new(),
             frame_gravity: Vec::new(),
             times: StepTimes::default(),
+            phases: PhaseTimes::default(),
         }
     }
 
@@ -166,6 +168,10 @@ impl PhysicsWorld {
 
     pub fn step_report(&self) -> Option<StepReport> {
         self.times.report()
+    }
+
+    pub fn phase_times(&self) -> PhaseTimes {
+        self.phases
     }
 
     /// # Errors
@@ -632,6 +638,13 @@ impl PhysicsWorld {
         self.prepare_frame_gravity()?;
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
+        let mut phases = PhaseTimes::default();
+        let mut mark = started;
+        let mut lap = |into: &mut Duration| {
+            let now = Instant::now();
+            *into += now - mark;
+            mark = now;
+        };
         find_broad_pairs(&self.bodies, &mut self.contact_scratch, dt);
         plan_wakes(
             &self.bodies,
@@ -656,6 +669,7 @@ impl PhysicsWorld {
         let substeps = self.settings.substeps;
         let part = dt / substeps as f32;
         let mut next_cache = self.contact_cache.clone();
+        lap(&mut phases.broadphase);
         prepare_contacts(
             bodies,
             awake,
@@ -665,6 +679,7 @@ impl PhysicsWorld {
             &mut self.contact_scratch,
             dt,
         );
+        lap(&mut phases.narrowphase);
         for substep in 0..substeps {
             // outside forces were worked out at the start of the step, so they go in whole before
             // the first move. spread over substeps they would lag the motion and add energy
@@ -679,6 +694,7 @@ impl PhysicsWorld {
                     (part, push),
                 );
             })?;
+            lap(&mut phases.integrate);
             solve_substep(
                 bodies,
                 awake,
@@ -688,9 +704,11 @@ impl PhysicsWorld {
                 (substep, substep + 1 == substeps),
                 part,
             );
+            lap(&mut phases.solve);
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
                 integrate_position(bodies, awake[dense], dense, slot, part);
             })?;
+            lap(&mut phases.integrate);
         }
         finish_contacts(bodies, awake, &mut next_cache, &self.contact_scratch);
 
@@ -707,6 +725,8 @@ impl PhysicsWorld {
         );
         self.recheck_sleepers = false;
         self.tick += 1;
+        lap(&mut phases.finish);
+        self.phases = phases;
         self.times.record(started.elapsed());
         Ok(())
     }

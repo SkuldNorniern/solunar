@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use solunar::{
-    BodyKind, CompoundChild, GridPosition, JointDesc, JointHandle, PhysicsError, PhysicsSettings,
-    PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, Shape, ShapeCast, Vec3,
+    BodyKind, CompoundChild, GridPosition, JointDesc, JointHandle, PhaseTimes, PhysicsError,
+    PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, Shape, ShapeCast, Vec3,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -29,6 +29,11 @@ const SUITES: [(&str, Suite); 8] = [
     ("rb-08", rb08),
 ];
 
+thread_local! {
+    static PHASES: std::cell::RefCell<(PhaseTimes, u32)> =
+        std::cell::RefCell::new((PhaseTimes::default(), 0));
+}
+
 fn main() {
     let wanted: Vec<String> = std::env::args().skip(1).collect();
     println!(
@@ -40,14 +45,37 @@ fn main() {
     );
     println!("| suite | bodies | samples | p50 | p95 | p99 | max | check |");
     println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    let mut splits = Vec::new();
     for (name, suite) in SUITES {
         if !wanted.is_empty() && !wanted.iter().any(|want| want == name) {
             continue;
         }
+        PHASES.with(|phases| *phases.borrow_mut() = (PhaseTimes::default(), 0));
         match suite() {
             Ok(outcome) => print_row(name, &outcome),
             Err(error) => println!("| {name} | failed: {error} | | | | | | |"),
         }
+        splits.push((name, PHASES.with(|phases| *phases.borrow())));
+    }
+    println!();
+    println!("mean ms per measured step, step is the sum");
+    println!();
+    println!("| suite | broadphase | narrowphase | solve | integrate | finish | step |");
+    println!("| --- | --- | --- | --- | --- | --- | --- |");
+    for (name, (sum, count)) in splits {
+        if count == 0 {
+            continue;
+        }
+        let mean = |time: Duration| format!("{:.3}", time.as_secs_f64() * 1e3 / f64::from(count));
+        println!(
+            "| {name} | {} | {} | {} | {} | {} | {} |",
+            mean(sum.broadphase),
+            mean(sum.narrowphase),
+            mean(sum.solve),
+            mean(sum.integrate),
+            mean(sum.finish),
+            mean(sum.broadphase + sum.narrowphase + sum.solve + sum.integrate + sum.finish),
+        );
     }
 }
 
@@ -92,6 +120,16 @@ fn steps(world: &mut PhysicsWorld, count: usize) -> Result<Vec<Duration>> {
         let started = Instant::now();
         world.step_fixed()?;
         times.push(started.elapsed());
+        let step = world.phase_times();
+        PHASES.with(|phases| {
+            let (sum, count) = &mut *phases.borrow_mut();
+            sum.broadphase += step.broadphase;
+            sum.narrowphase += step.narrowphase;
+            sum.solve += step.solve;
+            sum.integrate += step.integrate;
+            sum.finish += step.finish;
+            *count += 1;
+        });
     }
     Ok(times)
 }
