@@ -4,9 +4,9 @@
 use std::time::{Duration, Instant};
 
 use solunar::{
-    BodyKind, CompoundChild, GridPosition, JobDispatch, JointDesc, JointHandle, PhaseTimes,
-    PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, Sequential,
-    Shape, ShapeCast, Vec3,
+    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, GridPosition, JobDispatch, JointDesc,
+    JointHandle, Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat,
+    QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, Shape, ShapeCast, Vec3,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -20,7 +20,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 8] = [
+const SUITES: [(&str, Suite); 9] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -29,6 +29,7 @@ const SUITES: [(&str, Suite); 8] = [
     ("compound", compound),
     ("queries", queries),
     ("bullets", bullets),
+    ("tunnel", tunnel),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -514,4 +515,83 @@ fn bullets() -> Result<Outcome> {
         unit: "ms",
         check: format!("{through} of 200 went through"),
     })
+}
+
+/// A tunnel bored a little further each step under boxes lying on hills. Times are one edit
+/// each, from asking to the bricks being in the world.
+fn tunnel() -> Result<Outcome> {
+    let mut world = world()?;
+    let started = Instant::now();
+    let mut terrain = SdfTerrain::new(
+        &mut world,
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [16, 6, 16],
+            base: Base::Hills {
+                seed: 5,
+                height: 24.0,
+                amplitude: 3.0,
+                wavelength: 30.0,
+                octaves: 4,
+            },
+            material: Material::default(),
+        },
+    )?;
+    let built = started.elapsed();
+    let mut boxes = Vec::new();
+    for i in 0..200 {
+        let x = 10.0 + (i % 50) as f32 * 2.2;
+        let z = 60.0 + (i / 50) as f32 * 2.5;
+        boxes.push(
+            world.spawn(
+                RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.4)))
+                    .local_position(Vec3::new(x, 31.0, z)),
+            )?,
+        );
+    }
+    steps(&mut world, 240)?;
+    let mut edits = Vec::new();
+    let mut step_times = Vec::new();
+    for i in 0..400 {
+        let x = 4.0 + i as f32 * 0.3;
+        let edit = Edit {
+            shape: EditShape::Capsule {
+                a: Vec3::new(x - 0.3, 22.0, 63.0),
+                b: Vec3::new(x, 22.0, 63.0),
+                radius: 2.0,
+            },
+            op: EditOp::Excavate,
+        };
+        let started = Instant::now();
+        terrain.edit(&mut world, edit)?;
+        edits.push(started.elapsed());
+        step_times.extend(steps(&mut world, 1)?);
+    }
+    let mut fell = 0;
+    for body in &boxes {
+        if world.body_state(*body)?.position.to_dvec3().y < 0.0 {
+            fell += 1;
+        }
+    }
+    step_times.sort_unstable();
+    let step_p99 = step_times[step_times.len() * 99 / 100];
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times: edits,
+        unit: "ms",
+        check: format!(
+            "build {:.0} ms, step p99 {:.2} ms, {fell} fell out, {:.0} m3 removed",
+            built.as_secs_f64() * 1e3,
+            step_p99.as_secs_f64() * 1e3,
+            removed(&terrain),
+        ),
+    })
+}
+
+fn removed(terrain: &SdfTerrain) -> f64 {
+    let desc = terrain.volume().desc();
+    let full = solunar::SdfVolume::new(*desc).map_or(0.0, |fresh| fresh.material_volume());
+    full - terrain.volume().material_volume()
 }
