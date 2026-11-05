@@ -1757,6 +1757,13 @@ mod tests {
             .add_joint(JointDesc::ball(hook, weight).anchors(Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0)))
             .unwrap();
         run(&mut world, 0.5);
+        // enough bodies that a step hands work to the dispatcher at all
+        for i in 0..1100 {
+            let at = Vec3::new(1000.0 + (i % 40) as f32 * 3.0, 0.0, (i / 40) as f32 * 3.0);
+            world
+                .spawn(RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(at))
+                .unwrap();
+        }
         let before = world.joint_reaction(joint).unwrap();
         let bytes = world.save_snapshot();
         assert!(world.step_with(&SkipsJobs).is_err());

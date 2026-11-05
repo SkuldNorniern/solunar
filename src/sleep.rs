@@ -634,6 +634,13 @@ mod tests {
                 RigidBodyDesc::dynamic(Shape::sphere(0.5)).local_position(Vec3::new(0.0, 2.4, 0.0)),
             )
             .unwrap();
+        // enough bodies that a step hands work to the dispatcher at all
+        for i in 0..1100 {
+            let at = Vec3::new(1000.0 + (i % 40) as f32 * 3.0, 0.0, (i / 40) as f32 * 3.0);
+            world
+                .spawn(RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(at))
+                .unwrap();
+        }
         assert_eq!(
             world.step_with(&SkipsJobs),
             Err(PhysicsError::DispatchIncomplete)

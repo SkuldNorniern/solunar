@@ -17,7 +17,8 @@ use crate::{
     JointReaction, Joints, PhysicsError, RigidBodyDesc, Sequential, StepReport,
 };
 
-const MIN_BODIES_PER_JOB: usize = 256;
+/// Integrating a body is tens of nanoseconds, a dispatch several microseconds.
+const MIN_BODIES_PER_JOB: usize = 1024;
 const MAX_SUBSTEPS: u32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -797,6 +798,12 @@ fn run_jobs(
     dispatch: &dyn JobDispatch,
     work: &(dyn Fn(usize, &mut Integrated) + Sync),
 ) -> Result<(), PhysicsError> {
+    if state.len() <= chunk_size {
+        for (index, slot) in state.iter_mut().enumerate() {
+            work(index, slot);
+        }
+        return Ok(());
+    }
     let chunks: Vec<Mutex<(&mut [Integrated], bool)>> = state
         .chunks_mut(chunk_size)
         .map(|chunk| Mutex::new((chunk, false)))
@@ -1530,6 +1537,13 @@ mod tests {
     fn dispatcher_skipping_jobs_fails_and_leaves_state() {
         let mut world = world();
         let body = world.spawn(cube()).unwrap();
+        // enough bodies that a step hands work to the dispatcher at all
+        for i in 0..1100 {
+            let at = Vec3::new(1000.0 + (i % 40) as f32 * 3.0, 0.0, (i / 40) as f32 * 3.0);
+            world
+                .spawn(RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(at))
+                .unwrap();
+        }
         let before = world.body_state(body).unwrap();
         assert_eq!(
             world.step_with(&SkipsJobs),
