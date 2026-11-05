@@ -2,13 +2,17 @@ mod field;
 mod nets;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, PoisonError};
 
 use algebrix::{DVec3, IVec3, Vec3};
 
 pub use field::{Base, Edit, EditOp, EditShape};
 pub use nets::BrickMesh;
 
-use crate::{BodyHandle, GridPosition, Material, PhysicsError, PhysicsWorld, RigidBodyDesc, Shape};
+use crate::{
+    BodyHandle, GridPosition, JobDispatch, Material, PhysicsError, PhysicsWorld, RigidBodyDesc,
+    Sequential, Shape,
+};
 
 const MAX_BRICKS: u64 = 1 << 20;
 /// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
@@ -112,6 +116,14 @@ impl SdfVolume {
     /// # Errors
     /// Fails on a bad size, base or material.
     pub fn new(desc: SdfDesc) -> Result<Self, PhysicsError> {
+        Self::new_with(desc, &Sequential)
+    }
+
+    /// [`Self::new`] with bricks built on the host's workers. The result does not depend on them.
+    ///
+    /// # Errors
+    /// Fails on a bad size, base or material, or a dispatcher that skips jobs.
+    pub fn new_with(desc: SdfDesc, dispatch: &dyn JobDispatch) -> Result<Self, PhysicsError> {
         desc.validate()?;
         let mut volume = Self {
             desc,
@@ -121,24 +133,27 @@ impl SdfVolume {
             revision: 1,
         };
         let [bx, by, bz] = desc.bricks;
+        let mut keys = Vec::with_capacity((bx * by * bz) as usize);
         for z in 0..bz {
             for y in 0..by {
                 for x in 0..bx {
-                    let key = BrickKey([x, y, z]);
-                    let built = volume.build(key, &[]);
-                    if built.inside > 0 || !built.mesh.is_empty() {
-                        volume.bricks.insert(
-                            key,
-                            Brick {
-                                revision: volume.revision,
-                                inside: built.inside,
-                                mesh: built.mesh,
-                                edits: Vec::new(),
-                                values: None,
-                            },
-                        );
-                    }
+                    keys.push(BrickKey([x, y, z]));
                 }
+            }
+        }
+        let built = in_parallel(dispatch, &keys, |key| volume.build(*key, &[]))?;
+        for item in built {
+            if item.inside > 0 || !item.mesh.is_empty() {
+                volume.bricks.insert(
+                    item.key,
+                    Brick {
+                        revision: volume.revision,
+                        inside: item.inside,
+                        mesh: item.mesh,
+                        edits: Vec::new(),
+                        values: None,
+                    },
+                );
             }
         }
         Ok(volume)
@@ -409,13 +424,12 @@ impl SdfVolume {
     fn rebuild(
         &self,
         entry: &EditEntry,
-        pending: Option<&EditEntry>,
-        skip: Option<EditId>,
-    ) -> Vec<Rebuilt> {
-        self.reached(entry)
-            .into_iter()
-            .map(|key| self.build(key, &self.entries_of(key, pending, skip)))
-            .collect()
+        skip: EditId,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<Vec<Rebuilt>, PhysicsError> {
+        in_parallel(dispatch, &self.reached(entry), |key| {
+            self.build(*key, &self.entries_of(*key, None, Some(skip)))
+        })
     }
 
     fn commit(
@@ -445,6 +459,24 @@ impl SdfVolume {
     }
 }
 
+/// `work` for each item on the dispatcher's workers, results in item order.
+fn in_parallel<T: Sync, R: Send>(
+    dispatch: &dyn JobDispatch,
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+) -> Result<Vec<R>, PhysicsError> {
+    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    dispatch.run(items.len(), &|index| {
+        let result = work(&items[index]);
+        *slots[index].lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap_or_else(PoisonError::into_inner))
+        .collect::<Option<Vec<R>>>()
+        .ok_or(PhysicsError::DispatchIncomplete)
+}
+
 fn inside(at: IVec3, low: IVec3, high: IVec3) -> bool {
     at.max(low) == at && at.min(high) == at
 }
@@ -465,8 +497,20 @@ impl SdfTerrain {
     /// # Errors
     /// Fails on a bad description or a brick the world will not take. Nothing stays behind.
     pub fn new(world: &mut PhysicsWorld, desc: SdfDesc) -> Result<Self, PhysicsError> {
+        Self::new_with(world, desc, &Sequential)
+    }
+
+    /// [`Self::new`] with bricks built on the host's workers.
+    ///
+    /// # Errors
+    /// See [`Self::new`], and a dispatcher that skips jobs.
+    pub fn new_with(
+        world: &mut PhysicsWorld,
+        desc: SdfDesc,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<Self, PhysicsError> {
         let mut terrain = Self {
-            volume: SdfVolume::new(desc)?,
+            volume: SdfVolume::new_with(desc, dispatch)?,
             bodies: HashMap::new(),
         };
         let mut keys: Vec<BrickKey> = terrain
@@ -545,15 +589,27 @@ impl SdfTerrain {
         world: &mut PhysicsWorld,
         edit: Edit,
     ) -> Result<EditReport, PhysicsError> {
+        self.edit_with(world, edit, &Sequential)
+    }
+
+    /// [`Self::edit`] with its bricks built on the host's workers. The result does not depend
+    /// on them.
+    ///
+    /// # Errors
+    /// See [`Self::edit`], and a dispatcher that skips jobs.
+    pub fn edit_with(
+        &mut self,
+        world: &mut PhysicsWorld,
+        edit: Edit,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<EditReport, PhysicsError> {
         edit.shape.validate()?;
         let id = EditId(self.volume.next_edit);
         let entry = self.volume.entry(edit);
-        let rebuilt = self
-            .volume
-            .reached(&entry)
-            .into_iter()
-            .map(|key| self.volume.extend(key, &entry))
-            .collect();
+        let volume = &self.volume;
+        let rebuilt = in_parallel(dispatch, &volume.reached(&entry), |key| {
+            volume.extend(*key, &entry)
+        })?;
         let mut report = self.swap(world, rebuilt, |edits| edits.push(id))?;
         self.volume.edits.insert(id, entry);
         self.volume.next_edit += 1;
@@ -574,6 +630,19 @@ impl SdfTerrain {
         world: &mut PhysicsWorld,
         id: EditId,
     ) -> Result<EditReport, PhysicsError> {
+        self.remove_tunnel_with(world, id, &Sequential)
+    }
+
+    /// [`Self::remove_tunnel`] with its bricks built on the host's workers.
+    ///
+    /// # Errors
+    /// See [`Self::remove_tunnel`], and a dispatcher that skips jobs.
+    pub fn remove_tunnel_with(
+        &mut self,
+        world: &mut PhysicsWorld,
+        id: EditId,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<EditReport, PhysicsError> {
         let entry = *self
             .volume
             .edits
@@ -582,7 +651,7 @@ impl SdfTerrain {
         if entry.edit.op != EditOp::Tunnel {
             return Err(PhysicsError::InvalidHandle);
         }
-        let rebuilt = self.volume.rebuild(&entry, None, Some(id));
+        let rebuilt = self.volume.rebuild(&entry, id, dispatch)?;
         let mut report = self.swap(world, rebuilt, |edits| edits.retain(|other| *other != id))?;
         self.volume.edits.remove(&id);
         report.edit = id;
@@ -920,6 +989,69 @@ mod tests {
         let tunnel = terrain.edit(&mut world, edits()[1]).unwrap();
         terrain.remove_tunnel(&mut world, tunnel.edit).unwrap();
         assert_matches_reference(terrain.volume());
+    }
+
+    /// Runs jobs backwards on scoped threads, so order or sharing bugs show.
+    struct Threads;
+
+    impl JobDispatch for Threads {
+        fn parallelism(&self) -> usize {
+            4
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            std::thread::scope(|scope| {
+                for worker in 0..4 {
+                    scope.spawn(move || {
+                        for index in (0..jobs).rev().filter(|index| index % 4 == worker) {
+                            job(index);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    struct Lazy;
+
+    impl JobDispatch for Lazy {
+        fn parallelism(&self) -> usize {
+            1
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            for index in 1..jobs {
+                job(index);
+            }
+        }
+    }
+
+    #[test]
+    fn workers_give_the_same_ground_as_one_thread() {
+        let (mut alone, mut shared) = (world(), world());
+        let mut one = SdfTerrain::new(&mut alone, desc(hills())).unwrap();
+        let mut many = SdfTerrain::new_with(&mut shared, desc(hills()), &Threads).unwrap();
+        for edit in edits() {
+            let a = one.edit(&mut alone, edit).unwrap();
+            let b = many.edit_with(&mut shared, edit, &Threads).unwrap();
+            assert_eq!(a, b);
+        }
+        let tunnel = EditId(1);
+        one.remove_tunnel(&mut alone, tunnel).unwrap();
+        many.remove_tunnel_with(&mut shared, tunnel, &Threads)
+            .unwrap();
+        for key in all_keys(one.volume()) {
+            assert_eq!(one.volume().brick_mesh(key), many.volume().brick_mesh(key));
+        }
+        assert_matches_reference(many.volume());
+
+        let revision = many.volume().revision();
+        assert_eq!(
+            many.edit_with(&mut shared, edits()[0], &Lazy).map(|_| ()),
+            Err(PhysicsError::DispatchIncomplete)
+        );
+        assert_eq!(many.volume().revision(), revision);
+        assert!(SdfVolume::new_with(desc(hills()), &Lazy).is_err());
     }
 
     #[test]
