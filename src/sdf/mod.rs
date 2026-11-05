@@ -230,7 +230,17 @@ impl SdfVolume {
                 distance = entry.edit.op.apply(distance, entry.edit.shape.distance(at));
             }
         }
-        distance.min(at.y - FLOOR_STEPS * step)
+        distance
+            .min(at.y - FLOOR_STEPS * step)
+            .max(self.outside(at))
+    }
+
+    /// Above zero outside the volume, so the ground closes into a solid with no open edge.
+    fn outside(&self, at: Vec3) -> f32 {
+        let [bx, by, bz] = self.desc.bricks;
+        let size = Vec3::new(bx as f32, by as f32, bz as f32)
+            * (self.desc.brick_cells as f32 * self.desc.voxel);
+        (-at).max(at - size).max_element()
     }
 
     fn cells(&self) -> i32 {
@@ -396,8 +406,13 @@ impl SdfVolume {
             for y in 0..side {
                 let gy = (low.y + y as i32) as f32 * step;
                 for x in 0..side {
+                    let at = Vec3::new(
+                        (low.x + x as i32) as f32,
+                        (low.y + y as i32) as f32,
+                        (low.z + z as i32) as f32,
+                    ) * step;
                     let slot = &mut floored[x + side * (y + side * z)];
-                    *slot = slot.min(gy - floor);
+                    *slot = slot.min(gy - floor).max(self.outside(at));
                 }
             }
         }
@@ -417,15 +432,23 @@ impl SdfVolume {
         }
     }
 
-    /// `Some(true)` when the base alone is solid at every sample in range, `Some(false)` when
-    /// empty at all, known from the height bounds with no sampling.
+    /// `Some(true)` when the ground is solid at every sample in range, `Some(false)` when empty at
+    /// all, known from the height bounds with no sampling. A brick on the volume's edge has the
+    /// closing surface to make, and one at the bottom has the floor.
     fn uniform(&self, low: IVec3, high: IVec3) -> Option<bool> {
         let step = self.desc.voxel;
+        let n = self.cells();
+        let [bx, by, bz] = self.desc.bricks.map(|count| count as i32 * n);
         let (bottom, top) = (low.y as f32 * step, high.y as f32 * step);
+        if bottom <= FLOOR_STEPS * step {
+            return None;
+        }
+        let on_edge =
+            low.x <= 0 || low.y <= 0 || low.z <= 0 || high.x >= bx || high.y >= by || high.z >= bz;
         match self.desc.base.height_range() {
             None => Some(false),
             Some((_, highest)) if bottom > highest => Some(false),
-            Some((lowest, _)) if top < lowest => Some(true),
+            Some((lowest, _)) if top < lowest && !on_edge => Some(true),
             Some(_) => None,
         }
     }
@@ -959,13 +982,6 @@ mod tests {
         for (_, corner, _, mesh) in terrain.volume().surface_bricks() {
             bricks += 1;
             for triangle in &mesh.triangles {
-                // the floor is a sheet open at the volume's edge, the blob is what must close
-                if triangle
-                    .iter()
-                    .all(|i| (mesh.vertices[*i as usize] + corner).y < 1.5)
-                {
-                    continue;
-                }
                 let p = triangle.map(|i| key(mesh.vertices[i as usize] + corner));
                 for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
                     let sign = if a < b { 1 } else { -1 };
@@ -1272,6 +1288,32 @@ mod tests {
             "{}",
             height(&world, inside)
         );
+    }
+
+    #[test]
+    fn the_ground_is_closed_all_around() {
+        let mut world = world();
+        let terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        assert_matches_reference(terrain.volume());
+        let key = |p: Vec3| {
+            (
+                (p.x * 1e3).round() as i64,
+                (p.y * 1e3).round() as i64,
+                (p.z * 1e3).round() as i64,
+            )
+        };
+        let mut edges: HashMap<_, i32> = HashMap::new();
+        for (_, corner, _, mesh) in terrain.volume().surface_bricks() {
+            for triangle in &mesh.triangles {
+                let p = triangle.map(|i| key(mesh.vertices[i as usize] + corner));
+                for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
+                    let sign = if a < b { 1 } else { -1 };
+                    *edges.entry((a.min(b), a.max(b))).or_default() += sign;
+                }
+            }
+        }
+        let open = edges.values().filter(|count| **count != 0).count();
+        assert_eq!(open, 0, "{open} open edges of {}", edges.len());
     }
 
     #[test]
