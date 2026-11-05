@@ -713,7 +713,14 @@ mod tests {
             Vec3::new(0.0, 2.5, 0.0),
             Vec3::new(3.0, 0.25, 3.0),
         );
-        let mut character = walker(&world, 0.0, 0.0);
+        // spawned under the ceiling, the usual spawn height is inside it
+        let mut character = Character::new(CharacterDesc::default(), at(0.0, 1.2, 0.0)).unwrap();
+        for _ in 0..20 {
+            character
+                .move_by(&world, Vec3::new(0.0, -0.1, 0.0))
+                .unwrap();
+        }
+        near(character.position().local.y, STAND, 2e-3);
         let report = character.move_by(&world, Vec3::new(0.0, 2.0, 0.0)).unwrap();
         assert!(report.hit_ceiling);
         near(character.position().local.y, 2.25 - 0.9 - 0.01, 2e-3);

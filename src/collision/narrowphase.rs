@@ -264,16 +264,32 @@ fn box_segment(
     let half = inverse.rotate_vec3(half);
     let at = |t: f32| center + half * t;
     let distance_at = |t: f32| box_distance(extents, at(t)).0;
+    let reach = extents + Vec3::splat(radius + margin);
+    if (center.abs() - half.abs() - reach).max_element() > 0.0 {
+        return None;
+    }
 
-    // signed distance to a convex shape is convex along a segment
+    // signed distance to a convex shape is convex along a segment. golden section keeps one of
+    // its two probes each round
+    const GOLDEN: f32 = 0.618_034;
     let (mut low, mut high) = (-1.0_f32, 1.0_f32);
     if half.length_squared() > 1e-12 {
-        for _ in 0..24 {
-            let third = (high - low) / 3.0;
-            if distance_at(low + third) <= distance_at(high - third) {
-                high -= third;
+        let mut left = high - GOLDEN * (high - low);
+        let mut right = low + GOLDEN * (high - low);
+        let (mut at_left, mut at_right) = (distance_at(left), distance_at(right));
+        for _ in 0..22 {
+            if at_left <= at_right {
+                high = right;
+                right = left;
+                at_right = at_left;
+                left = high - GOLDEN * (high - low);
+                at_left = distance_at(left);
             } else {
-                low += third;
+                low = left;
+                left = right;
+                at_left = at_right;
+                right = low + GOLDEN * (high - low);
+                at_right = distance_at(right);
             }
         }
     }
@@ -281,6 +297,12 @@ fn box_segment(
     let (distance, normal) = box_distance(extents, at(best));
     if distance >= radius + margin {
         return None;
+    }
+    let is_segment = half.length_squared() > 1e-12;
+    if distance < 0.0 && is_segment {
+        return Some(deep_segment(
+            extents, rotation, center, half, radius, margin,
+        ));
     }
 
     let mut result = RawManifold::new(rotation.rotate_vec3(normal));
@@ -292,7 +314,6 @@ fn box_segment(
             result.push(rotation.rotate_vec3(contact), radius - distance);
         }
     };
-    let is_segment = half.length_squared() > 1e-12;
     if is_segment {
         add(&mut result, -1.0);
         add(&mut result, 1.0);
@@ -304,6 +325,45 @@ fn box_segment(
         add(&mut result, best);
     }
     result.filled()
+}
+
+/// The segment runs through the box. One point inside says little about the way out, at the
+/// middle of a face its normal is a coin flip. So the whole capsule picks the face that needs the
+/// least push. Box axes in, like `box_segment`.
+fn deep_segment(
+    extents: Vec3,
+    rotation: Quat,
+    center: Vec3,
+    half: Vec3,
+    radius: f32,
+    margin: f32,
+) -> RawManifold {
+    let ends = [center - half, center + half];
+    let mut best = (f32::INFINITY, Vec3::Y);
+    for (axis, extent) in [
+        (Vec3::X, extents.x),
+        (Vec3::Y, extents.y),
+        (Vec3::Z, extents.z),
+    ] {
+        for side in [axis, -axis] {
+            let lowest = ends[0].dot(side).min(ends[1].dot(side));
+            let push = extent + radius - lowest;
+            if push < best.0 {
+                best = (push, side);
+            }
+        }
+    }
+    let normal = best.1;
+    let face = normal.dot(extents).abs();
+    let mut result = RawManifold::new(rotation.rotate_vec3(normal));
+    for end in ends {
+        let distance = end.dot(normal) - face;
+        if distance < radius + margin {
+            let contact = end - normal * ((distance + radius) * 0.5);
+            result.push(rotation.rotate_vec3(contact), radius - distance);
+        }
+    }
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -651,6 +711,31 @@ mod tests {
         .unwrap();
         near_vec(hit.normal, Vec3::Y);
         near(hit.points[0].depth, 0.75);
+    }
+
+    #[test]
+    fn capsule_through_a_slab_leaves_by_the_shorter_way() {
+        // the core crosses the middle of the slab, up needs 0.65 and down 1.65
+        let slab = Shape::cuboid(Vec3::new(3.0, 0.25, 3.0));
+        let capsule = Shape::capsule(0.3, 0.6);
+        for nudge in [-1e-6_f32, 0.0, 1e-6] {
+            let hit = identity(&slab, &capsule, Vec3::new(0.0, 0.5 + nudge, 0.0)).unwrap();
+            near_vec(hit.normal, Vec3::Y);
+            let deepest = hit.points[..hit.count]
+                .iter()
+                .map(|point| point.depth)
+                .fold(0.0, f32::max);
+            near(deepest, 0.65);
+        }
+    }
+
+    #[test]
+    fn far_capsule_beside_a_box_has_no_contact() {
+        let block = Shape::cuboid(Vec3::ONE);
+        let capsule = Shape::capsule(0.3, 2.0);
+        assert!(identity(&block, &capsule, Vec3::new(1.31, 0.0, 0.0)).is_none());
+        assert!(identity(&block, &capsule, Vec3::new(1.29, 0.0, 0.0)).is_some());
+        assert!(identity(&block, &capsule, Vec3::new(0.0, 3.31, 0.0)).is_none());
     }
 
     #[test]
