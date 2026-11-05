@@ -1,0 +1,919 @@
+mod field;
+mod nets;
+
+use std::collections::{BTreeMap, HashMap};
+
+use algebrix::{DVec3, IVec3, Vec3};
+
+pub use field::{Base, Edit, EditOp, EditShape};
+pub use nets::BrickMesh;
+
+use crate::{BodyHandle, GridPosition, Material, PhysicsError, PhysicsWorld, RigidBodyDesc, Shape};
+
+const MAX_BRICKS: u64 = 1 << 20;
+/// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
+/// steps, so cutting the edit off never moves a surface.
+const EDIT_APRON: f32 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SdfDesc {
+    /// The volume's low corner.
+    pub origin: GridPosition,
+    /// Lattice step in meters.
+    pub voxel: f32,
+    /// Cells along each side of a brick.
+    pub brick_cells: u32,
+    /// Bricks along x, y and z.
+    pub bricks: [u32; 3],
+    pub base: Base,
+    /// Friction and restitution of the ground, and the density removed mass is counted with.
+    pub material: Material,
+}
+
+impl SdfDesc {
+    fn validate(&self) -> Result<(), PhysicsError> {
+        let count = self.bricks.iter().map(|n| u64::from(*n)).product::<u64>();
+        let valid = self.voxel.is_finite()
+            && self.voxel > 0.0
+            && (4..=32).contains(&self.brick_cells)
+            && self.bricks.iter().all(|n| *n > 0)
+            && count <= MAX_BRICKS;
+        if !valid {
+            return Err(PhysicsError::InvalidShape);
+        }
+        self.material.validate()?;
+        self.base.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EditId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BrickKey(pub [u32; 3]);
+
+#[derive(Debug, Clone, Copy)]
+struct EditEntry {
+    edit: Edit,
+    /// Lattice samples it reaches, inclusive. Whether a sample feels the edit depends on the
+    /// sample alone, never on which brick asks.
+    low: IVec3,
+    high: IVec3,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Brick {
+    revision: u64,
+    /// Samples inside material among the ones this brick owns.
+    inside: u64,
+    mesh: BrickMesh,
+    /// Edits that reach it, oldest first.
+    edits: Vec<EditId>,
+}
+
+/// What an edit or removal changed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditReport {
+    pub edit: EditId,
+    pub revision: u64,
+    pub bricks: usize,
+    /// Material volume after minus before, cubic meters.
+    pub volume_change: f64,
+    /// Mass an excavation took out, zero for other edits.
+    pub removed_mass: f64,
+}
+
+/// A brick built again but not yet in the volume.
+struct Rebuilt {
+    key: BrickKey,
+    inside: u64,
+    mesh: BrickMesh,
+}
+
+/// Ground as a signed distance field: a base and ordered edits, sampled in sparse bricks. Only
+/// bricks near the surface hold triangles. An edit samples again only the bricks it reaches,
+/// and each of those only runs the edits that reach it.
+#[derive(Debug, Clone)]
+pub struct SdfVolume {
+    desc: SdfDesc,
+    edits: BTreeMap<EditId, EditEntry>,
+    next_edit: u32,
+    bricks: HashMap<BrickKey, Brick>,
+    revision: u64,
+}
+
+impl SdfVolume {
+    /// # Errors
+    /// Fails on a bad size, base or material.
+    pub fn new(desc: SdfDesc) -> Result<Self, PhysicsError> {
+        desc.validate()?;
+        let mut volume = Self {
+            desc,
+            edits: BTreeMap::new(),
+            next_edit: 0,
+            bricks: HashMap::new(),
+            revision: 1,
+        };
+        let [bx, by, bz] = desc.bricks;
+        for z in 0..bz {
+            for y in 0..by {
+                for x in 0..bx {
+                    let key = BrickKey([x, y, z]);
+                    let built = volume.build(key, &[]);
+                    if built.inside > 0 || !built.mesh.is_empty() {
+                        volume.bricks.insert(
+                            key,
+                            Brick {
+                                revision: volume.revision,
+                                inside: built.inside,
+                                mesh: built.mesh,
+                                edits: Vec::new(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(volume)
+    }
+
+    pub fn desc(&self) -> &SdfDesc {
+        &self.desc
+    }
+
+    /// Goes up by one with each committed change.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn edit_count(&self) -> usize {
+        self.edits.len()
+    }
+
+    /// Material volume in cubic meters, one lattice sample is one cell of it.
+    pub fn material_volume(&self) -> f64 {
+        let cell = f64::from(self.desc.voxel).powi(3);
+        self.bricks
+            .values()
+            .map(|brick| brick.inside as f64)
+            .sum::<f64>()
+            * cell
+    }
+
+    /// Bricks with triangles: key, low corner from the volume origin, revision, mesh.
+    pub fn surface_bricks(&self) -> impl Iterator<Item = (BrickKey, Vec3, u64, &BrickMesh)> {
+        self.bricks
+            .iter()
+            .filter(|(_, brick)| !brick.mesh.is_empty())
+            .map(|(key, brick)| (*key, self.brick_corner(*key), brick.revision, &brick.mesh))
+    }
+
+    pub fn brick_mesh(&self, key: BrickKey) -> Option<&BrickMesh> {
+        self.bricks.get(&key).map(|brick| &brick.mesh)
+    }
+
+    /// Distance to the surface at a point from the volume origin, negative inside material.
+    /// Exact on lattice samples, where the bricks read it.
+    pub fn distance(&self, at: Vec3) -> f32 {
+        let step = self.desc.voxel;
+        let (height, slope) = self.desc.base.column(at.x, at.z, step * 0.5);
+        let mut distance = field::base_distance(height, slope, at.y);
+        let sample = IVec3::new(
+            (at.x / step).round() as i32,
+            (at.y / step).round() as i32,
+            (at.z / step).round() as i32,
+        );
+        for entry in self.edits.values() {
+            if inside(sample, entry.low, entry.high) {
+                distance = entry.edit.op.apply(distance, entry.edit.shape.distance(at));
+            }
+        }
+        distance
+    }
+
+    fn cells(&self) -> i32 {
+        self.desc.brick_cells as i32
+    }
+
+    fn brick_corner(&self, key: BrickKey) -> Vec3 {
+        let [x, y, z] = key.0;
+        Vec3::new(x as f32, y as f32, z as f32) * (self.desc.brick_cells as f32 * self.desc.voxel)
+    }
+
+    /// Lattice samples a brick reads, inclusive: its own and one more on each side.
+    fn brick_samples(&self, key: BrickKey) -> (IVec3, IVec3) {
+        let n = self.cells();
+        let low = IVec3::new(key.0[0] as i32, key.0[1] as i32, key.0[2] as i32) * n;
+        (low - IVec3::ONE, low + IVec3::splat(n))
+    }
+
+    fn entry(&self, edit: Edit) -> EditEntry {
+        let (low, high) = edit.shape.bounds();
+        let step = self.desc.voxel;
+        let reach = Vec3::splat(EDIT_APRON * step);
+        let lattice = |at: Vec3, round: fn(f32) -> f32| {
+            let scaled = at / step;
+            let to_int = |value: f32| round(value).clamp(-1.0e9, 1.0e9) as i32;
+            IVec3::new(to_int(scaled.x), to_int(scaled.y), to_int(scaled.z))
+        };
+        EditEntry {
+            edit,
+            low: lattice(low - reach, f32::floor),
+            high: lattice(high + reach, f32::ceil),
+        }
+    }
+
+    /// Bricks whose samples an edit reaches.
+    fn reached(&self, entry: &EditEntry) -> Vec<BrickKey> {
+        let n = self.cells();
+        let [bx, by, bz] = self.desc.bricks.map(|count| count as i32);
+        // brick b reads samples n b - 1 to n b + n
+        let first = |low: i32| (low - n).div_euclid(n).max(0);
+        let last = |high: i32, count: i32| (high + 1).div_euclid(n).min(count - 1);
+        let mut keys = Vec::new();
+        for z in first(entry.low.z)..=last(entry.high.z, bz) {
+            for y in first(entry.low.y)..=last(entry.high.y, by) {
+                for x in first(entry.low.x)..=last(entry.high.x, bx) {
+                    let key = BrickKey([x as u32, y as u32, z as u32]);
+                    let (low, high) = self.brick_samples(key);
+                    if overlaps(low, high, entry.low, entry.high) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// The brick's edits oldest first, with `pending` after them or `skip` left out.
+    fn entries_of(
+        &self,
+        key: BrickKey,
+        pending: Option<&EditEntry>,
+        skip: Option<EditId>,
+    ) -> Vec<EditEntry> {
+        let listed = self
+            .bricks
+            .get(&key)
+            .map_or(&[][..], |brick| &brick.edits[..]);
+        listed
+            .iter()
+            .filter(|id| Some(**id) != skip)
+            .filter_map(|id| self.edits.get(id).copied())
+            .chain(pending.copied())
+            .collect()
+    }
+
+    /// Samples and meshes one brick from scratch.
+    fn build(&self, key: BrickKey, edits: &[EditEntry]) -> Rebuilt {
+        let n = self.cells();
+        let (low, high) = self.brick_samples(key);
+        let step = self.desc.voxel;
+        if edits.is_empty()
+            && let Some(solid) = self.uniform(low, high)
+        {
+            let inside = if solid {
+                u64::from(self.desc.brick_cells).pow(3)
+            } else {
+                0
+            };
+            return Rebuilt {
+                key,
+                inside,
+                mesh: BrickMesh::default(),
+            };
+        }
+        let side = (n + 2) as usize;
+        let mut values = vec![0.0_f32; side * side * side];
+        for z in 0..side {
+            for x in 0..side {
+                let gx = (low.x + x as i32) as f32 * step;
+                let gz = (low.z + z as i32) as f32 * step;
+                let (height, slope) = self.desc.base.column(gx, gz, step * 0.5);
+                for y in 0..side {
+                    let gy = (low.y + y as i32) as f32 * step;
+                    values[x + side * (y + side * z)] = field::base_distance(height, slope, gy);
+                }
+            }
+        }
+        for entry in edits {
+            let from = entry.low.max(low);
+            let to = entry.high.min(high);
+            for gz in from.z..=to.z {
+                for gy in from.y..=to.y {
+                    for gx in from.x..=to.x {
+                        let p = Vec3::new(gx as f32, gy as f32, gz as f32) * step;
+                        let slot = (gx - low.x) as usize
+                            + side * ((gy - low.y) as usize + side * (gz - low.z) as usize);
+                        values[slot] = entry
+                            .edit
+                            .op
+                            .apply(values[slot], entry.edit.shape.distance(p));
+                    }
+                }
+            }
+        }
+        let mut inside = 0;
+        for z in 1..side - 1 {
+            for y in 1..side - 1 {
+                for x in 1..side - 1 {
+                    inside += u64::from(values[x + side * (y + side * z)] < 0.0);
+                }
+            }
+        }
+        Rebuilt {
+            key,
+            inside,
+            mesh: nets::surface_nets(&values, side, step),
+        }
+    }
+
+    /// `Some(true)` when the base alone is solid at every sample in range, `Some(false)` when
+    /// empty at all, known from the height bounds with no sampling.
+    fn uniform(&self, low: IVec3, high: IVec3) -> Option<bool> {
+        let step = self.desc.voxel;
+        let (bottom, top) = (low.y as f32 * step, high.y as f32 * step);
+        match self.desc.base.height_range() {
+            None => Some(false),
+            Some((_, highest)) if bottom > highest => Some(false),
+            Some((lowest, _)) if top < lowest => Some(true),
+            Some(_) => None,
+        }
+    }
+
+    fn rebuild(
+        &self,
+        entry: &EditEntry,
+        pending: Option<&EditEntry>,
+        skip: Option<EditId>,
+    ) -> Vec<Rebuilt> {
+        self.reached(entry)
+            .into_iter()
+            .map(|key| self.build(key, &self.entries_of(key, pending, skip)))
+            .collect()
+    }
+
+    fn commit(
+        &mut self,
+        rebuilt: Vec<Rebuilt>,
+        edit_change: impl Fn(&mut Vec<EditId>),
+    ) -> (u64, i64) {
+        self.revision += 1;
+        let mut change = 0_i64;
+        for item in rebuilt {
+            let brick = self.bricks.entry(item.key).or_default();
+            change += item.inside as i64 - brick.inside as i64;
+            brick.inside = item.inside;
+            brick.mesh = item.mesh;
+            brick.revision = self.revision;
+            edit_change(&mut brick.edits);
+        }
+        self.bricks.retain(|_, brick| {
+            brick.inside > 0 || !brick.mesh.is_empty() || !brick.edits.is_empty()
+        });
+        (self.revision, change)
+    }
+}
+
+fn inside(at: IVec3, low: IVec3, high: IVec3) -> bool {
+    at.max(low) == at && at.min(high) == at
+}
+
+fn overlaps(a_low: IVec3, a_high: IVec3, b_low: IVec3, b_high: IVec3) -> bool {
+    (a_high.min(b_high) - a_low.max(b_low)).min_element() >= 0
+}
+
+/// An [`SdfVolume`] in a world: each surface brick is a fixed body with its triangles. Changes
+/// land between steps, every brick of one edit at once, so a step never sees half a hole.
+#[derive(Debug)]
+pub struct SdfTerrain {
+    volume: SdfVolume,
+    bodies: HashMap<BrickKey, (BodyHandle, Shape)>,
+}
+
+impl SdfTerrain {
+    /// # Errors
+    /// Fails on a bad description or a brick the world will not take. Nothing stays behind.
+    pub fn new(world: &mut PhysicsWorld, desc: SdfDesc) -> Result<Self, PhysicsError> {
+        let mut terrain = Self {
+            volume: SdfVolume::new(desc)?,
+            bodies: HashMap::new(),
+        };
+        let mut keys: Vec<BrickKey> = terrain
+            .volume
+            .surface_bricks()
+            .map(|(key, ..)| key)
+            .collect();
+        keys.sort_unstable();
+        for key in keys {
+            let mesh = terrain.volume.brick_mesh(key).cloned().unwrap_or_default();
+            match terrain.collider(world, key, &mesh) {
+                Ok(Some(body)) => {
+                    terrain.bodies.insert(key, body);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terrain.remove(world);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(terrain)
+    }
+
+    pub fn volume(&self) -> &SdfVolume {
+        &self.volume
+    }
+
+    pub fn body_of(&self, key: BrickKey) -> Option<BodyHandle> {
+        self.bodies.get(&key).map(|(body, _)| *body)
+    }
+
+    pub fn bodies(&self) -> impl Iterator<Item = BodyHandle> + '_ {
+        self.bodies.values().map(|(body, _)| *body)
+    }
+
+    fn collider(
+        &self,
+        world: &mut PhysicsWorld,
+        key: BrickKey,
+        mesh: &BrickMesh,
+    ) -> Result<Option<(BodyHandle, Shape)>, PhysicsError> {
+        if mesh.is_empty() {
+            return Ok(None);
+        }
+        let shape = world.add_mesh(&mesh.vertices, &mesh.triangles)?;
+        let corner = DVec3::from_vec3(self.volume.brick_corner(key));
+        let placed = self
+            .volume
+            .desc
+            .origin
+            .shifted(corner)
+            .ok_or(PhysicsError::OutOfRange)
+            .and_then(|position| {
+                world.spawn(
+                    RigidBodyDesc::fixed(shape)
+                        .position(position)
+                        .material(self.volume.desc.material),
+                )
+            });
+        match placed {
+            Ok(body) => Ok(Some((body, shape))),
+            Err(error) => {
+                world.remove_mesh(shape)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Applies one edit to the volume and the world.
+    ///
+    /// # Errors
+    /// Fails on a bad shape or when the world will not take a new brick. Then nothing changed.
+    pub fn edit(
+        &mut self,
+        world: &mut PhysicsWorld,
+        edit: Edit,
+    ) -> Result<EditReport, PhysicsError> {
+        edit.shape.validate()?;
+        let id = EditId(self.volume.next_edit);
+        let entry = self.volume.entry(edit);
+        let rebuilt = self.volume.rebuild(&entry, Some(&entry), None);
+        let mut report = self.swap(world, rebuilt, |edits| edits.push(id))?;
+        self.volume.edits.insert(id, entry);
+        self.volume.next_edit += 1;
+        report.edit = id;
+        if edit.op == EditOp::Excavate {
+            report.removed_mass =
+                (-report.volume_change).max(0.0) * f64::from(self.volume.desc.material.density);
+        }
+        Ok(report)
+    }
+
+    /// Takes a tunnel out again, the ground it cut comes back.
+    ///
+    /// # Errors
+    /// Fails when `id` is not a tunnel here, or the world will not take a brick.
+    pub fn remove_tunnel(
+        &mut self,
+        world: &mut PhysicsWorld,
+        id: EditId,
+    ) -> Result<EditReport, PhysicsError> {
+        let entry = *self
+            .volume
+            .edits
+            .get(&id)
+            .ok_or(PhysicsError::InvalidHandle)?;
+        if entry.edit.op != EditOp::Tunnel {
+            return Err(PhysicsError::InvalidHandle);
+        }
+        let rebuilt = self.volume.rebuild(&entry, None, Some(id));
+        let mut report = self.swap(world, rebuilt, |edits| edits.retain(|other| *other != id))?;
+        self.volume.edits.remove(&id);
+        report.edit = id;
+        Ok(report)
+    }
+
+    /// Puts all new brick bodies in, then takes the old ones out. On failure nothing changed.
+    fn swap(
+        &mut self,
+        world: &mut PhysicsWorld,
+        rebuilt: Vec<Rebuilt>,
+        edit_change: impl Fn(&mut Vec<EditId>),
+    ) -> Result<EditReport, PhysicsError> {
+        let mut fresh = Vec::new();
+        for item in &rebuilt {
+            match self.collider(world, item.key, &item.mesh) {
+                Ok(Some(body)) => fresh.push((item.key, body)),
+                Ok(None) => {}
+                Err(error) => {
+                    let bodies: Vec<_> = fresh.iter().map(|(_, body)| *body).collect();
+                    release(world, &bodies);
+                    return Err(error);
+                }
+            }
+        }
+        let keys: Vec<BrickKey> = rebuilt.iter().map(|item| item.key).collect();
+        let old: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.bodies.remove(key))
+            .collect();
+        release(world, &old);
+        self.bodies.extend(fresh);
+        let (revision, change) = self.volume.commit(rebuilt, edit_change);
+        let cell = f64::from(self.volume.desc.voxel).powi(3);
+        Ok(EditReport {
+            edit: EditId(0),
+            revision,
+            bricks: keys.len(),
+            volume_change: change as f64 * cell,
+            removed_mass: 0.0,
+        })
+    }
+
+    /// Takes every brick body out of the world.
+    pub fn remove(self, world: &mut PhysicsWorld) {
+        let bodies: Vec<_> = self.bodies.into_values().collect();
+        release(world, &bodies);
+    }
+}
+
+fn release(world: &mut PhysicsWorld, bodies: &[(BodyHandle, Shape)]) {
+    for (body, shape) in bodies {
+        // both are ours and alive, so these only fail if someone else removed them first
+        let _ = world.despawn(*body);
+        let _ = world.remove_mesh(*shape);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use algebrix::Quat;
+
+    use super::*;
+    use crate::PhysicsSettings;
+
+    fn hills() -> Base {
+        Base::Hills {
+            seed: 11,
+            height: 6.0,
+            amplitude: 2.5,
+            wavelength: 14.0,
+            octaves: 3,
+        }
+    }
+
+    fn desc(base: Base) -> SdfDesc {
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 8,
+            bricks: [6, 4, 6],
+            base,
+            material: Material {
+                density: 2000.0,
+                ..Material::default()
+            },
+        }
+    }
+
+    fn world() -> PhysicsWorld {
+        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
+    }
+
+    fn edits() -> Vec<Edit> {
+        vec![
+            Edit {
+                shape: EditShape::Sphere {
+                    center: Vec3::new(6.0, 6.0, 6.0),
+                    radius: 2.5,
+                },
+                op: EditOp::Excavate,
+            },
+            Edit {
+                shape: EditShape::Capsule {
+                    a: Vec3::new(1.0, 4.5, 12.0),
+                    b: Vec3::new(20.0, 5.0, 12.5),
+                    radius: 1.3,
+                },
+                op: EditOp::Tunnel,
+            },
+            Edit {
+                shape: EditShape::Box {
+                    center: Vec3::new(14.0, 7.0, 4.0),
+                    half_extents: Vec3::new(2.0, 1.5, 1.0),
+                    rotation: Quat::from_axis_angle(Vec3::Y, 0.6),
+                },
+                op: EditOp::Add,
+            },
+            Edit {
+                shape: EditShape::Sphere {
+                    center: Vec3::new(4.0, 7.9, 4.0),
+                    radius: 1.7,
+                },
+                op: EditOp::Excavate,
+            },
+        ]
+    }
+
+    /// Every brick sampled straight from `distance`, with no brick lists or caching.
+    fn reference(volume: &SdfVolume, key: BrickKey) -> BrickMesh {
+        let (low, high) = volume.brick_samples(key);
+        let side = (high.x - low.x + 1) as usize;
+        let step = volume.desc.voxel;
+        let mut values = Vec::with_capacity(side * side * side);
+        for z in low.z..=high.z {
+            for y in low.y..=high.y {
+                for x in low.x..=high.x {
+                    values.push(volume.distance(Vec3::new(x as f32, y as f32, z as f32) * step));
+                }
+            }
+        }
+        nets::surface_nets(&values, side, step)
+    }
+
+    fn all_keys(volume: &SdfVolume) -> Vec<BrickKey> {
+        let [bx, by, bz] = volume.desc.bricks;
+        let mut keys = Vec::new();
+        for z in 0..bz {
+            for y in 0..by {
+                for x in 0..bx {
+                    keys.push(BrickKey([x, y, z]));
+                }
+            }
+        }
+        keys
+    }
+
+    fn assert_matches_reference(volume: &SdfVolume) {
+        for key in all_keys(volume) {
+            let stored = volume.brick_mesh(key).cloned().unwrap_or_default();
+            assert_eq!(stored, reference(volume, key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn edited_bricks_match_sampling_everything_again() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        assert_matches_reference(terrain.volume());
+        for edit in edits() {
+            let report = terrain.edit(&mut world, edit).unwrap();
+            assert!(report.bricks > 0);
+            assert_matches_reference(terrain.volume());
+        }
+    }
+
+    #[test]
+    fn the_surface_has_no_gaps_between_bricks() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Empty)).unwrap();
+        // a closed blob across many bricks
+        for edit in [
+            Edit {
+                shape: EditShape::Sphere {
+                    center: Vec3::splat(8.0),
+                    radius: 5.3,
+                },
+                op: EditOp::Add,
+            },
+            Edit {
+                shape: EditShape::Capsule {
+                    a: Vec3::new(3.0, 8.0, 8.0),
+                    b: Vec3::new(13.0, 9.0, 7.5),
+                    radius: 1.6,
+                },
+                op: EditOp::Excavate,
+            },
+        ] {
+            terrain.edit(&mut world, edit).unwrap();
+        }
+        let key = |p: Vec3| {
+            (
+                (p.x * 1e3).round() as i64,
+                (p.y * 1e3).round() as i64,
+                (p.z * 1e3).round() as i64,
+            )
+        };
+        let mut edges: HashMap<_, i32> = HashMap::new();
+        let mut bricks = 0;
+        for (_, corner, _, mesh) in terrain.volume().surface_bricks() {
+            bricks += 1;
+            for triangle in &mesh.triangles {
+                let p = triangle.map(|i| key(mesh.vertices[i as usize] + corner));
+                for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
+                    let sign = if a < b { 1 } else { -1 };
+                    *edges.entry((a.min(b), a.max(b))).or_default() += sign;
+                }
+            }
+        }
+        assert!(bricks > 8, "{bricks}");
+        let open = edges.values().filter(|count| **count != 0).count();
+        assert_eq!(open, 0, "{open} open edges of {}", edges.len());
+    }
+
+    #[test]
+    fn excavation_counts_the_volume_and_mass_it_takes() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 12.0 })).unwrap();
+        let before = terrain.volume().material_volume();
+        let radius = 3.0_f64;
+        let report = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Sphere {
+                        center: Vec3::new(12.0, 6.0, 12.0),
+                        radius: radius as f32,
+                    },
+                    op: EditOp::Excavate,
+                },
+            )
+            .unwrap();
+        let ball = 4.0 / 3.0 * std::f64::consts::PI * radius.powi(3);
+        assert!(
+            (-report.volume_change / ball - 1.0).abs() < 0.05,
+            "{report:?} {ball}"
+        );
+        assert!((report.removed_mass - -report.volume_change * 2000.0).abs() < 1e-6);
+        let after = terrain.volume().material_volume();
+        assert!((before - after + report.volume_change).abs() < 1e-6);
+
+        let added = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Sphere {
+                        center: Vec3::new(12.0, 6.0, 12.0),
+                        radius: 1.0,
+                    },
+                    op: EditOp::Add,
+                },
+            )
+            .unwrap();
+        assert!(added.volume_change > 0.0);
+        assert_eq!(added.removed_mass, 0.0);
+    }
+
+    #[test]
+    fn removing_a_tunnel_gives_back_the_same_ground() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        let meshes = |terrain: &SdfTerrain| {
+            let mut all: Vec<_> = terrain
+                .volume()
+                .surface_bricks()
+                .map(|(key, _, _, mesh)| (key, mesh.clone()))
+                .collect();
+            all.sort_by_key(|(key, _)| *key);
+            all
+        };
+        let start = meshes(&terrain);
+        let volume = terrain.volume().material_volume();
+        let tunnel = terrain.edit(&mut world, edits()[1]).unwrap();
+        assert!(tunnel.volume_change < 0.0);
+        assert_eq!(tunnel.removed_mass, 0.0);
+        assert_ne!(meshes(&terrain), start);
+        let back = terrain.remove_tunnel(&mut world, tunnel.edit).unwrap();
+        assert!((back.volume_change + tunnel.volume_change).abs() < 1e-9);
+        assert_eq!(meshes(&terrain), start);
+        assert_eq!(terrain.volume().material_volume(), volume);
+        assert_eq!(
+            terrain.remove_tunnel(&mut world, tunnel.edit).map(|_| ()),
+            Err(PhysicsError::InvalidHandle)
+        );
+        let dug = terrain.edit(&mut world, edits()[0]).unwrap();
+        assert_eq!(
+            terrain.remove_tunnel(&mut world, dug.edit).map(|_| ()),
+            Err(PhysicsError::InvalidHandle)
+        );
+    }
+
+    #[test]
+    fn repeated_edits_do_not_grow_the_world() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        let bodies = world.body_count();
+        let mut slots = 0;
+        for round in 0..30 {
+            let tunnel = terrain.edit(&mut world, edits()[1]).unwrap();
+            terrain.remove_tunnel(&mut world, tunnel.edit).unwrap();
+            assert_eq!(world.body_count(), bodies);
+            if round == 0 {
+                slots = world.bodies.assets.meshes.len();
+            }
+        }
+        assert_eq!(world.bodies.assets.meshes.len(), slots);
+        assert_eq!(terrain.volume().edit_count(), 0);
+        terrain.remove(&mut world);
+        assert_eq!(world.body_count(), 0);
+    }
+
+    #[test]
+    fn a_ball_rests_on_the_ground_and_falls_into_a_new_hole() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let start = Vec3::new(12.0, 9.0, 12.0);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.4))
+                    .position(GridPosition::from_local(start).unwrap()),
+            )
+            .unwrap();
+        let height = |world: &PhysicsWorld| world.body_state(ball).unwrap().position.to_dvec3().y;
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        assert!((height(&world) - 8.4).abs() < 0.05, "{}", height(&world));
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Box {
+                        center: Vec3::new(12.0, 6.0, 12.0),
+                        half_extents: Vec3::new(1.5, 2.5, 1.5),
+                        rotation: Quat::IDENTITY,
+                    },
+                    op: EditOp::Excavate,
+                },
+            )
+            .unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        assert!((height(&world) - 3.9).abs() < 0.1, "{}", height(&world));
+    }
+
+    #[test]
+    fn bad_input_changes_nothing() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        let revision = terrain.volume().revision();
+        let bad = Edit {
+            shape: EditShape::Sphere {
+                center: Vec3::ZERO,
+                radius: f32::NAN,
+            },
+            op: EditOp::Excavate,
+        };
+        assert_eq!(
+            terrain.edit(&mut world, bad).map(|_| ()),
+            Err(PhysicsError::InvalidShape)
+        );
+        assert_eq!(terrain.volume().revision(), revision);
+        assert_eq!(terrain.volume().edit_count(), 0);
+        let far = Edit {
+            shape: EditShape::Sphere {
+                center: Vec3::splat(-500.0),
+                radius: 1.0,
+            },
+            op: EditOp::Excavate,
+        };
+        assert_eq!(terrain.edit(&mut world, far).unwrap().bricks, 0);
+        for broken in [
+            SdfDesc {
+                voxel: 0.0,
+                ..desc(hills())
+            },
+            SdfDesc {
+                brick_cells: 2,
+                ..desc(hills())
+            },
+            SdfDesc {
+                bricks: [0, 1, 1],
+                ..desc(hills())
+            },
+            SdfDesc {
+                bricks: [2048, 2048, 2048],
+                ..desc(hills())
+            },
+        ] {
+            assert!(SdfTerrain::new(&mut world, broken).is_err());
+        }
+    }
+}
