@@ -103,6 +103,7 @@ pub struct PhysicsWorld {
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
     contact_events: Vec<ContactEvent>,
+    failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
     pub(crate) contact_scratch: ContactScratch,
@@ -143,6 +144,7 @@ impl PhysicsWorld {
             accumulator,
             contact_cache: Vec::new(),
             contact_events: Vec::new(),
+            failed_body: None,
             recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
             sleep: SleepScratch::default(),
@@ -175,6 +177,12 @@ impl PhysicsWorld {
 
     pub fn phase_times(&self) -> PhaseTimes {
         self.phases
+    }
+
+    /// The body that made the last step fail, when one did. A failed step keeps failing until
+    /// this body is fixed or removed, there can be more after it.
+    pub fn failed_body(&self) -> Option<BodyHandle> {
+        self.failed_body
     }
 
     /// Pairs that started or stopped pushing on each other in the last step, lower handle
@@ -644,6 +652,7 @@ impl PhysicsWorld {
     /// State stays at the last step when this fails.
     pub fn step_with(&mut self, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
         let started = Instant::now();
+        self.failed_body = None;
         self.prepare_frame_gravity()?;
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
@@ -762,15 +771,19 @@ impl PhysicsWorld {
     }
 
     fn commit(&mut self) -> Result<(), PhysicsError> {
-        for result in &self.scratch {
-            if result.out_of_range {
-                return Err(PhysicsError::OutOfRange);
-            }
-            finite(result.linear, "velocity")?;
-            finite(result.angular, "velocity")?;
-            finite(result.momentum, "momentum")?;
-            if !result.rotation.is_finite() {
-                return Err(PhysicsError::NonFinite("rotation"));
+        for (dense, result) in self.scratch.iter().enumerate() {
+            let checked = if result.out_of_range {
+                Err(PhysicsError::OutOfRange)
+            } else if !result.rotation.is_finite() {
+                Err(PhysicsError::NonFinite("rotation"))
+            } else {
+                finite(result.linear, "velocity")
+                    .and_then(|()| finite(result.angular, "velocity"))
+                    .and_then(|()| finite(result.momentum, "momentum"))
+            };
+            if let Err(error) = checked {
+                self.failed_body = Some(self.bodies.handle_at(dense));
+                return Err(error);
             }
         }
         for (dense, result) in self.scratch.iter().enumerate() {

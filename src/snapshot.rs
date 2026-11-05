@@ -1387,4 +1387,380 @@ mod tests {
         };
         assert!(PhysicsWorld::load_snapshot_with_limits(&bytes, &no_slots).is_err());
     }
+
+    mod scripted {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use algebrix::{Quat, Vec3};
+
+        use crate::{
+            BodyHandle, BodyKind, CompoundChild, GridPosition, JobDispatch, JointDesc, JointDof,
+            JointMotor, PhysicsError, PhysicsSettings, PhysicsWorld, QueryFilter, Ray,
+            RigidBodyDesc, Sequential, Shape,
+        };
+
+        struct Workers(usize);
+
+        impl JobDispatch for Workers {
+            fn parallelism(&self) -> usize {
+                self.0
+            }
+
+            fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..self.0 {
+                        scope.spawn(|| {
+                            loop {
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                if index >= jobs {
+                                    break;
+                                }
+                                job(index);
+                            }
+                        });
+                    }
+                });
+            }
+        }
+
+        struct Dice(u64);
+
+        impl Dice {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+
+            fn float(&mut self, low: f32, high: f32) -> f32 {
+                low + (self.next() % 10_000) as f32 / 10_000.0 * (high - low)
+            }
+
+            fn spot(&mut self, reach: f32, high: f32) -> Vec3 {
+                Vec3::new(
+                    self.float(-reach, reach),
+                    self.float(1.0, high),
+                    self.float(-reach, reach),
+                )
+            }
+        }
+
+        /// One of everything the solver handles. `pyramid` wide boxes make a big colored island.
+        fn scene(pyramid: usize) -> PhysicsWorld {
+            let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+            let floor = RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(200.0, 1.0, 200.0)))
+                .local_position(Vec3::new(0.0, -1.0, 0.0));
+            let floor = world.spawn(floor).unwrap();
+            for row in 0..pyramid {
+                for column in 0..pyramid - row {
+                    let x = column as f32 * 1.05 - (pyramid - row) as f32 * 0.525;
+                    let at = Vec3::new(x, 0.5 + row as f32, -30.0);
+                    let body = RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)));
+                    world.spawn(body.local_position(at)).unwrap();
+                }
+            }
+            let mut last = world
+                .spawn(
+                    RigidBodyDesc::fixed(Shape::sphere(0.1))
+                        .local_position(Vec3::new(10.0, 8.0, 0.0)),
+                )
+                .unwrap();
+            for link in 1..6 {
+                let at = Vec3::new(10.0 + link as f32 * 0.6, 8.0, 0.0);
+                let ball = RigidBodyDesc::dynamic(Shape::sphere(0.15)).local_position(at);
+                let ball = world.spawn(ball).unwrap();
+                let anchor = GridPosition::from_local(at - Vec3::X * 0.3).unwrap();
+                let joint = world
+                    .joint_at(JointDesc::ball(last, ball), anchor, Quat::IDENTITY)
+                    .unwrap();
+                world.add_joint(joint).unwrap();
+                last = ball;
+            }
+            let wheel = RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(0.1, 0.5, 0.5)))
+                .local_position(Vec3::new(-10.0, 2.0, 0.0));
+            let wheel = world.spawn(wheel).unwrap();
+            let anchor = GridPosition::from_local(Vec3::new(-10.0, 2.0, 0.0)).unwrap();
+            let hinge = world
+                .joint_at(JointDesc::hinge(floor, wheel), anchor, Quat::IDENTITY)
+                .unwrap();
+            let hinge = world.add_joint(hinge).unwrap();
+            let motor = JointMotor::Velocity {
+                speed: 2.0,
+                max_force: 500.0,
+            };
+            world
+                .set_joint_motor(hinge, JointDof::AngularX, Some(motor))
+                .unwrap();
+            let parts = [
+                CompoundChild::new(Shape::cuboid(Vec3::splat(0.3)), Vec3::ZERO),
+                CompoundChild::new(Shape::sphere(0.3), Vec3::new(0.6, 0.0, 0.0)),
+            ];
+            let compound = world.add_compound(&parts).unwrap();
+            let (at, turn) = compound.placed(Vec3::new(0.0, 3.0, 8.0), Quat::IDENTITY);
+            let body = RigidBodyDesc::dynamic(compound.shape).local_position(at);
+            world.spawn(body.rotation(turn)).unwrap();
+            let hull = world
+                .add_convex(&[
+                    Vec3::new(0.5, 0.0, 0.0),
+                    Vec3::new(-0.5, 0.0, 0.0),
+                    Vec3::new(0.0, 0.7, 0.0),
+                    Vec3::new(0.0, 0.0, 0.5),
+                    Vec3::new(0.0, 0.0, -0.5),
+                ])
+                .unwrap();
+            let (at, turn) = hull.placed(Vec3::new(3.0, 3.0, 8.0), Quat::IDENTITY);
+            let body = RigidBodyDesc::dynamic(hull.shape).local_position(at);
+            world.spawn(body.rotation(turn)).unwrap();
+            let mut heights = Vec::new();
+            for z in 0..9 {
+                for x in 0..9 {
+                    heights.push(((x + z) % 3) as f32 * 0.1);
+                }
+            }
+            let terrain = world.add_heightfield(9, 9, 1.0, 1.0, &heights).unwrap();
+            let body = RigidBodyDesc::fixed(terrain).local_position(Vec3::new(12.0, 0.01, 8.0));
+            world.spawn(body).unwrap();
+            let mover = RigidBodyDesc::kinematic(Shape::cuboid(Vec3::new(1.0, 0.1, 1.0)))
+                .local_position(Vec3::new(-4.0, 0.2, 8.0))
+                .linear_velocity(Vec3::new(0.3, 0.0, 0.0));
+            world.spawn(mover).unwrap();
+            world
+        }
+
+        /// The same outside changes from the same dice, whatever ran before.
+        fn script(world: &mut PhysicsWorld, dice: &mut Dice, thrown: &mut Vec<BodyHandle>) {
+            match dice.next() % 12 {
+                0 => {
+                    let shape = match dice.next() % 3 {
+                        0 => Shape::sphere(0.3),
+                        1 => Shape::cuboid(Vec3::splat(0.3)),
+                        _ => Shape::capsule(0.2, 0.3),
+                    };
+                    let at = dice.spot(12.0, 8.0);
+                    let body = RigidBodyDesc::dynamic(shape).local_position(at);
+                    thrown.push(world.spawn(body).unwrap());
+                }
+                1 if thrown.len() > 8 => {
+                    world.despawn(thrown.remove(0)).unwrap();
+                }
+                2 => {
+                    if let Some(body) = thrown.last() {
+                        let push = Vec3::new(dice.float(-200.0, 200.0), 300.0, 0.0);
+                        world.apply_impulse(*body, push).unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn run(pyramid: usize, steps: usize, dispatch: &dyn JobDispatch) -> Vec<u64> {
+            let mut world = scene(pyramid);
+            let mut dice = Dice(0x1234_5678_9abc_def1);
+            let mut thrown = Vec::new();
+            let mut hashes = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                script(&mut world, &mut dice, &mut thrown);
+                world.step_with(dispatch).unwrap();
+                hashes.push(world.state_hash());
+            }
+            hashes
+        }
+
+        #[test]
+        fn a_replay_gives_the_same_state_every_step_on_any_thread_count() {
+            let first = run(4, 240, &Sequential);
+            assert_eq!(run(4, 240, &Sequential), first);
+            assert_eq!(run(4, 240, &Workers(4)), first);
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn a_replay_of_a_big_colored_island_matches_on_threads() {
+            let first = run(40, 60, &Sequential);
+            assert_eq!(run(40, 60, &Workers(4)), first);
+        }
+
+        #[test]
+        fn a_snapshot_mid_run_continues_exactly() {
+            let mut world = scene(4);
+            let mut dice = Dice(0x0fed_cba9_8765_4321);
+            let mut thrown = Vec::new();
+            for _ in 0..200 {
+                script(&mut world, &mut dice, &mut thrown);
+                world.step_fixed().unwrap();
+            }
+            let bytes = world.save_snapshot();
+            let mut loaded = PhysicsWorld::load_snapshot(&bytes).unwrap();
+            assert_eq!(loaded.state_hash(), world.state_hash());
+            assert_eq!(loaded.save_snapshot(), bytes);
+            let mut other = Dice(dice.0);
+            let mut other_thrown = thrown.clone();
+            for step in 0..200 {
+                script(&mut world, &mut dice, &mut thrown);
+                script(&mut loaded, &mut other, &mut other_thrown);
+                world.step_fixed().unwrap();
+                loaded.step_fixed().unwrap();
+                assert_eq!(loaded.state_hash(), world.state_hash(), "step {step}");
+            }
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn huge_speeds_reach_the_solver_and_a_failed_step_is_recoverable() {
+            for speed in [1e4_f32, 1e8, 1e15, 1e30] {
+                let mut world = scene(4);
+                let mut dice = Dice(0x5555_aaaa_1234_9876);
+                let mut thrown = Vec::new();
+                for _ in 0..30 {
+                    script(&mut world, &mut dice, &mut thrown);
+                    world.step_fixed().unwrap();
+                }
+                for _ in 0..6 {
+                    let body = RigidBodyDesc::dynamic(Shape::sphere(0.3))
+                        .local_position(dice.spot(10.0, 6.0));
+                    let body = world.spawn(body).unwrap();
+                    let aim = Vec3::new(dice.float(-1.0, 1.0), -1.0, dice.float(-1.0, 1.0));
+                    world
+                        .set_velocity(body, aim * speed, Vec3::new(speed, 0.0, 0.0))
+                        .unwrap();
+                    thrown.push(body);
+                }
+                let mut failed = false;
+                for _ in 0..30 {
+                    let before = world.save_snapshot();
+                    if world.step_fixed().is_err() {
+                        failed = true;
+                        assert_eq!(world.save_snapshot(), before, "speed {speed}");
+                        break;
+                    }
+                }
+                // a failed step names no body, so the game removes what it threw
+                for body in thrown {
+                    if world.body_state(body).is_ok() {
+                        world.despawn(body).unwrap();
+                    }
+                }
+                // what it hit can have picked the speed up too, the world says which
+                let mut removed = 0;
+                for _ in 0..30 {
+                    while let Err(error) = world.step_fixed() {
+                        let body = world
+                            .failed_body()
+                            .unwrap_or_else(|| panic!("speed {speed}: {error} names no body"));
+                        world.despawn(body).unwrap();
+                        removed += 1;
+                        assert!(removed < 200, "speed {speed}");
+                    }
+                }
+                assert!(failed || removed == 0);
+                for body in world.body_handles().collect::<Vec<_>>() {
+                    let state = world.body_state(body).unwrap();
+                    assert!(
+                        state.linear_velocity.is_finite(),
+                        "speed {speed}: {state:?}"
+                    );
+                }
+            }
+        }
+
+        fn wild(dice: &mut Dice) -> f32 {
+            match dice.next() % 7 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => -1e30,
+                3 => 1e30,
+                4 => 0.0,
+                _ => dice.float(-1e4, 1e4),
+            }
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn churn_with_wild_input_never_panics_and_leaves_nothing() {
+            let mut world = scene(8);
+            let mut dice = Dice(0xdead_beef_cafe_f00d);
+            let mut live: Vec<BodyHandle> = Vec::new();
+            let mut gone: Vec<BodyHandle> = Vec::new();
+            let mut most_contacts = 0;
+            let filter = QueryFilter::default();
+            for _ in 0..1500 {
+                for _ in 0..3 {
+                    match dice.next() % 10 {
+                        0..=2 if live.len() < 300 => {
+                            let at = dice.spot(30.0, 20.0);
+                            let shape = match dice.next() % 3 {
+                                0 => Shape::sphere(dice.float(0.05, 0.8)),
+                                1 => Shape::cuboid(Vec3::splat(dice.float(0.05, 0.8))),
+                                _ => Shape::capsule(dice.float(0.05, 0.4), dice.float(0.0, 0.8)),
+                            };
+                            let body = RigidBodyDesc::dynamic(shape).local_position(at);
+                            live.push(world.spawn(body).unwrap());
+                        }
+                        3 if !live.is_empty() => {
+                            let at = dice.next() as usize % live.len();
+                            let body = live.swap_remove(at);
+                            world.despawn(body).unwrap();
+                            gone.push(body);
+                        }
+                        4 if !gone.is_empty() => {
+                            // a stale handle fails, it never reaches another body
+                            let body = gone[dice.next() as usize % gone.len()];
+                            assert!(world.apply_impulse(body, Vec3::X).is_err());
+                            assert!(world.body_state(body).is_err());
+                        }
+                        5 | 6 if !live.is_empty() => {
+                            // bad numbers are turned down, good ones go in. only a sane range is
+                            // applied by force, a real game clamps too
+                            let body = live[dice.next() as usize % live.len()];
+                            let value = Vec3::new(wild(&mut dice), wild(&mut dice), 0.0);
+                            let result = world.apply_impulse(body, value);
+                            assert_eq!(result.is_ok(), value.is_finite(), "{value:?}");
+                            if result.is_ok() {
+                                let calm = Vec3::new(0.0, 0.0, 0.0);
+                                world.set_velocity(body, calm, calm).unwrap();
+                            }
+                        }
+                        7 => {
+                            let ray = Ray {
+                                origin: GridPosition::from_local(dice.spot(30.0, 25.0)).unwrap(),
+                                direction: Vec3::new(wild(&mut dice), -1.0, 0.0),
+                                max_distance: 50.0,
+                            };
+                            // only that it answers, bad directions fail
+                            let _ = world.raycast(&ray, &filter);
+                        }
+                        _ => {}
+                    }
+                }
+                world.step_fixed().unwrap();
+                let mut contacts = Vec::new();
+                world.contacts(&mut contacts);
+                most_contacts = most_contacts.max(contacts.len());
+                assert!(contacts.iter().all(|contact| contact.load.is_finite()));
+            }
+            for body in world.body_handles().collect::<Vec<_>>() {
+                let state = world.body_state(body).unwrap();
+                assert!(state.position.local.is_finite(), "{state:?}");
+                assert!(state.linear_velocity.is_finite(), "{state:?}");
+                if state.kind == BodyKind::Dynamic {
+                    assert!(state.rotation.is_finite(), "{state:?}");
+                }
+            }
+            assert!(most_contacts > 0);
+            for body in world.body_handles().collect::<Vec<_>>() {
+                world.despawn(body).unwrap();
+            }
+            world.step_fixed().unwrap();
+            let mut contacts = Vec::new();
+            world.contacts(&mut contacts);
+            assert_eq!(world.body_count(), 0);
+            assert_eq!(world.joint_handles().count(), 0);
+            assert!(contacts.is_empty());
+            assert_eq!(world.island_stats().count, 0);
+            let empty_error: Result<(), PhysicsError> = world.step_fixed();
+            assert!(empty_error.is_ok());
+        }
+    }
 }
