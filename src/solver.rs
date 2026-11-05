@@ -1,7 +1,7 @@
 use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
-use crate::collision::{Bounds, MAX_CONTACTS, contacts, find_pairs};
+use crate::collision::{Bounds, MAX_CONTACTS, RawManifold, find_pairs};
 use crate::joint::{
     JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
@@ -31,6 +31,8 @@ pub(crate) struct CachedPoint {
 pub(crate) struct CachedManifold {
     pub(crate) a: BodyHandle,
     pub(crate) b: BodyHandle,
+    pub(crate) part_a: u32,
+    pub(crate) part_b: u32,
     pub(crate) points: [CachedPoint; MAX_CONTACTS],
     pub(crate) count: usize,
 }
@@ -56,6 +58,8 @@ struct SolverManifold {
     b: usize,
     handle_a: BodyHandle,
     handle_b: BodyHandle,
+    part_a: u32,
+    part_b: u32,
     axes: [Vec3; 3],
     friction: f32,
     points: [SolverPoint; MAX_CONTACTS],
@@ -103,7 +107,7 @@ impl std::fmt::Debug for SolverManifold {
 pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch) {
     scratch.bounds.clear();
     for dense in 0..bodies.len() {
-        scratch.bounds.push(Bounds::of(
+        scratch.bounds.push(bodies.assets.bounds(
             &bodies.shape[dense],
             bodies.position(dense),
             bodies.rotation[dense],
@@ -250,11 +254,13 @@ pub(crate) fn finish_contacts(
         cache.push(CachedManifold {
             a: manifold.handle_a,
             b: manifold.handle_b,
+            part_a: manifold.part_a,
+            part_b: manifold.part_b,
             points,
             count: manifold.count,
         });
     }
-    cache.sort_unstable_by_key(|entry| (entry.a, entry.b));
+    cache.sort_unstable_by_key(|entry| (entry.a, entry.b, entry.part_a, entry.part_b));
 }
 
 fn build_manifolds(
@@ -284,85 +290,118 @@ fn build_manifolds(
             std::mem::swap(&mut a, &mut b);
         }
         let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
-        let Some(raw) = contacts(
-            &bodies.shape[a],
-            bodies.rotation[a],
-            &bodies.shape[b],
-            bodies.rotation[b],
+        let manifolds = &mut scratch.manifolds;
+        bodies.assets.for_each_contact(
+            (&bodies.shape[a], bodies.rotation[a]),
+            (&bodies.shape[b], bodies.rotation[b]),
             center_b,
             CONTACT_MARGIN,
-        ) else {
-            continue;
-        };
-        let (handle_a, handle_b) = (bodies.handle_at(a), bodies.handle_at(b));
-        let old = cache
-            .binary_search_by_key(&(handle_a, handle_b), |entry| (entry.a, entry.b))
-            .ok()
-            .map(|at| &cache[at]);
+            |part_a, part_b, raw, at_a| {
+                manifolds.push(contact_manifold(
+                    bodies,
+                    state,
+                    cache,
+                    (a, b),
+                    (part_a, part_b),
+                    raw,
+                    at_a,
+                    center_b,
+                    dt,
+                ));
+            },
+        );
+    }
+    scratch.manifolds.sort_unstable_by_key(|manifold| {
+        (
+            manifold.handle_a,
+            manifold.handle_b,
+            manifold.part_a,
+            manifold.part_b,
+        )
+    });
+}
 
-        let normal = raw.normal;
-        let tangent = tangent_of(normal);
-        let axes = [normal, tangent, normal.cross(tangent)];
-        let (material_a, material_b) = (&bodies.material[a], &bodies.material[b]);
-        let restitution = material_a.restitution.max(material_b.restitution);
-        let mut manifold = SolverManifold {
-            a,
-            b,
-            handle_a,
-            handle_b,
-            axes,
-            friction: (material_a.friction * material_b.friction).sqrt(),
-            points: [SolverPoint::default(); MAX_CONTACTS],
-            count: raw.count,
-        };
-        let inverse_rotation_a = bodies.rotation[a].conjugate();
-        let inverse_rotation_b = bodies.rotation[b].conjugate();
-        let mut claimed = [false; MAX_CONTACTS];
-        for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
-            let offset_a = point.position;
-            let offset_b = point.position - center_b;
-            let local_a = inverse_rotation_a.rotate_vec3(offset_a);
-            let local_b = inverse_rotation_b.rotate_vec3(offset_b);
-            let mut mass = Vec3::ZERO;
-            for (index, axis) in axes.iter().enumerate() {
-                let inverse = effective_inverse_mass(bodies, a, b, offset_a, offset_b, *axis);
-                let value = if inverse > 1e-12 {
-                    inverse.recip()
-                } else {
-                    0.0
-                };
-                match index {
-                    0 => mass.x = value,
-                    1 => mass.y = value,
-                    _ => mass.z = value,
-                }
-            }
-            let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
-            let reaches = -approach * dt >= -point.depth;
-            let bounce = if reaches && approach < -RESTITUTION_THRESHOLD {
-                -restitution * approach
+#[allow(clippy::too_many_arguments)]
+fn contact_manifold(
+    bodies: &Bodies,
+    state: &[Integrated],
+    cache: &[CachedManifold],
+    (a, b): (usize, usize),
+    (part_a, part_b): (u32, u32),
+    raw: &RawManifold,
+    at_a: Vec3,
+    center_b: Vec3,
+    dt: f32,
+) -> SolverManifold {
+    let (handle_a, handle_b) = (bodies.handle_at(a), bodies.handle_at(b));
+    let old = cache
+        .binary_search_by_key(&(handle_a, handle_b, part_a, part_b), |entry| {
+            (entry.a, entry.b, entry.part_a, entry.part_b)
+        })
+        .ok()
+        .map(|at| &cache[at]);
+
+    let normal = raw.normal;
+    let tangent = tangent_of(normal);
+    let axes = [normal, tangent, normal.cross(tangent)];
+    let (material_a, material_b) = (&bodies.material[a], &bodies.material[b]);
+    let restitution = material_a.restitution.max(material_b.restitution);
+    let mut manifold = SolverManifold {
+        a,
+        b,
+        handle_a,
+        handle_b,
+        part_a,
+        part_b,
+        axes,
+        friction: (material_a.friction * material_b.friction).sqrt(),
+        points: [SolverPoint::default(); MAX_CONTACTS],
+        count: raw.count,
+    };
+    let inverse_rotation_a = bodies.rotation[a].conjugate();
+    let inverse_rotation_b = bodies.rotation[b].conjugate();
+    let mut claimed = [false; MAX_CONTACTS];
+    for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
+        let offset_a = point.position + at_a;
+        let offset_b = offset_a - center_b;
+        let local_a = inverse_rotation_a.rotate_vec3(offset_a);
+        let local_b = inverse_rotation_b.rotate_vec3(offset_b);
+        let mut mass = Vec3::ZERO;
+        for (index, axis) in axes.iter().enumerate() {
+            let inverse = effective_inverse_mass(bodies, a, b, offset_a, offset_b, *axis);
+            let value = if inverse > 1e-12 {
+                inverse.recip()
             } else {
                 0.0
             };
-            *out = SolverPoint {
-                offset_a,
-                offset_b,
-                mass,
-                target: 0.0,
-                bounce,
-                depth: point.depth,
-                recovery: 0.0,
-                recovery_impulse: 0.0,
-                impulse: matching_impulse(old, local_a, &mut claimed),
-                local_a,
-                local_b,
-            };
+            match index {
+                0 => mass.x = value,
+                1 => mass.y = value,
+                _ => mass.z = value,
+            }
         }
-        scratch.manifolds.push(manifold);
+        let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
+        let reaches = -approach * dt >= -point.depth;
+        let bounce = if reaches && approach < -RESTITUTION_THRESHOLD {
+            -restitution * approach
+        } else {
+            0.0
+        };
+        *out = SolverPoint {
+            offset_a,
+            offset_b,
+            mass,
+            target: 0.0,
+            bounce,
+            depth: point.depth,
+            recovery: 0.0,
+            recovery_impulse: 0.0,
+            impulse: matching_impulse(old, local_a, &mut claimed),
+            local_a,
+            local_b,
+        };
     }
-    scratch
-        .manifolds
-        .sort_unstable_by_key(|manifold| (manifold.handle_a, manifold.handle_b));
+    manifold
 }
 
 /// Each old point goes to one new point, two sharing it would double its load.

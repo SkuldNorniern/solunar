@@ -5,12 +5,13 @@ use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 
 use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
+use crate::compound::{Compound, MAX_COMPOUND_CHILDREN};
 use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
-    BodyHandle, BodyKind, CollisionFilter, FrameDesc, FrameId, Frames, GridPosition, JointAxis,
-    JointDesc, JointKind, JointLimit, JointMotor, Joints, Material, PhysicsSettings, PhysicsWorld,
-    RigidBodyDesc, Shape,
+    BodyHandle, BodyKind, CollisionFilter, CompoundChild, CompoundId, FrameDesc, FrameId, Frames,
+    GridPosition, JointAxis, JointDesc, JointKind, JointLimit, JointMotor, Joints, MassProperties,
+    Material, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
@@ -24,7 +25,9 @@ const BODY_BYTES: usize =
     4 + 1 + 1 + 4 * 3 + 4 * 3 + 4 * 2 + 4 + 4 * 3 + 4 * 3 + 4 * 4 + 4 * 3 * 5 + 1 + 4;
 const FLAG_ASLEEP: u8 = 1;
 const FLAG_CAN_SLEEP: u8 = 2;
-const MANIFOLD_BYTES: usize = 4 * 4 + 1;
+const MANIFOLD_BYTES: usize = 4 * 4 + 4 * 2 + 1;
+const COMPOUND_BYTES: usize = 4 + 4 * 3 + 4;
+const CHILD_BYTES: usize = 13 + 4 * 3 + 4 * 4 + 4;
 const JOINT_SLOT_BYTES: usize = 4 + 1;
 const FREE_SLOT: u32 = u32::MAX;
 
@@ -105,6 +108,19 @@ impl PhysicsWorld {
             out.dvec3(frame.angular_velocity);
         }
 
+        out.len(self.bodies.assets.compounds.len());
+        for compound in &self.bodies.assets.compounds {
+            out.f32(compound.unit.mass);
+            out.vec3(compound.unit.inertia);
+            out.len(compound.children.len());
+            for child in &compound.children {
+                out.shape(&child.shape);
+                out.vec3(child.position);
+                out.quat(child.rotation);
+                out.f32(child.density_scale);
+            }
+        }
+
         out.len(self.bodies.slots.len());
         for slot in &self.bodies.slots {
             out.u32(slot.generation);
@@ -158,6 +174,8 @@ impl PhysicsWorld {
             out.u32(manifold.a.generation);
             out.u32(manifold.b.index);
             out.u32(manifold.b.generation);
+            out.u32(manifold.part_a);
+            out.u32(manifold.part_b);
             out.u8(manifold.count as u8);
             for point in &manifold.points[..manifold.count] {
                 out.vec3(point.local_a);
@@ -293,6 +311,11 @@ fn read_bodies(
     limits: &SnapshotLimits,
 ) -> Result<Bodies, SnapshotError> {
     let mut bodies = Bodies::default();
+    let compound_count = reader.count(COMPOUND_BYTES, limits.max_slots)?;
+    bodies.assets.compounds.reserve(compound_count);
+    for _ in 0..compound_count {
+        bodies.assets.compounds.push(read_compound(reader)?);
+    }
     let slot_count = reader.count(SLOT_BYTES, limits.max_slots)?;
     bodies.slots.reserve(slot_count);
     for _ in 0..slot_count {
@@ -417,8 +440,8 @@ fn read_body(
         angular_velocity: angular,
         can_sleep,
     };
-    validate_desc(&desc).map_err(|_| SnapshotError::Invalid("body"))?;
-    let (inverse_mass, inverse_inertia) = inverse_mass_properties(kind, &desc);
+    validate_desc(&desc, &bodies.assets).map_err(|_| SnapshotError::Invalid("body"))?;
+    let (inverse_mass, inverse_inertia) = inverse_mass_properties(kind, &desc, &bodies.assets);
 
     bodies.owner.push(owner);
     bodies.cell.push(cell);
@@ -442,6 +465,24 @@ fn read_body(
     Ok(())
 }
 
+fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
+    let unit = MassProperties {
+        mass: reader.f32()?,
+        inertia: reader.vec3()?,
+    };
+    let count = reader.count(CHILD_BYTES, MAX_COMPOUND_CHILDREN)?;
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        children.push(CompoundChild {
+            shape: reader.shape()?,
+            position: reader.vec3()?,
+            rotation: reader.quat()?,
+            density_scale: reader.f32()?,
+        });
+    }
+    Compound::from_rebased(children, unit).map_err(|_| SnapshotError::Invalid("compound"))
+}
+
 fn read_contacts(
     reader: &mut Reader<'_>,
     limits: &SnapshotLimits,
@@ -457,12 +498,17 @@ fn read_contacts(
             index: reader.u32()?,
             generation: reader.u32()?,
         };
+        let (part_a, part_b) = (reader.u32()?, reader.u32()?);
         let points_count = reader.u8()? as usize;
         if points_count == 0 || points_count > MAX_CONTACTS {
             return Err(SnapshotError::Invalid("contact count"));
         }
         // the solver finds entries by binary search
-        if cache.last().is_some_and(|last| (last.a, last.b) >= (a, b)) {
+        let key = (a, b, part_a, part_b);
+        if cache
+            .last()
+            .is_some_and(|last| (last.a, last.b, last.part_a, last.part_b) >= key)
+        {
             return Err(SnapshotError::Invalid("contact order"));
         }
         let mut points = [CachedPoint::default(); MAX_CONTACTS];
@@ -477,6 +523,8 @@ fn read_contacts(
         cache.push(CachedManifold {
             a,
             b,
+            part_a,
+            part_b,
             points,
             count: points_count,
         });
@@ -742,6 +790,7 @@ impl Writer {
                 radius,
                 half_height,
             } => (2, [radius, half_height, 0.0]),
+            Shape::Compound(id) => (3, [f32::from_bits(id.0), 0.0, 0.0]),
         };
         self.u8(tag);
         for value in values {
@@ -821,8 +870,17 @@ impl Reader<'_> {
         })
     }
 
+    fn quat(&mut self) -> Result<Quat, SnapshotError> {
+        Ok(Quat::new(
+            self.f32()?,
+            self.f32()?,
+            self.f32()?,
+            self.f32()?,
+        ))
+    }
+
     fn unit_quat(&mut self) -> Result<Quat, SnapshotError> {
-        let value = Quat::new(self.f32()?, self.f32()?, self.f32()?, self.f32()?);
+        let value = self.quat()?;
         let error = (value.length_squared() - 1.0).abs();
         if error.is_nan() || error >= 1e-3 {
             return Err(SnapshotError::Invalid("joint frame"));
@@ -864,6 +922,7 @@ impl Reader<'_> {
             0 => Ok(Shape::sphere(values[0])),
             1 => Ok(Shape::cuboid(Vec3::new(values[0], values[1], values[2]))),
             2 => Ok(Shape::capsule(values[0], values[1])),
+            3 => Ok(Shape::Compound(CompoundId(values[0].to_bits()))),
             _ => Err(SnapshotError::Invalid("shape kind")),
         }
     }

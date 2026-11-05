@@ -50,6 +50,8 @@ impl Hull {
                 },
                 0.0,
             ),
+            // callers go part by part, a compound never gets here
+            Shape::Compound(_) => (Self::Point(center), 0.0),
         }
     }
 

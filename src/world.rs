@@ -177,7 +177,7 @@ impl PhysicsWorld {
     /// # Errors
     /// Fails on a bad desc or an unknown frame.
     pub fn spawn(&mut self, desc: RigidBodyDesc) -> Result<BodyHandle, PhysicsError> {
-        validate_desc(&desc)?;
+        validate_desc(&desc, &self.bodies.assets)?;
         if !self.frames.contains(desc.frame) {
             return Err(PhysicsError::InvalidFrame);
         }

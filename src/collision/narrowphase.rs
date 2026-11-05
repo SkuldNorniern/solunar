@@ -47,6 +47,7 @@ impl RawManifold {
 }
 
 /// `center_b` is the center of B relative to the center of A. Reports real overlap only.
+#[cfg(test)]
 pub(crate) fn collide(
     shape_a: &Shape,
     rotation_a: Quat,
@@ -105,7 +106,7 @@ fn rounded_segment(shape: &Shape, rotation: Quat) -> Option<(Vec3, f32)> {
             radius,
             half_height,
         } => Some((rotation.rotate_vec3(Vec3::Y * half_height), radius)),
-        Shape::Cuboid { .. } => None,
+        Shape::Cuboid { .. } | Shape::Compound(_) => None,
     }
 }
 

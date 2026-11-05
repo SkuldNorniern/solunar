@@ -1,5 +1,6 @@
 use algebrix::{IVec3, Quat, Vec3};
 
+use crate::compound::ShapeAssets;
 use crate::{
     CollisionFilter, FrameId, GridPosition, MassProperties, Material, PhysicsError, Shape,
 };
@@ -159,6 +160,7 @@ pub(crate) struct Bodies {
     pub(crate) asleep: Vec<bool>,
     pub(crate) can_sleep: Vec<bool>,
     pub(crate) still_time: Vec<f32>,
+    pub(crate) assets: ShapeAssets,
 }
 
 impl Bodies {
@@ -219,7 +221,8 @@ impl Bodies {
         slot.dense = dense;
         let generation = slot.generation;
 
-        let (inverse_mass, inverse_inertia) = inverse_mass_properties(desc.kind, desc);
+        let (inverse_mass, inverse_inertia) =
+            inverse_mass_properties(desc.kind, desc, &self.assets);
         let rotation = desc.rotation.normalize();
         self.owner.push(index);
         self.cell.push(desc.position.cell);
@@ -283,11 +286,16 @@ impl Bodies {
     }
 }
 
-pub(crate) fn inverse_mass_properties(kind: BodyKind, desc: &RigidBodyDesc) -> (f32, Vec3) {
+pub(crate) fn inverse_mass_properties(
+    kind: BodyKind,
+    desc: &RigidBodyDesc,
+    assets: &ShapeAssets,
+) -> (f32, Vec3) {
     if kind != BodyKind::Dynamic {
         return (0.0, Vec3::ZERO);
     }
-    let MassProperties { mass, inertia } = desc.shape.mass_properties(desc.material.density);
+    let MassProperties { mass, inertia } =
+        assets.mass_properties(&desc.shape, desc.material.density);
     (mass.recip(), inertia.recip())
 }
 
@@ -316,11 +324,14 @@ pub(crate) fn momentum_from_velocity(
 
 /// # Errors
 /// Fails on bad shape, material, or non finite state.
-pub(crate) fn validate_desc(desc: &RigidBodyDesc) -> Result<(), PhysicsError> {
-    desc.shape.validate()?;
+pub(crate) fn validate_desc(
+    desc: &RigidBodyDesc,
+    assets: &ShapeAssets,
+) -> Result<(), PhysicsError> {
+    assets.validate(&desc.shape)?;
     desc.material.validate()?;
     if desc.kind == BodyKind::Dynamic {
-        let (inverse_mass, inverse_inertia) = inverse_mass_properties(desc.kind, desc);
+        let (inverse_mass, inverse_inertia) = inverse_mass_properties(desc.kind, desc, assets);
         if !inverse_mass.is_finite()
             || inverse_mass <= 0.0
             || !inverse_inertia.is_finite()
@@ -339,7 +350,7 @@ pub(crate) fn validate_desc(desc: &RigidBodyDesc) -> Result<(), PhysicsError> {
     if !length_squared.is_finite() || length_squared < 1e-12 {
         return Err(PhysicsError::NonFinite("rotation"));
     }
-    let (_, inverse_inertia) = inverse_mass_properties(desc.kind, desc);
+    let (_, inverse_inertia) = inverse_mass_properties(desc.kind, desc, assets);
     let momentum = momentum_from_velocity(
         desc.kind,
         desc.rotation.normalize(),
@@ -404,23 +415,24 @@ mod tests {
     fn bad_desc_fails() {
         let mut bad = desc();
         bad.linear_velocity = Vec3::new(f32::NAN, 0.0, 0.0);
-        assert!(validate_desc(&bad).is_err());
+        assert!(validate_desc(&bad, &ShapeAssets::default()).is_err());
         let mut zero = desc();
         zero.rotation = Quat::new(0.0, 0.0, 0.0, 0.0);
-        assert!(validate_desc(&zero).is_err());
+        assert!(validate_desc(&zero, &ShapeAssets::default()).is_err());
         let tiny = desc().density(f32::from_bits(1));
-        assert!(validate_desc(&tiny).is_err());
-        assert_eq!(validate_desc(&desc()), Ok(()));
+        assert!(validate_desc(&tiny, &ShapeAssets::default()).is_err());
+        assert_eq!(validate_desc(&desc(), &ShapeAssets::default()), Ok(()));
     }
 
     #[test]
     fn only_dynamic_has_mass() {
         let fixed = RigidBodyDesc::fixed(Shape::sphere(1.0));
         assert_eq!(
-            inverse_mass_properties(fixed.kind, &fixed),
+            inverse_mass_properties(fixed.kind, &fixed, &ShapeAssets::default()),
             (0.0, Vec3::ZERO)
         );
-        let (inverse_mass, _) = inverse_mass_properties(BodyKind::Dynamic, &desc());
+        let (inverse_mass, _) =
+            inverse_mass_properties(BodyKind::Dynamic, &desc(), &ShapeAssets::default());
         assert!(inverse_mass > 0.0);
     }
 }

@@ -1,7 +1,6 @@
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use super::gjk::{Hull, distance};
-use super::narrowphase::collide;
 use crate::{BodyHandle, FrameId, GridPosition, PhysicsError, PhysicsWorld, Shape};
 
 const MAX_CAST_ITERATIONS: usize = 64;
@@ -81,25 +80,30 @@ impl PhysicsWorld {
             }
             let offset = ray.origin.offset_from(self.bodies.position(dense));
             let limit = best.map_or(max, |found| found.0);
-            let reach = f64::from(self.bodies.shape[dense].bounding_radius());
+            let assets = &self.bodies.assets;
+            let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if !sphere_near_path(offset, direction, limit, reach) {
                 continue;
             }
-            let rotation = DQuat::from_quat(self.bodies.rotation[dense]);
-            let inverse = rotation.conjugate();
-            let Some((time, normal)) = ray_shape(
-                &self.bodies.shape[dense],
-                inverse.mul_vec3(offset),
-                inverse.mul_vec3(direction),
-                limit,
-            ) else {
-                continue;
-            };
-            let normal = rotation.mul_vec3(normal);
             let handle = self.bodies.handle_at(dense);
-            if best.is_none_or(|found| (time, handle) < (found.0, found.1)) {
-                best = Some((time, handle, normal));
-            }
+            let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
+            assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+                let limit = best.map_or(max, |found| found.0);
+                let rotation = DQuat::from_quat(turn);
+                let inverse = rotation.conjugate();
+                let Some((time, normal)) = ray_shape(
+                    part,
+                    inverse.mul_vec3(offset - DVec3::from_vec3(at)),
+                    inverse.mul_vec3(direction),
+                    limit,
+                ) else {
+                    return;
+                };
+                let normal = rotation.mul_vec3(normal);
+                if best.is_none_or(|found| (time, handle) < (found.0, found.1)) {
+                    best = Some((time, handle, normal));
+                }
+            });
         }
         best.map(|(time, body, normal)| {
             let point = shifted(ray.origin, direction * time)?;
@@ -122,7 +126,7 @@ impl PhysicsWorld {
         cast: &ShapeCast,
         filter: &QueryFilter,
     ) -> Result<Option<CastHit>, PhysicsError> {
-        cast.shape.validate()?;
+        check_query_shape(&cast.shape)?;
         let rotation = checked_rotation(cast.rotation)?;
         let direction = self.check_cast(cast.origin, cast.direction, cast.max_distance, filter)?;
         let (moving, radius) = Hull::of(&cast.shape, rotation, DVec3::ZERO);
@@ -135,22 +139,24 @@ impl PhysicsWorld {
             }
             let center = self.bodies.position(dense).offset_from(cast.origin);
             let limit = best.map_or(max, |found| found.0);
-            let reach = own_reach + f64::from(self.bodies.shape[dense].bounding_radius());
+            let assets = &self.bodies.assets;
+            let reach = own_reach + f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if !sphere_near_path(-center, direction, limit, reach) {
                 continue;
             }
-            let (target, target_radius) = Hull::of(
-                &self.bodies.shape[dense],
-                self.bodies.rotation[dense],
-                center,
-            );
-            let Some(hit) = sweep(&moving, radius, &target, target_radius, direction, limit) else {
-                continue;
-            };
             let handle = self.bodies.handle_at(dense);
-            if best.is_none_or(|found| (hit.0, handle) < (found.0, found.1)) {
-                best = Some((hit.0, handle, hit.1, hit.2));
-            }
+            let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
+            assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+                let limit = best.map_or(max, |found| found.0);
+                let (target, target_radius) = Hull::of(part, turn, center + DVec3::from_vec3(at));
+                let Some(hit) = sweep(&moving, radius, &target, target_radius, direction, limit)
+                else {
+                    return;
+                };
+                if best.is_none_or(|found| (hit.0, handle) < (found.0, found.1)) {
+                    best = Some((hit.0, handle, hit.1, hit.2));
+                }
+            });
         }
         best.map(|(time, body, normal, point)| {
             Ok(CastHit {
@@ -176,7 +182,7 @@ impl PhysicsWorld {
         out: &mut Vec<BodyHandle>,
     ) -> Result<(), PhysicsError> {
         out.clear();
-        shape.validate()?;
+        check_query_shape(shape)?;
         let rotation = checked_rotation(rotation)?;
         let position = checked_position(position)?;
         self.check_frame(filter)?;
@@ -186,18 +192,17 @@ impl PhysicsWorld {
                 continue;
             }
             let center = self.bodies.position(dense).offset_from(position);
-            let reach = own_reach + f64::from(self.bodies.shape[dense].bounding_radius());
+            let assets = &self.bodies.assets;
+            let reach = own_reach + f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if center.length_squared() > reach * reach {
                 continue;
             }
-            let touching = collide(
-                shape,
-                rotation,
-                &self.bodies.shape[dense],
-                self.bodies.rotation[dense],
+            let touching = assets.any_contact(
+                (shape, rotation),
+                (&self.bodies.shape[dense], self.bodies.rotation[dense]),
                 center.as_vec3(),
-            )
-            .is_some();
+                0.0,
+            );
             if touching {
                 out.push(self.bodies.handle_at(dense));
             }
@@ -226,21 +231,26 @@ impl PhysicsWorld {
             }
             let offset = position.offset_from(self.bodies.position(dense));
             let limit = best.map_or(f64::from(max_distance), |found| found.0);
-            let reach = f64::from(self.bodies.shape[dense].bounding_radius());
+            let assets = &self.bodies.assets;
+            let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if offset.length() - reach > limit {
                 continue;
             }
-            let rotation = DQuat::from_quat(self.bodies.rotation[dense]);
-            let local = rotation.conjugate().mul_vec3(offset);
-            let (gap, normal) = surface_distance(&self.bodies.shape[dense], local);
-            if gap > limit {
-                continue;
-            }
-            let normal = rotation.mul_vec3(normal);
             let handle = self.bodies.handle_at(dense);
-            if best.is_none_or(|found| (gap, handle) < (found.0, found.1)) {
-                best = Some((gap, handle, normal));
-            }
+            let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
+            assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+                let limit = best.map_or(f64::from(max_distance), |found| found.0);
+                let rotation = DQuat::from_quat(turn);
+                let local = rotation.conjugate().mul_vec3(offset - DVec3::from_vec3(at));
+                let (gap, normal) = surface_distance(part, local);
+                if gap > limit {
+                    return;
+                }
+                let normal = rotation.mul_vec3(normal);
+                if best.is_none_or(|found| (gap, handle) < (found.0, found.1)) {
+                    best = Some((gap, handle, normal));
+                }
+            });
         }
         best.map(|(gap, body, normal)| {
             Ok(PointHit {
@@ -286,6 +296,13 @@ impl PhysicsWorld {
         }
         Ok(wide.normalize())
     }
+}
+
+fn check_query_shape(shape: &Shape) -> Result<(), PhysicsError> {
+    if matches!(shape, Shape::Compound(_)) {
+        return Err(PhysicsError::InvalidShape);
+    }
+    shape.validate()
 }
 
 fn check_max_distance(max_distance: f32) -> Result<(), PhysicsError> {
@@ -336,6 +353,7 @@ fn ray_shape(shape: &Shape, origin: DVec3, direction: DVec3, max: f64) -> Option
             max,
         ),
         Shape::Cuboid { half_extents } => ray_box(origin, direction, half_extents, max),
+        Shape::Compound(_) => None,
     }
 }
 
@@ -474,6 +492,7 @@ fn surface_distance(shape: &Shape, point: DVec3) -> (f64, DVec3) {
             half_height,
         } => rounded_distance(point, f64::from(half_height), f64::from(radius)),
         Shape::Cuboid { half_extents } => box_distance(point, half_extents),
+        Shape::Compound(_) => (f64::INFINITY, DVec3::Y),
     }
 }
 

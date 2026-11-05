@@ -1,7 +1,6 @@
 use algebrix::Vec3;
 
 use crate::body::Bodies;
-use crate::collision::contacts;
 use crate::joint::Joints;
 use crate::solver::CONTACT_MARGIN;
 use crate::solver::CachedManifold;
@@ -116,18 +115,15 @@ pub(crate) fn plan_wakes(
             && bodies.frame[sleeper] == bodies.frame[other]
             && bodies.filter[sleeper].allows(bodies.filter[other])
             && !joints.excludes(bodies.handle_at(sleeper), bodies.handle_at(other))
-            && contacts(
-                &bodies.shape[sleeper],
-                bodies.rotation[sleeper],
-                &bodies.shape[other],
-                bodies.rotation[other],
+            && bodies.assets.any_contact(
+                (&bodies.shape[sleeper], bodies.rotation[sleeper]),
+                (&bodies.shape[other], bodies.rotation[other]),
                 bodies
                     .position(other)
                     .offset_from(bodies.position(sleeper))
                     .as_vec3(),
                 CONTACT_MARGIN,
             )
-            .is_some()
         {
             scratch.flagged[sleeper] = true;
         }
@@ -149,9 +145,8 @@ pub(crate) fn plan_wakes(
 
 fn is_cached(cache: &[CachedManifold], a: BodyHandle, b: BodyHandle) -> bool {
     let key = (a.min(b), a.max(b));
-    cache
-        .binary_search_by_key(&key, |entry| (entry.a, entry.b))
-        .is_ok()
+    let at = cache.partition_point(|entry| (entry.a, entry.b) < key);
+    cache.get(at).is_some_and(|entry| (entry.a, entry.b) == key)
 }
 
 /// Runs on committed state. An island sleeps when every body stayed slow long enough.
