@@ -5,14 +5,16 @@ use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 
 use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
+use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
-    BodyHandle, BodyKind, CollisionFilter, FrameDesc, FrameId, Frames, GridPosition, Material,
-    PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape,
+    BodyHandle, BodyKind, CollisionFilter, FrameDesc, FrameId, Frames, GridPosition, JointAxis,
+    JointDesc, JointKind, JointLimit, JointMotor, Joints, Material, PhysicsSettings, PhysicsWorld,
+    RigidBodyDesc, Shape,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 const HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
@@ -23,6 +25,7 @@ const BODY_BYTES: usize =
 const FLAG_ASLEEP: u8 = 1;
 const FLAG_CAN_SLEEP: u8 = 2;
 const MANIFOLD_BYTES: usize = 4 * 4 + 1;
+const JOINT_SLOT_BYTES: usize = 4 + 1;
 const FREE_SLOT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +164,21 @@ impl PhysicsWorld {
             }
         }
 
+        out.len(self.joints.slots.len());
+        for slot in &self.joints.slots {
+            out.u32(slot.generation);
+            let Some(state) = &slot.state else {
+                out.u8(0);
+                continue;
+            };
+            out.u8(1);
+            out.joint(state);
+        }
+        out.len(self.joints.free.len());
+        for index in &self.joints.free {
+            out.u32(*index);
+        }
+
         let checksum = fnv1a(&out.data);
         out.u64(checksum);
         out.data
@@ -233,11 +251,13 @@ impl PhysicsWorld {
         let frames = read_frames(&mut reader, limits)?;
         let bodies = read_bodies(&mut reader, &frames, limits)?;
         let contact_cache = read_contacts(&mut reader, limits)?;
+        let joints = read_joints(&mut reader, &bodies, limits)?;
         if reader.at != reader.data.len() {
             return Err(SnapshotError::Invalid("trailing data"));
         }
         let mut world = Self::from_parts(settings, frames, bodies, tick, accumulator);
         world.contact_cache = contact_cache;
+        world.joints = joints;
         world.recheck_sleepers = recheck_sleepers;
         Ok(world)
     }
@@ -462,6 +482,113 @@ fn read_contacts(
     Ok(cache)
 }
 
+fn read_joints(
+    reader: &mut Reader<'_>,
+    bodies: &Bodies,
+    limits: &SnapshotLimits,
+) -> Result<Joints, SnapshotError> {
+    let mut joints = Joints::default();
+    let slot_count = reader.count(JOINT_SLOT_BYTES, limits.max_slots)?;
+    joints.slots.reserve(slot_count);
+    for _ in 0..slot_count {
+        let generation = reader.u32()?;
+        let state = match reader.u8()? {
+            0 => None,
+            1 => Some(read_joint(reader, bodies)?),
+            _ => return Err(SnapshotError::Invalid("joint slot")),
+        };
+        joints.slots.push(JointSlot { generation, state });
+    }
+    let free_count = reader.count(4, slot_count)?;
+    let mut in_free_list = vec![false; slot_count];
+    joints.free.reserve(free_count);
+    for _ in 0..free_count {
+        let index = reader.u32()?;
+        let seen = in_free_list
+            .get_mut(index as usize)
+            .ok_or(SnapshotError::Invalid("joint free list"))?;
+        let slot = &joints.slots[index as usize];
+        if *seen || slot.state.is_some() || slot.generation == u32::MAX {
+            return Err(SnapshotError::Invalid("joint free list"));
+        }
+        *seen = true;
+        joints.free.push(index);
+    }
+    for (slot, in_list) in joints.slots.iter().zip(&in_free_list) {
+        if slot.state.is_none() && slot.generation != u32::MAX && !in_list {
+            return Err(SnapshotError::Invalid("joint free list"));
+        }
+    }
+    joints.mark_loaded();
+    Ok(joints)
+}
+
+fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, SnapshotError> {
+    let a = reader.handle()?;
+    let b = reader.handle()?;
+    let anchor_a = reader.vec3()?;
+    let anchor_b = reader.vec3()?;
+    let frame_a = reader.unit_quat()?;
+    let frame_b = reader.unit_quat()?;
+    let collide_connected = match reader.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(SnapshotError::Invalid("joint flag")),
+    };
+    let kind = match reader.u8()? {
+        0 => {
+            let mut axes = [JointAxis::FREE; 6];
+            for axis in &mut axes {
+                *axis = reader.joint_axis()?;
+            }
+            JointKind::Axes(axes)
+        }
+        1 => JointKind::Distance {
+            min: reader.f32()?,
+            max: reader.f32()?,
+        },
+        _ => return Err(SnapshotError::Invalid("joint kind")),
+    };
+    let desc = JointDesc {
+        a,
+        b,
+        anchor_a,
+        anchor_b,
+        frame_a,
+        frame_b,
+        kind,
+        collide_connected,
+    };
+    desc.validate()
+        .map_err(|_| SnapshotError::Invalid("joint"))?;
+    let (Ok(dense_a), Ok(dense_b)) = (bodies.dense_index(a), bodies.dense_index(b)) else {
+        return Err(SnapshotError::Invalid("joint body"));
+    };
+    if bodies.frame[dense_a] != bodies.frame[dense_b]
+        || (bodies.kind[dense_a] != BodyKind::Dynamic && bodies.kind[dense_b] != BodyKind::Dynamic)
+    {
+        return Err(SnapshotError::Invalid("joint body"));
+    }
+    let mut impulses = [0.0; JOINT_IMPULSES];
+    for impulse in &mut impulses {
+        *impulse = reader.f32()?;
+        if !impulse.is_finite() {
+            return Err(SnapshotError::Invalid("joint impulse"));
+        }
+    }
+    let force = reader.vec3()?;
+    let torque = reader.vec3()?;
+    if !force.is_finite() || !torque.is_finite() {
+        return Err(SnapshotError::Invalid("joint reaction"));
+    }
+    Ok(JointState {
+        desc,
+        impulses,
+        force,
+        torque,
+    })
+}
+
 fn kind_tag(kind: BodyKind) -> u8 {
     match kind {
         BodyKind::Static => 0,
@@ -544,6 +671,67 @@ impl Writer {
         self.f64(value.z);
     }
 
+    fn quat(&mut self, value: Quat) {
+        for part in value.to_array() {
+            self.f32(part);
+        }
+    }
+
+    fn joint(&mut self, state: &JointState) {
+        let desc = &state.desc;
+        for handle in [desc.a, desc.b] {
+            self.u32(handle.index);
+            self.u32(handle.generation);
+        }
+        self.vec3(desc.anchor_a);
+        self.vec3(desc.anchor_b);
+        self.quat(desc.frame_a);
+        self.quat(desc.frame_b);
+        self.u8(u8::from(desc.collide_connected));
+        match desc.kind {
+            JointKind::Axes(axes) => {
+                self.u8(0);
+                for axis in &axes {
+                    self.joint_axis(axis);
+                }
+            }
+            JointKind::Distance { min, max } => {
+                self.u8(1);
+                self.f32(min);
+                self.f32(max);
+            }
+        }
+        for impulse in state.impulses {
+            self.f32(impulse);
+        }
+        self.vec3(state.force);
+        self.vec3(state.torque);
+    }
+
+    fn joint_axis(&mut self, axis: &JointAxis) {
+        let (tag, min, max) = match axis.limit {
+            JointLimit::Free => (0, 0.0, 0.0),
+            JointLimit::Locked => (1, 0.0, 0.0),
+            JointLimit::Range { min, max } => (2, min, max),
+        };
+        self.u8(tag);
+        self.f32(min);
+        self.f32(max);
+        let (tag, values) = match axis.motor {
+            None => (0, [0.0; 3]),
+            Some(JointMotor::Velocity { speed, max_force }) => (1, [speed, max_force, 0.0]),
+            Some(JointMotor::Position {
+                target,
+                max_speed,
+                max_force,
+            }) => (2, [target, max_speed, max_force]),
+        };
+        self.u8(tag);
+        for value in values {
+            self.f32(value);
+        }
+    }
+
     fn shape(&mut self, shape: &Shape) {
         let (tag, values) = match *shape {
             Shape::Sphere { radius } => (0, [radius, 0.0, 0.0]),
@@ -624,6 +812,49 @@ impl Reader<'_> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
 
+    fn handle(&mut self) -> Result<BodyHandle, SnapshotError> {
+        Ok(BodyHandle {
+            index: self.u32()?,
+            generation: self.u32()?,
+        })
+    }
+
+    fn unit_quat(&mut self) -> Result<Quat, SnapshotError> {
+        let value = Quat::new(self.f32()?, self.f32()?, self.f32()?, self.f32()?);
+        let error = (value.length_squared() - 1.0).abs();
+        if error.is_nan() || error >= 1e-3 {
+            return Err(SnapshotError::Invalid("joint frame"));
+        }
+        Ok(value)
+    }
+
+    fn joint_axis(&mut self) -> Result<JointAxis, SnapshotError> {
+        let tag = self.u8()?;
+        let (min, max) = (self.f32()?, self.f32()?);
+        let limit = match tag {
+            0 => JointLimit::Free,
+            1 => JointLimit::Locked,
+            2 => JointLimit::Range { min, max },
+            _ => return Err(SnapshotError::Invalid("joint limit")),
+        };
+        let tag = self.u8()?;
+        let values = [self.f32()?, self.f32()?, self.f32()?];
+        let motor = match tag {
+            0 => None,
+            1 => Some(JointMotor::Velocity {
+                speed: values[0],
+                max_force: values[1],
+            }),
+            2 => Some(JointMotor::Position {
+                target: values[0],
+                max_speed: values[1],
+                max_force: values[2],
+            }),
+            _ => return Err(SnapshotError::Invalid("joint motor")),
+        };
+        Ok(JointAxis { limit, motor })
+    }
+
     fn shape(&mut self) -> Result<Shape, SnapshotError> {
         let tag = self.u8()?;
         let values = [self.f32()?, self.f32()?, self.f32()?];
@@ -639,7 +870,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BodyHandle, PhysicsError};
+    use crate::{BodyHandle, JointDof, PhysicsError};
 
     fn sample() -> (PhysicsWorld, BodyHandle, BodyHandle) {
         let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
@@ -652,7 +883,7 @@ mod tests {
                 ..FrameDesc::new(FrameId::ROOT)
             })
             .unwrap();
-        world
+        let ground = world
             .spawn(RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(
                 10.0, 1.0, 10.0,
             ))))
@@ -676,6 +907,32 @@ mod tests {
                 RigidBodyDesc::kinematic(Shape::sphere(0.25))
                     .linear_velocity(Vec3::new(1.0, 0.0, 0.0)),
             )
+            .unwrap();
+        let swinging = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.5))
+                    .local_position(Vec3::new(40.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        let old_joint = world
+            .add_joint(JointDesc::distance(ground, swinging, 1.0, 50.0))
+            .unwrap();
+        world.remove_joint(old_joint).unwrap();
+        world
+            .add_joint(
+                JointDesc::hinge(ground, swinging)
+                    .anchors(Vec3::new(30.0, 0.0, 0.0), Vec3::new(-10.0, 0.0, 0.0))
+                    .axis(
+                        JointDof::AngularX,
+                        JointAxis::range(-1.0, 1.0).motor(JointMotor::Velocity {
+                            speed: 0.5,
+                            max_force: 10.0,
+                        }),
+                    ),
+            )
+            .unwrap();
+        world
+            .add_joint(JointDesc::distance(ground, swinging, 1.0, 50.0))
             .unwrap();
         world.despawn(removed).unwrap();
         world
@@ -773,7 +1030,7 @@ mod tests {
         );
     }
 
-    const GOLDEN_HASH: u64 = 8567880626527914801;
+    const GOLDEN_HASH: u64 = 7308935220004825430;
 
     #[test]
     fn every_truncation_fails() {

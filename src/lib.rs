@@ -4,6 +4,7 @@ mod command;
 mod dispatch;
 mod error;
 mod frame;
+mod joint;
 mod material;
 mod position;
 mod profile;
@@ -20,6 +21,10 @@ pub use command::{ApplyReport, Command, CommandBuffer};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
+pub use joint::{
+    JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,
+    Joints,
+};
 pub use material::Material;
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::StepReport;

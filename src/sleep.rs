@@ -2,6 +2,7 @@ use algebrix::Vec3;
 
 use crate::body::Bodies;
 use crate::collision::contacts;
+use crate::joint::Joints;
 use crate::solver::CONTACT_MARGIN;
 use crate::solver::CachedManifold;
 use crate::{BodyHandle, BodyKind};
@@ -60,6 +61,7 @@ fn is_moving(bodies: &Bodies, awake: &[bool], dense: usize) -> bool {
 pub(crate) fn plan_wakes(
     bodies: &Bodies,
     cache: &[CachedManifold],
+    joints: &Joints,
     pairs: &[(u32, u32)],
     recheck: bool,
     scratch: &mut SleepScratch,
@@ -89,6 +91,16 @@ pub(crate) fn plan_wakes(
         }
     }
 
+    for (a, b, _) in joints.links(bodies) {
+        if bodies.asleep[a] && bodies.asleep[b] {
+            scratch.union(a, b);
+        } else if bodies.asleep[a] && is_moving(bodies, &scratch.awake, b) {
+            scratch.flagged[a] = true;
+        } else if bodies.asleep[b] && is_moving(bodies, &scratch.awake, a) {
+            scratch.flagged[b] = true;
+        }
+    }
+
     for &(first, second) in pairs {
         let (first, second) = (first as usize, second as usize);
         let (sleeper, other) = match (bodies.asleep[first], bodies.asleep[second]) {
@@ -103,6 +115,7 @@ pub(crate) fn plan_wakes(
         if wakes
             && bodies.frame[sleeper] == bodies.frame[other]
             && bodies.filter[sleeper].allows(bodies.filter[other])
+            && !joints.excludes(bodies.handle_at(sleeper), bodies.handle_at(other))
             && contacts(
                 &bodies.shape[sleeper],
                 bodies.rotation[sleeper],
@@ -143,8 +156,10 @@ fn is_cached(cache: &[CachedManifold], a: BodyHandle, b: BodyHandle) -> bool {
 
 /// Runs on committed state. An island sleeps when every body stayed slow long enough.
 /// It needs support from a still static or kinematic body, a free drift keeps its momentum.
+/// A joint counts as a link and as support, a running motor keeps its island awake.
 pub(crate) fn update_sleep(
     bodies: &mut Bodies,
+    joints: &Joints,
     touching: impl Iterator<Item = (usize, usize)> + Clone,
     scratch: &mut SleepScratch,
     dt: f32,
@@ -156,12 +171,28 @@ pub(crate) fn update_sleep(
             scratch.union(a, b);
         }
     }
+    for (a, b, _) in joints.links(bodies) {
+        if bodies.kind[a] == BodyKind::Dynamic && bodies.kind[b] == BodyKind::Dynamic {
+            scratch.union(a, b);
+        }
+    }
     // `flagged` marks islands that must stay awake from here on
     scratch.flagged.clear();
     scratch.flagged.resize(count, false);
     scratch.supported.clear();
     scratch.supported.resize(count, false);
-    for (a, b) in touching {
+    let links: Vec<(usize, usize, bool)> = joints.links(bodies).collect();
+    let contacts = touching.map(|(a, b)| (a, b, false));
+    for (a, b, running) in contacts.chain(links) {
+        if running {
+            let body = if bodies.kind[a] == BodyKind::Dynamic {
+                a
+            } else {
+                b
+            };
+            let root = scratch.find(body);
+            scratch.flagged[root] = true;
+        }
         let (body, other) = match (bodies.kind[a], bodies.kind[b]) {
             (BodyKind::Dynamic, BodyKind::Dynamic) => continue,
             (BodyKind::Dynamic, _) => (a, b),

@@ -2,6 +2,10 @@ use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
 use crate::collision::{Bounds, MAX_CONTACTS, contacts, find_pairs};
+use crate::joint::{
+    JointPoint, JointRow, Joints, build_rows, solve_point, solve_point_recovery, solve_row,
+    solve_row_recovery, warm_start_point, warm_start_row,
+};
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind};
 
@@ -60,11 +64,17 @@ pub(crate) struct ContactScratch {
     order: Vec<u32>,
     pairs: Vec<(u32, u32)>,
     manifolds: Vec<SolverManifold>,
+    joint_points: Vec<JointPoint>,
+    joint_rows: Vec<JointRow>,
 }
 
 impl ContactScratch {
     pub(crate) fn pairs(&self) -> &[(u32, u32)] {
         &self.pairs
+    }
+
+    pub(crate) fn joint_parts(&self) -> (&[JointPoint], &[JointRow]) {
+        (&self.joint_points, &self.joint_rows)
     }
 
     /// Dense pairs that made contact in the last solve.
@@ -103,18 +113,39 @@ pub(crate) fn find_broad_pairs(bodies: &Bodies, scratch: &mut ContactScratch) {
 pub(crate) fn solve_contacts(
     bodies: &Bodies,
     awake: &[bool],
+    joints: &Joints,
     state: &mut [Integrated],
     cache: &mut Vec<CachedManifold>,
     scratch: &mut ContactScratch,
     dt: f32,
 ) {
-    build_manifolds(bodies, awake, state, cache, scratch, dt);
+    build_manifolds(bodies, awake, joints, state, cache, scratch, dt);
+    build_rows(
+        joints,
+        bodies,
+        awake,
+        &mut scratch.joint_points,
+        &mut scratch.joint_rows,
+        dt,
+    );
+    for point in &scratch.joint_points {
+        warm_start_point(bodies, state, point);
+    }
+    for row in &scratch.joint_rows {
+        warm_start_row(state, row);
+    }
     for manifold in &scratch.manifolds {
         warm_start(bodies, state, manifold);
     }
     // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
     for iteration in 0..VELOCITY_ITERATIONS {
         if iteration % 2 == 0 {
+            for point in &mut scratch.joint_points {
+                solve_point(bodies, state, point);
+            }
+            for row in &mut scratch.joint_rows {
+                solve_row(state, row);
+            }
             for manifold in &mut scratch.manifolds {
                 solve_manifold(bodies, state, manifold);
             }
@@ -122,9 +153,21 @@ pub(crate) fn solve_contacts(
             for manifold in scratch.manifolds.iter_mut().rev() {
                 solve_manifold(bodies, state, manifold);
             }
+            for row in scratch.joint_rows.iter_mut().rev() {
+                solve_row(state, row);
+            }
+            for point in scratch.joint_points.iter_mut().rev() {
+                solve_point(bodies, state, point);
+            }
         }
     }
     for _ in 0..RECOVERY_ITERATIONS {
+        for point in &mut scratch.joint_points {
+            solve_point_recovery(bodies, state, point);
+        }
+        for row in &mut scratch.joint_rows {
+            solve_row_recovery(state, row);
+        }
         for manifold in &mut scratch.manifolds {
             solve_recovery(bodies, state, manifold);
         }
@@ -157,6 +200,7 @@ pub(crate) fn solve_contacts(
 fn build_manifolds(
     bodies: &Bodies,
     awake: &[bool],
+    joints: &Joints,
     state: &[Integrated],
     cache: &[CachedManifold],
     scratch: &mut ContactScratch,
@@ -169,7 +213,10 @@ fn build_manifolds(
         if !active(a) && !active(b) {
             continue;
         }
-        if bodies.frame[a] != bodies.frame[b] || !bodies.filter[a].allows(bodies.filter[b]) {
+        if bodies.frame[a] != bodies.frame[b]
+            || !bodies.filter[a].allows(bodies.filter[b])
+            || joints.excludes(bodies.handle_at(a), bodies.handle_at(b))
+        {
             continue;
         }
         // the lower handle is always A, dense order can change but the cache must still match

@@ -13,6 +13,8 @@ pub enum PhysicsError {
     NotDynamic,
     OutOfRange,
     DispatchIncomplete,
+    InvalidJoint,
+    BodyHasJoints,
 }
 
 impl fmt::Display for PhysicsError {
@@ -28,6 +30,8 @@ impl fmt::Display for PhysicsError {
             Self::NotDynamic => f.write_str("body is not dynamic"),
             Self::OutOfRange => f.write_str("position out of range"),
             Self::DispatchIncomplete => f.write_str("dispatcher did not run every job"),
+            Self::InvalidJoint => f.write_str("invalid joint"),
+            Self::BodyHasJoints => f.write_str("body has joints"),
         }
     }
 }

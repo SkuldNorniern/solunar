@@ -1,6 +1,8 @@
 use algebrix::Vec3;
 
-use crate::{BodyHandle, FrameId, PhysicsError, RigidBodyDesc};
+use crate::{
+    BodyHandle, FrameId, JointDesc, JointDof, JointHandle, JointMotor, PhysicsError, RigidBodyDesc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
@@ -13,6 +15,9 @@ pub enum Command {
     SetVelocity(BodyHandle, Vec3, Vec3),
     TransferToFrame(BodyHandle, FrameId),
     Wake(BodyHandle),
+    CreateJoint(JointDesc),
+    DestroyJoint(JointHandle),
+    SetJointMotor(JointHandle, JointDof, Option<JointMotor>),
 }
 
 /// Commands recorded between steps, applied in order at a safe boundary.
@@ -43,5 +48,6 @@ impl CommandBuffer {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ApplyReport {
     pub created: Vec<BodyHandle>,
+    pub created_joints: Vec<JointHandle>,
     pub rejected: Vec<(usize, PhysicsError)>,
 }

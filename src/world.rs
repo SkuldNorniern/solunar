@@ -4,13 +4,14 @@ use std::time::Instant;
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
+use crate::joint::JointKind;
 use crate::profile::StepTimes;
 use crate::sleep::{SleepScratch, plan_wakes, update_sleep};
 use crate::solver::{CachedManifold, ContactScratch, find_broad_pairs, solve_contacts};
 use crate::{
     ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
-    FrameState, Frames, GridPosition, JobDispatch, PhysicsError, RigidBodyDesc, Sequential,
-    StepReport,
+    FrameState, Frames, GridPosition, JobDispatch, JointDesc, JointDof, JointHandle, JointMotor,
+    JointReaction, Joints, PhysicsError, RigidBodyDesc, Sequential, StepReport,
 };
 
 const MIN_BODIES_PER_JOB: usize = 256;
@@ -85,6 +86,7 @@ pub struct PhysicsWorld {
     pub(crate) settings: PhysicsSettings,
     pub(crate) frames: Frames,
     pub(crate) bodies: Bodies,
+    pub(crate) joints: Joints,
     pub(crate) tick: u64,
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
@@ -122,6 +124,7 @@ impl PhysicsWorld {
             settings,
             frames,
             bodies,
+            joints: Joints::default(),
             tick,
             accumulator,
             contact_cache: Vec::new(),
@@ -178,7 +181,117 @@ impl PhysicsWorld {
     pub fn despawn(&mut self, body: BodyHandle) -> Result<(), PhysicsError> {
         self.bodies.remove(body)?;
         self.wake_contacts_of(body);
+        let attached: Vec<JointHandle> = self.joints.touching(body).collect();
+        for joint in attached {
+            self.remove_joint(joint)?;
+        }
         Ok(())
+    }
+
+    pub fn joints(&self) -> &Joints {
+        &self.joints
+    }
+
+    /// Bodies must exist, share a frame, and at least one must be dynamic.
+    ///
+    /// # Errors
+    /// Fails on a stale body or a bad setup.
+    pub fn add_joint(&mut self, desc: JointDesc) -> Result<JointHandle, PhysicsError> {
+        desc.validate()?;
+        let a = self.bodies.dense_index(desc.a)?;
+        let b = self.bodies.dense_index(desc.b)?;
+        if self.bodies.frame[a] != self.bodies.frame[b]
+            || (self.bodies.kind[a] != BodyKind::Dynamic
+                && self.bodies.kind[b] != BodyKind::Dynamic)
+        {
+            return Err(PhysicsError::InvalidJoint);
+        }
+        let joint = self.joints.insert(desc)?;
+        self.bodies.wake(a);
+        self.bodies.wake(b);
+        Ok(joint)
+    }
+
+    /// Wakes both bodies, the joint may have been holding them.
+    ///
+    /// # Errors
+    /// Fails on a stale handle.
+    pub fn remove_joint(&mut self, joint: JointHandle) -> Result<(), PhysicsError> {
+        let removed = self.joints.remove(joint)?;
+        for body in [removed.desc.a, removed.desc.b] {
+            if let Ok(dense) = self.bodies.dense_index(body) {
+                self.bodies.wake(dense);
+            }
+        }
+        Ok(())
+    }
+
+    /// Force and torque of the last step on body B.
+    ///
+    /// # Errors
+    /// Fails on a stale handle.
+    pub fn joint_reaction(&self, joint: JointHandle) -> Result<JointReaction, PhysicsError> {
+        let state = self.joints.get(joint)?;
+        Ok(JointReaction {
+            force: state.force,
+            torque: state.torque,
+        })
+    }
+
+    /// Sets or clears one axis motor, and wakes both bodies.
+    ///
+    /// # Errors
+    /// Fails on a stale handle, a distance joint or a bad motor.
+    pub fn set_joint_motor(
+        &mut self,
+        joint: JointHandle,
+        dof: JointDof,
+        motor: Option<JointMotor>,
+    ) -> Result<(), PhysicsError> {
+        let state = self.joints.get(joint)?;
+        if !matches!(state.desc.kind, JointKind::Axes(_)) {
+            return Err(PhysicsError::InvalidJoint);
+        }
+        let mut desc = state.desc;
+        if let JointKind::Axes(axes) = &mut desc.kind {
+            axes[dof.index()].motor = motor;
+        }
+        desc.validate()?;
+        let state = self.joints.get_mut(joint)?;
+        state.desc = desc;
+        state.impulses[dof.index() + crate::joint::MOTOR_SLOT] = 0.0;
+        for body in [desc.a, desc.b] {
+            let dense = self.bodies.dense_index(body)?;
+            self.bodies.wake(dense);
+        }
+        Ok(())
+    }
+
+    /// Fills anchors and frames so the joint sits at `at`, turned by `rotation`, as things stand now.
+    ///
+    /// # Errors
+    /// Fails on a stale body.
+    pub fn joint_at(
+        &self,
+        desc: JointDesc,
+        at: GridPosition,
+        rotation: Quat,
+    ) -> Result<JointDesc, PhysicsError> {
+        let a = self.bodies.dense_index(desc.a)?;
+        let b = self.bodies.dense_index(desc.b)?;
+        let local = |dense: usize| {
+            let inverse = self.bodies.rotation[dense].conjugate();
+            let offset = at.offset_from(self.bodies.position(dense)).as_vec3();
+            (inverse.rotate_vec3(offset), inverse * rotation)
+        };
+        let ((anchor_a, frame_a), (anchor_b, frame_b)) = (local(a), local(b));
+        Ok(JointDesc {
+            anchor_a,
+            anchor_b,
+            frame_a,
+            frame_b,
+            ..desc
+        })
     }
 
     /// # Errors
@@ -320,13 +433,16 @@ impl PhysicsWorld {
     /// Moves a body to another frame, keeping its motion in the root frame.
     ///
     /// # Errors
-    /// Fails on a stale handle, an unknown frame, or a result out of range.
+    /// Fails on a stale handle, an unknown frame, a body with joints, or a result out of range.
     pub fn transfer_to_frame(
         &mut self,
         body: BodyHandle,
         frame: FrameId,
     ) -> Result<(), PhysicsError> {
         let dense = self.bodies.dense_index(body)?;
+        if self.joints.touching(body).next().is_some() {
+            return Err(PhysicsError::BodyHasJoints);
+        }
         let from = self.bodies.frame[dense];
         let position = GridPosition {
             cell: self.bodies.cell[dense],
@@ -388,6 +504,13 @@ impl PhysicsWorld {
                 }
                 Command::TransferToFrame(body, frame) => self.transfer_to_frame(body, frame),
                 Command::Wake(body) => self.wake(body),
+                Command::CreateJoint(desc) => self.add_joint(desc).map(|joint| {
+                    report.created_joints.push(joint);
+                }),
+                Command::DestroyJoint(joint) => self.remove_joint(joint),
+                Command::SetJointMotor(joint, dof, motor) => {
+                    self.set_joint_motor(joint, dof, motor)
+                }
             };
             if let Err(error) = result {
                 report.rejected.push((index, error));
@@ -433,10 +556,12 @@ impl PhysicsWorld {
     pub fn step_with(&mut self, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
         let started = Instant::now();
         self.prepare_frame_gravity()?;
+        self.joints.refresh_exclusions();
         find_broad_pairs(&self.bodies, &mut self.contact_scratch);
         plan_wakes(
             &self.bodies,
             &self.contact_cache,
+            &self.joints,
             self.contact_scratch.pairs(),
             self.recheck_sleepers,
             &mut self.sleep,
@@ -460,6 +585,7 @@ impl PhysicsWorld {
         solve_contacts(
             bodies,
             awake,
+            &self.joints,
             &mut self.scratch,
             &mut next_cache,
             &mut self.contact_scratch,
@@ -472,8 +598,11 @@ impl PhysicsWorld {
 
         self.commit()?;
         self.contact_cache = next_cache;
+        let (points, rows) = self.contact_scratch.joint_parts();
+        self.joints.store(points, rows, dt);
         update_sleep(
             &mut self.bodies,
+            &self.joints,
             self.contact_scratch.touching(),
             &mut self.sleep,
             dt,
