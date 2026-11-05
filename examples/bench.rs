@@ -1,10 +1,12 @@
-//! Fixed rigid body scenes, timed per step. `cargo run --release --example bench [pile ...]`.
+//! Fixed rigid body scenes, timed per step.
+//! `cargo run --release --example bench [--threads N] [pile ...]`.
 
 use std::time::{Duration, Instant};
 
 use solunar::{
-    BodyKind, CompoundChild, GridPosition, JointDesc, JointHandle, PhaseTimes, PhysicsError,
-    PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, Shape, ShapeCast, Vec3,
+    BodyKind, CompoundChild, GridPosition, JobDispatch, JointDesc, JointHandle, PhaseTimes,
+    PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, Sequential,
+    Shape, ShapeCast, Vec3,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -29,15 +31,53 @@ const SUITES: [(&str, Suite); 8] = [
     ("bullets", bullets),
 ];
 
+/// A rayon pool as the host's job runner, standing in for a game engine's.
+struct Pool(rayon::ThreadPool);
+
+impl JobDispatch for Pool {
+    fn parallelism(&self) -> usize {
+        self.0.current_num_threads()
+    }
+
+    fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+        self.0.scope(|scope| {
+            for index in 0..jobs {
+                scope.spawn(move |_| job(index));
+            }
+        });
+    }
+}
+
+thread_local! {
+    static DISPATCH: std::cell::RefCell<Option<Pool>> = const { std::cell::RefCell::new(None) };
+}
+
 thread_local! {
     static PHASES: std::cell::RefCell<(PhaseTimes, u32)> =
         std::cell::RefCell::new((PhaseTimes::default(), 0));
 }
 
 fn main() {
-    let wanted: Vec<String> = std::env::args().skip(1).collect();
+    let mut wanted: Vec<String> = std::env::args().skip(1).collect();
+    let mut threads = 1;
+    if let Some(at) = wanted.iter().position(|arg| arg == "--threads") {
+        threads = wanted
+            .get(at + 1)
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(1);
+        wanted.drain(at..(at + 2).min(wanted.len()));
+    }
+    if threads > 1 {
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => DISPATCH.with(|dispatch| *dispatch.borrow_mut() = Some(Pool(pool))),
+            Err(error) => {
+                eprintln!("no thread pool: {error}");
+                return;
+            }
+        }
+    }
     println!(
-        "solunar {} {} {}, {} threads seen, sequential solver",
+        "solunar {} {} {}, {} threads seen, {threads} used",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -118,7 +158,10 @@ fn steps(world: &mut PhysicsWorld, count: usize) -> Result<Vec<Duration>> {
     let mut times = Vec::with_capacity(count);
     for _ in 0..count {
         let started = Instant::now();
-        world.step_fixed()?;
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.step_with(pool),
+            None => world.step_with(&Sequential),
+        })?;
         times.push(started.elapsed());
         let step = world.phase_times();
         PHASES.with(|phases| {
