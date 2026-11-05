@@ -14,6 +14,8 @@ const MAX_BRICKS: u64 = 1 << 20;
 /// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
 /// steps, so cutting the edit off never moves a surface.
 const EDIT_APRON: f32 = 2.0;
+/// Lattice steps at the bottom no edit can open, so nothing digs out through the floor.
+const FLOOR_STEPS: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SdfDesc {
@@ -188,7 +190,7 @@ impl SdfVolume {
                 distance = entry.edit.op.apply(distance, entry.edit.shape.distance(at));
             }
         }
-        distance
+        distance.min(at.y - FLOOR_STEPS * step)
     }
 
     fn cells(&self) -> i32 {
@@ -310,6 +312,16 @@ impl SdfVolume {
                             .op
                             .apply(values[slot], entry.edit.shape.distance(p));
                     }
+                }
+            }
+        }
+        let floor = FLOOR_STEPS * step;
+        for z in 0..side {
+            for y in 0..side {
+                let gy = (low.y + y as i32) as f32 * step;
+                for x in 0..side {
+                    let slot = &mut values[x + side * (y + side * z)];
+                    *slot = slot.min(gy - floor);
                 }
             }
         }
@@ -722,6 +734,13 @@ mod tests {
         for (_, corner, _, mesh) in terrain.volume().surface_bricks() {
             bricks += 1;
             for triangle in &mesh.triangles {
+                // the floor is a sheet open at the volume's edge, the blob is what must close
+                if triangle
+                    .iter()
+                    .all(|i| (mesh.vertices[*i as usize] + corner).y < 1.5)
+                {
+                    continue;
+                }
                 let p = triangle.map(|i| key(mesh.vertices[i as usize] + corner));
                 for (a, b) in [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])] {
                     let sign = if a < b { 1 } else { -1 };
@@ -809,6 +828,36 @@ mod tests {
             terrain.remove_tunnel(&mut world, dug.edit).map(|_| ()),
             Err(PhysicsError::InvalidHandle)
         );
+    }
+
+    #[test]
+    fn nothing_digs_through_the_floor() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let shaft = Edit {
+            shape: EditShape::Capsule {
+                a: Vec3::new(12.0, -5.0, 12.0),
+                b: Vec3::new(12.0, 20.0, 12.0),
+                radius: 2.0,
+            },
+            op: EditOp::Excavate,
+        };
+        terrain.edit(&mut world, shaft).unwrap();
+        let volume = terrain.volume();
+        assert!(volume.distance(Vec3::new(12.0, 0.5, 12.0)) < 0.0);
+        assert!(volume.distance(Vec3::new(12.0, 3.0, 12.0)) > 0.0);
+        assert_matches_reference(volume);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.4))
+                    .position(GridPosition::from_local(Vec3::new(12.0, 6.0, 12.0)).unwrap()),
+            )
+            .unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        let y = world.body_state(ball).unwrap().position.to_dvec3().y;
+        assert!((y - 1.4).abs() < 0.1, "{y}");
     }
 
     #[test]
