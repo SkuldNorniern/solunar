@@ -1,4 +1,5 @@
 mod body;
+mod character;
 mod collision;
 mod command;
 mod compound;
@@ -18,6 +19,7 @@ mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
 pub use body::{BodyHandle, BodyKind, BodyState, RigidBodyDesc};
+pub use character::{Character, CharacterDesc, Ground, MoveReport};
 pub use collision::{CastHit, CollisionFilter, PointHit, QueryFilter, Ray, ShapeCast};
 pub use command::{ApplyReport, Command, CommandBuffer};
 pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo, MeshId};

@@ -336,6 +336,46 @@ impl PhysicsWorld {
         .transpose()
     }
 
+    /// The overlap to push out of first: unit normal toward `shape` and depth. `None` when free.
+    pub(crate) fn deepest_overlap(
+        &self,
+        shape: &Shape,
+        position: GridPosition,
+        filter: &QueryFilter,
+    ) -> Result<Option<(Vec3, f32)>, PhysicsError> {
+        check_query_shape(shape)?;
+        let position = checked_position(position)?;
+        self.check_frame(filter)?;
+        let own_reach = f64::from(shape.bounding_radius());
+        let mut deepest: Option<(Vec3, f32)> = None;
+        for dense in 0..self.bodies.len() {
+            if !self.visible(dense, filter) {
+                continue;
+            }
+            let assets = &self.bodies.assets;
+            let center = position.offset_from(self.bodies.position(dense));
+            let reach = own_reach + f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
+            if center.length_squared() > reach * reach {
+                continue;
+            }
+            assets.for_each_contact(
+                (&self.bodies.shape[dense], self.bodies.rotation[dense]),
+                (shape, Quat::IDENTITY),
+                center.as_vec3(),
+                0.0,
+                None,
+                |_, _, raw, _| {
+                    for point in &raw.points[..raw.count] {
+                        if point.depth > 0.0 && deepest.is_none_or(|found| point.depth > found.1) {
+                            deepest = Some((raw.normal, point.depth));
+                        }
+                    }
+                },
+            );
+        }
+        Ok(deepest)
+    }
+
     fn visible(&self, dense: usize, filter: &QueryFilter) -> bool {
         self.bodies.frame[dense] == filter.frame
             && self.bodies.filter[dense].layers & filter.mask != 0
