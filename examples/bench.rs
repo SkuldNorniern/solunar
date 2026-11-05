@@ -16,7 +16,9 @@ struct Outcome {
     check: String,
 }
 
-const SUITES: [(&str, fn() -> Result<Outcome>); 8] = [
+type Suite = fn() -> Result<Outcome>;
+
+const SUITES: [(&str, Suite); 8] = [
     ("rb-01", rb01),
     ("rb-02", rb02),
     ("rb-03", rb03),
