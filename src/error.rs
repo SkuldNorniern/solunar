@@ -16,6 +16,7 @@ pub enum PhysicsError {
     DispatchIncomplete,
     InvalidJoint,
     BodyHasJoints,
+    ShapeInUse,
 }
 
 impl fmt::Display for PhysicsError {
@@ -34,6 +35,7 @@ impl fmt::Display for PhysicsError {
             Self::DispatchIncomplete => f.write_str("dispatcher did not run every job"),
             Self::InvalidJoint => f.write_str("invalid joint"),
             Self::BodyHasJoints => f.write_str("body has joints"),
+            Self::ShapeInUse => f.write_str("a body still uses the shape"),
         }
     }
 }

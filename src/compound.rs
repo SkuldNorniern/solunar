@@ -12,8 +12,18 @@ const JACOBI_SWEEPS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CompoundId(pub(crate) u32);
 
+/// A freed mesh's id never names a later mesh in the same slot, the generation differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MeshId(pub(crate) u32);
+pub struct MeshId {
+    pub(crate) index: u32,
+    pub(crate) generation: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MeshSlot {
+    pub(crate) generation: u32,
+    pub(crate) mesh: Option<TriMesh>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConvexId(pub(crate) u32);
@@ -127,7 +137,8 @@ fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ShapeAssets {
     pub(crate) compounds: Vec<Compound>,
-    pub(crate) meshes: Vec<TriMesh>,
+    pub(crate) meshes: Vec<MeshSlot>,
+    pub(crate) free_meshes: Vec<u32>,
     pub(crate) convexes: Vec<ConvexHull>,
 }
 
@@ -138,7 +149,12 @@ impl ShapeAssets {
 
     pub(crate) fn mesh(&self, shape: &Shape) -> Option<&TriMesh> {
         match *shape {
-            Shape::TriMesh(id) => self.meshes.get(id.0 as usize),
+            Shape::TriMesh(id) => self
+                .meshes
+                .get(id.index as usize)
+                .filter(|slot| slot.generation == id.generation)?
+                .mesh
+                .as_ref(),
             _ => None,
         }
     }
@@ -623,10 +639,46 @@ fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), Physics
 
 impl PhysicsWorld {
     fn push_mesh(&mut self, mesh: TriMesh) -> Result<Shape, PhysicsError> {
-        let id =
-            u32::try_from(self.bodies.assets.meshes.len()).map_err(|_| PhysicsError::OutOfRange)?;
-        self.bodies.assets.meshes.push(mesh);
-        Ok(Shape::TriMesh(MeshId(id)))
+        let assets = &mut self.bodies.assets;
+        if let Some(index) = assets.free_meshes.pop() {
+            let slot = &mut assets.meshes[index as usize];
+            slot.mesh = Some(mesh);
+            return Ok(Shape::TriMesh(MeshId {
+                index,
+                generation: slot.generation,
+            }));
+        }
+        let index = u32::try_from(assets.meshes.len()).map_err(|_| PhysicsError::OutOfRange)?;
+        assets.meshes.push(MeshSlot {
+            generation: 0,
+            mesh: Some(mesh),
+        });
+        Ok(Shape::TriMesh(MeshId {
+            index,
+            generation: 0,
+        }))
+    }
+
+    /// Frees a mesh so its memory and slot can be used again.
+    ///
+    /// # Errors
+    /// Fails when `shape` is not a live mesh, or a body still uses it.
+    pub fn remove_mesh(&mut self, shape: Shape) -> Result<(), PhysicsError> {
+        let Shape::TriMesh(id) = shape else {
+            return Err(PhysicsError::InvalidShape);
+        };
+        if self.bodies.assets.mesh(&shape).is_none() {
+            return Err(PhysicsError::InvalidShape);
+        }
+        if self.bodies.shape.contains(&shape) {
+            return Err(PhysicsError::ShapeInUse);
+        }
+        let assets = &mut self.bodies.assets;
+        let slot = &mut assets.meshes[id.index as usize];
+        slot.mesh = None;
+        slot.generation = slot.generation.wrapping_add(1);
+        assets.free_meshes.push(id.index);
+        Ok(())
     }
 
     /// Heights go row by row, x across, z down, `columns` by `rows`. The first post sits at the
@@ -732,6 +784,47 @@ mod tests {
 
     fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
+    }
+
+    fn ramp(world: &mut PhysicsWorld) -> Shape {
+        let vertices = [Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0), Vec3::X];
+        world.add_mesh(&vertices, &[[0, 1, 2]]).unwrap()
+    }
+
+    #[test]
+    fn a_freed_mesh_slot_is_used_again_and_the_old_id_dies() {
+        let mut world = world();
+        let first = ramp(&mut world);
+        let body = world.spawn(RigidBodyDesc::fixed(first)).unwrap();
+        assert_eq!(world.remove_mesh(first), Err(PhysicsError::ShapeInUse));
+        world.despawn(body).unwrap();
+        world.remove_mesh(first).unwrap();
+        assert_eq!(world.remove_mesh(first), Err(PhysicsError::InvalidShape));
+        assert_eq!(
+            world.spawn(RigidBodyDesc::fixed(first)),
+            Err(PhysicsError::InvalidShape)
+        );
+        let second = ramp(&mut world);
+        assert_ne!(second, first);
+        assert!(world.remove_mesh(Shape::sphere(1.0)).is_err());
+        for _ in 0..1000 {
+            let mesh = ramp(&mut world);
+            world.remove_mesh(mesh).unwrap();
+        }
+        assert_eq!(world.bodies.assets.meshes.len(), 2);
+    }
+
+    #[test]
+    fn a_freed_mesh_slot_survives_a_snapshot() {
+        let mut world = world();
+        let gone = ramp(&mut world);
+        let kept = ramp(&mut world);
+        world.remove_mesh(gone).unwrap();
+        let mut back = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(back.save_snapshot(), world.save_snapshot());
+        assert!(back.spawn(RigidBodyDesc::fixed(kept)).is_ok());
+        assert!(back.spawn(RigidBodyDesc::fixed(gone)).is_err());
+        assert_ne!(ramp(&mut back), gone);
     }
 
     fn no_gravity() -> PhysicsWorld {

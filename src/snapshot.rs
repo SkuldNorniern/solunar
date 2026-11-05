@@ -7,7 +7,7 @@ use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
 use crate::collision::convex::{ConvexHull, MAX_CONVEX_POINTS};
 use crate::collision::trimesh::{MAX_TRIANGLES, TriMesh};
-use crate::compound::{Compound, MAX_COMPOUND_CHILDREN};
+use crate::compound::{Compound, MAX_COMPOUND_CHILDREN, MeshSlot};
 use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 const HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
@@ -134,8 +134,15 @@ impl PhysicsWorld {
         }
 
         out.len(self.bodies.assets.meshes.len());
-        for mesh in &self.bodies.assets.meshes {
-            out.mesh(mesh);
+        for slot in &self.bodies.assets.meshes {
+            out.u32(slot.generation);
+            match &slot.mesh {
+                Some(mesh) => {
+                    out.u8(1);
+                    out.mesh(mesh);
+                }
+                None => out.u8(0),
+            }
         }
 
         out.len(self.bodies.slots.len());
@@ -338,10 +345,19 @@ fn read_bodies(
     for _ in 0..convex_count {
         bodies.assets.convexes.push(read_convex(reader)?);
     }
-    let mesh_count = reader.count(1, limits.max_slots)?;
+    let mesh_count = reader.count(5, limits.max_slots)?;
     bodies.assets.meshes.reserve(mesh_count);
-    for _ in 0..mesh_count {
-        bodies.assets.meshes.push(read_mesh(reader, limits)?);
+    for index in 0..mesh_count {
+        let generation = reader.u32()?;
+        let mesh = match reader.u8()? {
+            0 => {
+                bodies.assets.free_meshes.push(index as u32);
+                None
+            }
+            1 => Some(read_mesh(reader, limits)?),
+            _ => return Err(SnapshotError::Invalid("mesh slot")),
+        };
+        bodies.assets.meshes.push(MeshSlot { generation, mesh });
     }
     let slot_count = reader.count(SLOT_BYTES, limits.max_slots)?;
     bodies.slots.reserve(slot_count);
@@ -887,7 +903,10 @@ impl Writer {
                 half_height,
             } => (2, [radius, half_height, 0.0]),
             Shape::Compound(id) => (3, [f32::from_bits(id.0), 0.0, 0.0]),
-            Shape::TriMesh(id) => (4, [f32::from_bits(id.0), 0.0, 0.0]),
+            Shape::TriMesh(id) => (
+                4,
+                [f32::from_bits(id.index), f32::from_bits(id.generation), 0.0],
+            ),
             Shape::Convex(id) => (5, [f32::from_bits(id.0), 0.0, 0.0]),
         };
         self.u8(tag);
@@ -1021,7 +1040,10 @@ impl Reader<'_> {
             1 => Ok(Shape::cuboid(Vec3::new(values[0], values[1], values[2]))),
             2 => Ok(Shape::capsule(values[0], values[1])),
             3 => Ok(Shape::Compound(CompoundId(values[0].to_bits()))),
-            4 => Ok(Shape::TriMesh(MeshId(values[0].to_bits()))),
+            4 => Ok(Shape::TriMesh(MeshId {
+                index: values[0].to_bits(),
+                generation: values[1].to_bits(),
+            })),
             5 => Ok(Shape::Convex(ConvexId(values[0].to_bits()))),
             _ => Err(SnapshotError::Invalid("shape kind")),
         }
