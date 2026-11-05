@@ -565,7 +565,10 @@ fn tunnel() -> Result<Outcome> {
             op: EditOp::Excavate,
         };
         let started = Instant::now();
-        terrain.edit(&mut world, edit)?;
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => terrain.edit_with(&mut world, edit, pool),
+            None => terrain.edit(&mut world, edit),
+        })?;
         edits.push(started.elapsed());
         step_times.extend(steps(&mut world, 1)?);
     }
