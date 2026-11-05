@@ -12,9 +12,9 @@ use crate::solver::{
     prepare_contacts, solve_substep,
 };
 use crate::{
-    ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, FrameDesc, FrameId,
-    FrameState, Frames, GridPosition, JobDispatch, JointDesc, JointDof, JointHandle, JointMotor,
-    JointReaction, Joints, PhysicsError, RigidBodyDesc, Sequential, StepReport,
+    ApplyReport, BodyHandle, BodyKind, BodyState, Command, CommandBuffer, ContactEvent, FrameDesc,
+    FrameId, FrameState, Frames, GridPosition, JobDispatch, JointDesc, JointDof, JointHandle,
+    JointMotor, JointReaction, Joints, PhysicsError, RigidBodyDesc, Sequential, StepReport,
 };
 
 /// Integrating a body is tens of nanoseconds, a dispatch several microseconds.
@@ -102,6 +102,7 @@ pub struct PhysicsWorld {
     pub(crate) tick: u64,
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
+    contact_events: Vec<ContactEvent>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
     pub(crate) contact_scratch: ContactScratch,
@@ -141,6 +142,7 @@ impl PhysicsWorld {
             tick,
             accumulator,
             contact_cache: Vec::new(),
+            contact_events: Vec::new(),
             recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
             sleep: SleepScratch::default(),
@@ -173,6 +175,12 @@ impl PhysicsWorld {
 
     pub fn phase_times(&self) -> PhaseTimes {
         self.phases
+    }
+
+    /// Pairs that started or stopped pushing on each other in the last step, lower handle
+    /// first, sorted. An `Ended` pair can name a body removed since.
+    pub fn contact_events(&self) -> &[ContactEvent] {
+        &self.contact_events
     }
 
     /// # Errors
@@ -722,6 +730,7 @@ impl PhysicsWorld {
         finish_contacts(bodies, awake, &mut next_cache, &self.contact_scratch);
 
         self.commit()?;
+        contact_changes(&self.contact_cache, &next_cache, &mut self.contact_events);
         self.contact_cache = next_cache;
         let (points, rows, impulses) = self.contact_scratch.joint_parts();
         self.joints.store(impulses, points, rows, part);
@@ -929,6 +938,48 @@ fn tumble(rotation: Quat, inverse_inertia: Vec3, momentum: Vec3, dt: f32) -> Qua
     next.normalize()
 }
 
+/// Body pairs with a loaded point, lower handle first, sorted, once each.
+fn touching(cache: &[CachedManifold], out: &mut Vec<(BodyHandle, BodyHandle)>) {
+    out.clear();
+    for entry in cache {
+        let loaded = entry.points[..entry.count]
+            .iter()
+            .any(|point| point.impulse.x > 0.0);
+        if loaded && out.last() != Some(&(entry.a, entry.b)) {
+            out.push((entry.a, entry.b));
+        }
+    }
+}
+
+fn contact_changes(old: &[CachedManifold], new: &[CachedManifold], out: &mut Vec<ContactEvent>) {
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    touching(old, &mut before);
+    touching(new, &mut after);
+    out.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < before.len() || j < after.len() {
+        match (before.get(i), after.get(j)) {
+            (Some(was), Some(now)) if was == now => {
+                i += 1;
+                j += 1;
+            }
+            (Some(was), Some(now)) if was < now => {
+                out.push(ContactEvent::Ended(was.0, was.1));
+                i += 1;
+            }
+            (Some(was), None) => {
+                out.push(ContactEvent::Ended(was.0, was.1));
+                i += 1;
+            }
+            (_, Some(now)) => {
+                out.push(ContactEvent::Began(now.0, now.1));
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+}
+
 fn finite(value: Vec3, what: &'static str) -> Result<(), PhysicsError> {
     if value.is_finite() {
         Ok(())
@@ -1099,6 +1150,35 @@ mod tests {
         let wanted = Quat::from_scaled_axis(axis * 3.0);
         assert!(state.rotation.angle_between(wanted) < 1e-4, "{state:?}");
         assert!((state.angular_velocity - axis * 3.0).length() < 1e-5);
+    }
+
+    #[test]
+    fn contact_events_begin_on_landing_end_on_leaving_and_survive_sleep() {
+        let mut world = world();
+        let ground = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(10.0, 1.0, 10.0)))
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+        let ball = world
+            .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.5)).local_position(Vec3::Y * 3.0))
+            .unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+            seen.extend_from_slice(world.contact_events());
+        }
+        let pair = (ground.min(ball), ground.max(ball));
+        assert_eq!(seen, [ContactEvent::Began(pair.0, pair.1)]);
+        assert!(world.body_state(ball).unwrap().asleep);
+        world.set_velocity(ball, Vec3::Y * 8.0, Vec3::ZERO).unwrap();
+        let mut after = Vec::new();
+        for _ in 0..10 {
+            world.step_fixed().unwrap();
+            after.extend_from_slice(world.contact_events());
+        }
+        assert_eq!(after, [ContactEvent::Ended(pair.0, pair.1)]);
     }
 
     #[test]

@@ -4,6 +4,13 @@ use crate::{
     BodyHandle, CompoundChild, GridPosition, JointHandle, PhysicsError, PhysicsWorld, Shape,
 };
 
+/// A pair of bodies starting or stopping to push on each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactEvent {
+    Began(BodyHandle, BodyHandle),
+    Ended(BodyHandle, BodyHandle),
+}
+
 /// A contact from the last step. `load` is the push along `normal` per second, in newtons.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContactView {
