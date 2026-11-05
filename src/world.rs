@@ -901,6 +901,10 @@ fn spin(rotation: Quat, angular: Vec3, dt: f32) -> Quat {
 
 /// Symmetric Lie-Poisson splitting (Dullweber, Reich, Leimkuhler 1997).
 fn tumble(rotation: Quat, inverse_inertia: Vec3, momentum: Vec3, dt: f32) -> Quat {
+    // equal axes have no gyroscopic term, it spins about a fixed axis
+    if inverse_inertia.x == inverse_inertia.y && inverse_inertia.y == inverse_inertia.z {
+        return spin(rotation, momentum * inverse_inertia.x, dt);
+    }
     let half = dt * 0.5;
     let mut next = rotation;
     let mut body = rotation.conjugate().rotate_vec3(momentum);
@@ -1072,6 +1076,22 @@ mod tests {
                 state.kind == BodyKind::Dynamic && !state.asleep
             })
             .count()
+    }
+
+    #[test]
+    fn a_free_ball_spins_about_a_fixed_axis_exactly() {
+        let mut world = no_gravity();
+        let axis = Vec3::new(1.0, 2.0, -0.5).normalize();
+        let ball = world
+            .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.5)).angular_velocity(axis * 3.0))
+            .unwrap();
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let state = world.body_state(ball).unwrap();
+        let wanted = Quat::from_scaled_axis(axis * 3.0);
+        assert!(state.rotation.angle_between(wanted) < 1e-4, "{state:?}");
+        assert!((state.angular_velocity - axis * 3.0).length() < 1e-5);
     }
 
     #[test]
