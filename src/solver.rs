@@ -242,6 +242,8 @@ pub(crate) struct Islands {
     point_ends: Vec<u32>,
     row_ends: Vec<u32>,
     spare_manifolds: Vec<SolverManifold>,
+    spare_contacts: Vec<SolverPoint>,
+    spare_frames: Vec<PointFrame>,
     spare_points: Vec<JointPoint>,
     spare_rows: Vec<JointRow>,
 }
@@ -499,6 +501,65 @@ fn find_islands(bodies: &Bodies, awake: &[bool], joints: &Joints, scratch: &mut 
         },
         &mut islands.manifold_ends,
     );
+    order_big_islands(bodies, scratch);
+}
+
+/// Islands that will surely be colored get their contacts in color order, and the points
+/// rewritten to match, so a pass reads them front to back. Joints are left out of these
+/// colors, the substep coloring adds them. Smaller islands keep their order and results.
+fn order_big_islands(bodies: &Bodies, scratch: &mut ContactScratch) {
+    let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
+    let islands = &mut scratch.islands;
+    let used = &mut scratch.colors.used;
+    used.clear();
+    used.resize(bodies.len(), 0);
+    let mut moved = false;
+    for island in 0..islands.count() {
+        let range = Islands::range(&islands.manifold_ends, island);
+        if range.len() < COLORED_ISLAND {
+            continue;
+        }
+        moved = true;
+        let manifolds = &mut scratch.manifolds[range];
+        let mut keys: Vec<(u32, u32)> = Vec::with_capacity(manifolds.len());
+        for (index, manifold) in manifolds.iter().enumerate() {
+            let mask = |dense: usize| if dynamic(dense) { used[dense] } else { 0 };
+            let color = (!(mask(manifold.a) | mask(manifold.b)))
+                .trailing_zeros()
+                .min(COLORS as u32);
+            if (color as usize) < COLORS {
+                for dense in [manifold.a, manifold.b] {
+                    if dynamic(dense) {
+                        used[dense] |= 1 << color;
+                    }
+                }
+            }
+            keys.push((color, index as u32));
+        }
+        keys.sort_unstable();
+        islands.spare_manifolds.clear();
+        islands.spare_manifolds.extend_from_slice(manifolds);
+        for (slot, (_, from)) in manifolds.iter_mut().zip(&keys) {
+            *slot = islands.spare_manifolds[*from as usize];
+        }
+    }
+    if !moved {
+        return;
+    }
+    let (points, frames) = (
+        &mut scratch.islands.spare_contacts,
+        &mut scratch.islands.spare_frames,
+    );
+    points.clear();
+    frames.clear();
+    for manifold in &mut scratch.manifolds {
+        let range = manifold.first..manifold.first + manifold.count;
+        manifold.first = points.len();
+        points.extend_from_slice(&scratch.points[range.clone()]);
+        frames.extend_from_slice(&scratch.frames[range]);
+    }
+    std::mem::swap(&mut scratch.points, points);
+    std::mem::swap(&mut scratch.frames, frames);
 }
 
 /// One substep of velocities. Joints rebuild from the moved bodies, contacts refresh their gaps.
