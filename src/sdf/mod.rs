@@ -15,6 +15,8 @@ use crate::{
 };
 
 const MAX_BRICKS: u64 = 1 << 20;
+/// A body counts as swallowed when its center is nearer the surface than this share of its radius.
+const EJECT_DEPTH: f32 = 0.25;
 /// Room left between an ejected body and the surface it lands on, meters.
 const EJECT_GAP: f32 = 0.02;
 /// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
@@ -691,7 +693,7 @@ impl SdfTerrain {
         Ok(report)
     }
 
-    /// Moves dynamic bodies whose center ended up inside new material straight up to the surface.
+    /// Moves dynamic bodies that new material swallowed straight up to the surface.
     /// Triangles only push from the front, so a body left under them would fall out of the world.
     fn eject(&self, world: &mut PhysicsWorld, entry: &EditEntry) -> Result<usize, PhysicsError> {
         let step = self.volume.desc.voxel;
@@ -711,9 +713,14 @@ impl SdfTerrain {
                 continue;
             }
             let at = state.position.offset_from(origin).as_vec3();
-            if at.max(low) == at && at.min(high) == at && self.volume.distance(at) < 0.0 {
-                let shape = world.body_shape(body)?;
-                buried.push((body, at, world.bodies.assets.bounding_radius(&shape)));
+            if at.max(low) != at || at.min(high) != at {
+                continue;
+            }
+            let shape = world.body_shape(body)?;
+            let radius = world.bodies.assets.bounding_radius(&shape);
+            // bodies at rest sit half a radius or more above the surface, so this leaves them be
+            if self.volume.distance(at) < radius * EJECT_DEPTH {
+                buried.push((body, at, radius));
             }
         }
         // lowest first, so a column of bodies lands in the order it stood
