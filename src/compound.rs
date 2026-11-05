@@ -638,7 +638,7 @@ fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), Physics
 }
 
 impl PhysicsWorld {
-    fn push_mesh(&mut self, mesh: TriMesh) -> Result<Shape, PhysicsError> {
+    pub(crate) fn push_mesh(&mut self, mesh: TriMesh) -> Result<Shape, PhysicsError> {
         let assets = &mut self.bodies.assets;
         if let Some(index) = assets.free_meshes.pop() {
             let slot = &mut assets.meshes[index as usize];

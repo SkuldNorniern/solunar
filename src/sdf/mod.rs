@@ -1,10 +1,12 @@
 mod field;
 mod nets;
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, PoisonError};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use algebrix::{DVec3, IVec3, Vec3};
+
+use crate::collision::trimesh::TriMesh;
 
 pub use field::{Base, Edit, EditOp, EditShape};
 pub use nets::BrickMesh;
@@ -22,6 +24,8 @@ const EJECT_GAP: f32 = 0.02;
 /// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
 /// Bodies a host puts on this bit look like ground to [`SdfTerrain::raycast`].
 pub const GROUND_LAYER: u32 = 1 << 31;
+/// Most edits one job takes, so a long queue still commits in steps.
+const MAX_BATCH: usize = 64;
 /// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
 /// steps, so cutting the edit off never moves a surface.
 const EDIT_APRON: f32 = 2.0;
@@ -84,13 +88,16 @@ struct Brick {
     edits: Vec<EditId>,
     /// Samples after the base and every edit, before the floor. Kept while the brick has edits,
     /// so the next edit runs alone on top.
-    values: Option<Vec<f32>>,
+    values: Option<Arc<Vec<f32>>>,
 }
 
 /// What an edit or removal changed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EditReport {
+    /// The last edit committed.
     pub edit: EditId,
+    /// How many edits this commit holds, more than one when they waited in a queue.
+    pub edits: usize,
     pub revision: u64,
     pub bricks: usize,
     /// Material volume after minus before, cubic meters.
@@ -102,11 +109,93 @@ pub struct EditReport {
 }
 
 /// A brick built again but not yet in the volume.
+#[derive(Debug)]
 struct Rebuilt {
     key: BrickKey,
     inside: u64,
     mesh: BrickMesh,
-    values: Option<Vec<f32>>,
+    values: Option<Arc<Vec<f32>>>,
+    collider: Option<TriMesh>,
+    added: Vec<EditId>,
+    closed: Option<EditId>,
+}
+
+/// One brick's work: start from its kept samples and run `edits`, or from scratch with `edits`
+/// being every edit that reaches it.
+#[derive(Debug)]
+struct JobBrick {
+    key: BrickKey,
+    kept: Option<Arc<Vec<f32>>>,
+    edits: Vec<EditEntry>,
+    added: Vec<EditId>,
+    closed: Option<EditId>,
+}
+
+/// Building a batch of bricks, cut off from the terrain and the world, so it can run on any
+/// thread while the world steps. Comes from [`SdfTerrain::next_job`].
+#[derive(Debug)]
+pub struct BrickJob {
+    lattice: SdfVolume,
+    bricks: Vec<JobBrick>,
+    token: u64,
+}
+
+impl BrickJob {
+    pub fn brick_count(&self) -> usize {
+        self.bricks.len()
+    }
+
+    /// Samples, meshes and readies colliders for every brick. The result does not depend on
+    /// `dispatch`.
+    ///
+    /// # Errors
+    /// Fails on triangles a collider will not take, or a dispatcher that skips jobs. Then call
+    /// [`SdfTerrain::abandon`].
+    pub fn run(self, dispatch: &dyn JobDispatch) -> Result<BuiltBricks, PhysicsError> {
+        let lattice = &self.lattice;
+        let built = in_parallel(dispatch, &self.bricks, |brick| {
+            let mut item = match &brick.kept {
+                Some(kept) => {
+                    let mut values = Vec::clone(kept);
+                    for entry in &brick.edits {
+                        lattice.apply(brick.key, &mut values, entry);
+                    }
+                    lattice.finish(brick.key, values)
+                }
+                None => lattice.build(brick.key, &brick.edits),
+            };
+            item.added.clone_from(&brick.added);
+            item.closed = brick.closed;
+            if !item.mesh.is_empty() {
+                item.collider = Some(TriMesh::from_triangles(
+                    item.mesh.vertices.clone(),
+                    item.mesh.triangles.clone(),
+                )?);
+            }
+            Ok(item)
+        })?;
+        let rebuilt = built
+            .into_iter()
+            .collect::<Result<Vec<_>, PhysicsError>>()?;
+        Ok(BuiltBricks {
+            rebuilt,
+            token: self.token,
+        })
+    }
+}
+
+/// A finished [`BrickJob`], for [`SdfTerrain::commit`].
+#[derive(Debug)]
+pub struct BuiltBricks {
+    rebuilt: Vec<Rebuilt>,
+    token: u64,
+}
+
+/// Work waiting its turn, in the order it was asked for.
+#[derive(Debug, Clone, Copy)]
+enum Queued {
+    Edit(EditId, EditEntry),
+    Close(EditId, EditEntry),
 }
 
 /// Ground as a signed distance field: a base and ordered edits, sampled in sparse bricks. Only
@@ -332,6 +421,9 @@ impl SdfVolume {
                 inside,
                 mesh: BrickMesh::default(),
                 values: None,
+                collider: None,
+                added: Vec::new(),
+                closed: None,
             };
         }
         let side = self.side();
@@ -352,22 +444,6 @@ impl SdfVolume {
             self.apply(key, &mut values, entry);
         }
         self.finish(key, values)
-    }
-
-    /// One more edit on a brick: on its kept samples when it has them, else from scratch.
-    fn extend(&self, key: BrickKey, entry: &EditEntry) -> Rebuilt {
-        match self
-            .bricks
-            .get(&key)
-            .and_then(|brick| brick.values.as_ref())
-        {
-            Some(kept) => {
-                let mut values = kept.clone();
-                self.apply(key, &mut values, entry);
-                self.finish(key, values)
-            }
-            None => self.build(key, &self.entries_of(key, Some(entry), None)),
-        }
     }
 
     fn side(&self) -> usize {
@@ -428,7 +504,10 @@ impl SdfVolume {
             key,
             inside,
             mesh: nets::surface_nets(&floored, side, step),
-            values: Some(values),
+            values: Some(Arc::new(values)),
+            collider: None,
+            added: Vec::new(),
+            closed: None,
         }
     }
 
@@ -453,22 +532,18 @@ impl SdfVolume {
         }
     }
 
-    fn rebuild(
-        &self,
-        entry: &EditEntry,
-        skip: EditId,
-        dispatch: &dyn JobDispatch,
-    ) -> Result<Vec<Rebuilt>, PhysicsError> {
-        in_parallel(dispatch, &self.reached(entry), |key| {
-            self.build(*key, &self.entries_of(*key, None, Some(skip)))
-        })
+    /// A copy that knows only the lattice, for building bricks away from the volume.
+    fn lattice(&self) -> Self {
+        Self {
+            desc: self.desc,
+            edits: BTreeMap::new(),
+            next_edit: 0,
+            bricks: HashMap::new(),
+            revision: 0,
+        }
     }
 
-    fn commit(
-        &mut self,
-        rebuilt: Vec<Rebuilt>,
-        edit_change: impl Fn(&mut Vec<EditId>),
-    ) -> (u64, i64) {
+    fn commit(&mut self, rebuilt: Vec<Rebuilt>) -> (u64, i64) {
         self.revision += 1;
         let mut change = 0_i64;
         for item in rebuilt {
@@ -477,7 +552,8 @@ impl SdfVolume {
             brick.inside = item.inside;
             brick.mesh = item.mesh;
             brick.revision = self.revision;
-            edit_change(&mut brick.edits);
+            brick.edits.extend(item.added);
+            brick.edits.retain(|other| Some(*other) != item.closed);
             brick.values = if brick.edits.is_empty() {
                 None
             } else {
@@ -523,6 +599,10 @@ fn overlaps(a_low: IVec3, a_high: IVec3, b_low: IVec3, b_high: IVec3) -> bool {
 pub struct SdfTerrain {
     volume: SdfVolume,
     bodies: HashMap<BrickKey, (BodyHandle, Shape)>,
+    queue: VecDeque<Queued>,
+    /// What the job handed out holds, until it commits or is abandoned.
+    flying: Vec<Queued>,
+    token: u64,
 }
 
 impl SdfTerrain {
@@ -544,6 +624,9 @@ impl SdfTerrain {
         let mut terrain = Self {
             volume: SdfVolume::new_with(desc, dispatch)?,
             bodies: HashMap::new(),
+            queue: VecDeque::new(),
+            flying: Vec::new(),
+            token: 0,
         };
         let mut keys: Vec<BrickKey> = terrain
             .volume
@@ -607,6 +690,16 @@ impl SdfTerrain {
             return Ok(None);
         }
         let shape = world.add_mesh(&mesh.vertices, &mesh.triangles)?;
+        self.place(world, key, shape).map(Some)
+    }
+
+    /// A fixed body for a brick's mesh. On failure the mesh is gone too.
+    fn place(
+        &self,
+        world: &mut PhysicsWorld,
+        key: BrickKey,
+        shape: Shape,
+    ) -> Result<(BodyHandle, Shape), PhysicsError> {
         let corner = DVec3::from_vec3(self.volume.brick_corner(key));
         let placed = self
             .volume
@@ -626,7 +719,7 @@ impl SdfTerrain {
                 )
             });
         match placed {
-            Ok(body) => Ok(Some((body, shape))),
+            Ok(body) => Ok((body, shape)),
             Err(error) => {
                 world.remove_mesh(shape)?;
                 Err(error)
@@ -634,10 +727,224 @@ impl SdfTerrain {
         }
     }
 
+    /// Asks for an edit. It lands when a job holding it commits, so it can be built away from
+    /// the step. Edits land in the order they were asked for.
+    ///
+    /// # Errors
+    /// Fails on a bad shape.
+    pub fn queue_edit(&mut self, edit: Edit) -> Result<EditId, PhysicsError> {
+        edit.shape.validate()?;
+        let id = EditId(self.volume.next_edit);
+        self.volume.next_edit += 1;
+        let entry = self.volume.entry(edit);
+        self.queue.push_back(Queued::Edit(id, entry));
+        Ok(id)
+    }
+
+    /// Asks for a tunnel to be taken out, the ground it cut comes back.
+    ///
+    /// # Errors
+    /// Fails when `id` is not a tunnel here, or it is already on its way out.
+    pub fn queue_close_tunnel(&mut self, id: EditId) -> Result<(), PhysicsError> {
+        let waiting = || self.queue.iter().chain(&self.flying);
+        if waiting().any(|item| matches!(item, Queued::Close(other, _) if *other == id)) {
+            return Err(PhysicsError::InvalidHandle);
+        }
+        let asked = waiting().find_map(|item| match item {
+            Queued::Edit(other, entry) if *other == id => Some(*entry),
+            _ => None,
+        });
+        let entry = asked
+            .or_else(|| self.volume.edits.get(&id).copied())
+            .filter(|entry| entry.edit.op == EditOp::Tunnel)
+            .ok_or(PhysicsError::InvalidHandle)?;
+        self.queue.push_back(Queued::Close(id, entry));
+        Ok(())
+    }
+
+    /// Edits asked for and not landed yet.
+    pub fn pending(&self) -> usize {
+        self.queue.len() + self.flying.len()
+    }
+
+    /// Whether a job is out and its result not committed.
+    pub fn job_out(&self) -> bool {
+        !self.flying.is_empty()
+    }
+
+    /// The next batch to build, `None` with one still out or nothing asked for. A batch is
+    /// edits of one kind in a row, so what it did to the ground can be told apart.
+    pub fn next_job(&mut self) -> Option<BrickJob> {
+        if !self.flying.is_empty() {
+            return None;
+        }
+        let first = self.queue.pop_front()?;
+        self.flying.push(first);
+        if let Queued::Edit(_, entry) = first {
+            while self.flying.len() < MAX_BATCH {
+                match self.queue.front() {
+                    Some(Queued::Edit(_, next)) if next.edit.op == entry.edit.op => {}
+                    _ => break,
+                }
+                if let Some(next) = self.queue.pop_front() {
+                    self.flying.push(next);
+                }
+            }
+        }
+        let mut bricks: BTreeMap<BrickKey, JobBrick> = BTreeMap::new();
+        for item in &self.flying {
+            match *item {
+                Queued::Edit(id, entry) => {
+                    for key in self.volume.reached(&entry) {
+                        let brick = bricks.entry(key).or_insert_with(|| {
+                            let kept = self
+                                .volume
+                                .bricks
+                                .get(&key)
+                                .and_then(|brick| brick.values.clone());
+                            let edits = if kept.is_some() {
+                                Vec::new()
+                            } else {
+                                self.volume.entries_of(key, None, None)
+                            };
+                            JobBrick {
+                                key,
+                                kept,
+                                edits,
+                                added: Vec::new(),
+                                closed: None,
+                            }
+                        });
+                        brick.edits.push(entry);
+                        brick.added.push(id);
+                    }
+                }
+                Queued::Close(id, entry) => {
+                    for key in self.volume.reached(&entry) {
+                        bricks.insert(
+                            key,
+                            JobBrick {
+                                key,
+                                kept: None,
+                                edits: self.volume.entries_of(key, None, Some(id)),
+                                added: Vec::new(),
+                                closed: Some(id),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        self.token += 1;
+        Some(BrickJob {
+            lattice: self.volume.lattice(),
+            bricks: bricks.into_values().collect(),
+            token: self.token,
+        })
+    }
+
+    /// Drops the edits of the job that is out, its result is refused from now on.
+    pub fn abandon(&mut self) {
+        self.flying.clear();
+        self.token += 1;
+    }
+
+    /// Puts a finished job in the world, every brick at once. Call it between steps.
+    ///
+    /// # Errors
+    /// Fails on a result of a job abandoned or already committed, or a brick the world will not
+    /// take. Then nothing changed.
+    pub fn commit(
+        &mut self,
+        world: &mut PhysicsWorld,
+        built: BuiltBricks,
+    ) -> Result<EditReport, PhysicsError> {
+        if built.token != self.token || self.flying.is_empty() {
+            return Err(PhysicsError::InvalidHandle);
+        }
+        let mut rebuilt = built.rebuilt;
+        let mut fresh = Vec::new();
+        for item in &mut rebuilt {
+            let Some(collider) = item.collider.take() else {
+                continue;
+            };
+            let placed = world
+                .push_mesh(collider)
+                .and_then(|shape| self.place(world, item.key, shape));
+            match placed {
+                Ok(body) => fresh.push((item.key, body)),
+                Err(error) => {
+                    let bodies: Vec<_> = fresh.iter().map(|(_, body)| *body).collect();
+                    release(world, &bodies);
+                    return Err(error);
+                }
+            }
+        }
+        let keys: Vec<BrickKey> = rebuilt.iter().map(|item| item.key).collect();
+        let old: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.bodies.remove(key))
+            .collect();
+        release(world, &old);
+        self.bodies.extend(fresh);
+        let (revision, change) = self.volume.commit(rebuilt);
+        let volume_change = change as f64 * f64::from(self.volume.desc.voxel).powi(3);
+        let density = f64::from(self.volume.desc.material.density);
+        let mut report = EditReport {
+            edit: EditId(0),
+            edits: self.flying.len(),
+            revision,
+            bricks: keys.len(),
+            volume_change,
+            removed_mass: 0.0,
+            ejected: 0,
+        };
+        for item in std::mem::take(&mut self.flying) {
+            match item {
+                Queued::Edit(id, entry) => {
+                    self.volume.edits.insert(id, entry);
+                    report.edit = id;
+                    match entry.edit.op {
+                        EditOp::Excavate => {
+                            report.removed_mass = (-volume_change).max(0.0) * density;
+                        }
+                        EditOp::Add => report.ejected += self.eject(world, &entry)?,
+                        EditOp::Tunnel => {}
+                    }
+                }
+                Queued::Close(id, entry) => {
+                    self.volume.edits.remove(&id);
+                    report.edit = id;
+                    report.ejected += self.eject(world, &entry)?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Queue, build and commit in one call. Only with nothing else waiting.
+    fn run_now(
+        &mut self,
+        world: &mut PhysicsWorld,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<EditReport, PhysicsError> {
+        let Some(job) = self.next_job() else {
+            return Err(PhysicsError::TerrainBusy);
+        };
+        let done = job
+            .run(dispatch)
+            .and_then(|built| self.commit(world, built));
+        if done.is_err() {
+            self.abandon();
+        }
+        done
+    }
+
     /// Applies one edit to the volume and the world.
     ///
     /// # Errors
-    /// Fails on a bad shape or when the world will not take a new brick. Then nothing changed.
+    /// Fails on a bad shape, with other edits waiting, or when the world will not take a new
+    /// brick. Then nothing changed.
     pub fn edit(
         &mut self,
         world: &mut PhysicsWorld,
@@ -657,31 +964,18 @@ impl SdfTerrain {
         edit: Edit,
         dispatch: &dyn JobDispatch,
     ) -> Result<EditReport, PhysicsError> {
-        edit.shape.validate()?;
-        let id = EditId(self.volume.next_edit);
-        let entry = self.volume.entry(edit);
-        let volume = &self.volume;
-        let rebuilt = in_parallel(dispatch, &volume.reached(&entry), |key| {
-            volume.extend(*key, &entry)
-        })?;
-        let mut report = self.swap(world, rebuilt, |edits| edits.push(id))?;
-        self.volume.edits.insert(id, entry);
-        self.volume.next_edit += 1;
-        report.edit = id;
-        if edit.op == EditOp::Excavate {
-            report.removed_mass =
-                (-report.volume_change).max(0.0) * f64::from(self.volume.desc.material.density);
+        if self.pending() > 0 {
+            return Err(PhysicsError::TerrainBusy);
         }
-        if edit.op == EditOp::Add {
-            report.ejected = self.eject(world, &entry)?;
-        }
-        Ok(report)
+        self.queue_edit(edit)?;
+        self.run_now(world, dispatch)
     }
 
     /// Takes a tunnel out again, the ground it cut comes back.
     ///
     /// # Errors
-    /// Fails when `id` is not a tunnel here, or the world will not take a brick.
+    /// Fails when `id` is not a tunnel here, with other edits waiting, or the world will not
+    /// take a brick.
     pub fn remove_tunnel(
         &mut self,
         world: &mut PhysicsWorld,
@@ -700,20 +994,11 @@ impl SdfTerrain {
         id: EditId,
         dispatch: &dyn JobDispatch,
     ) -> Result<EditReport, PhysicsError> {
-        let entry = *self
-            .volume
-            .edits
-            .get(&id)
-            .ok_or(PhysicsError::InvalidHandle)?;
-        if entry.edit.op != EditOp::Tunnel {
-            return Err(PhysicsError::InvalidHandle);
+        if self.pending() > 0 {
+            return Err(PhysicsError::TerrainBusy);
         }
-        let rebuilt = self.volume.rebuild(&entry, id, dispatch)?;
-        let mut report = self.swap(world, rebuilt, |edits| edits.retain(|other| *other != id))?;
-        self.volume.edits.remove(&id);
-        report.edit = id;
-        report.ejected = self.eject(world, &entry)?;
-        Ok(report)
+        self.queue_close_tunnel(id)?;
+        self.run_now(world, dispatch)
     }
 
     /// Moves dynamic bodies that new material swallowed straight up to the surface.
@@ -771,44 +1056,6 @@ impl SdfTerrain {
             world.set_velocity(body, Vec3::ZERO, Vec3::ZERO)?;
         }
         Ok(placed.len())
-    }
-
-    /// Puts all new brick bodies in, then takes the old ones out. On failure nothing changed.
-    fn swap(
-        &mut self,
-        world: &mut PhysicsWorld,
-        rebuilt: Vec<Rebuilt>,
-        edit_change: impl Fn(&mut Vec<EditId>),
-    ) -> Result<EditReport, PhysicsError> {
-        let mut fresh = Vec::new();
-        for item in &rebuilt {
-            match self.collider(world, item.key, &item.mesh) {
-                Ok(Some(body)) => fresh.push((item.key, body)),
-                Ok(None) => {}
-                Err(error) => {
-                    let bodies: Vec<_> = fresh.iter().map(|(_, body)| *body).collect();
-                    release(world, &bodies);
-                    return Err(error);
-                }
-            }
-        }
-        let keys: Vec<BrickKey> = rebuilt.iter().map(|item| item.key).collect();
-        let old: Vec<_> = keys
-            .iter()
-            .filter_map(|key| self.bodies.remove(key))
-            .collect();
-        release(world, &old);
-        self.bodies.extend(fresh);
-        let (revision, change) = self.volume.commit(rebuilt, edit_change);
-        let cell = f64::from(self.volume.desc.voxel).powi(3);
-        Ok(EditReport {
-            edit: EditId(0),
-            revision,
-            bricks: keys.len(),
-            volume_change: change as f64 * cell,
-            removed_mass: 0.0,
-            ejected: 0,
-        })
     }
 
     /// Takes every brick body out of the world.
@@ -1314,6 +1561,151 @@ mod tests {
         }
         let open = edges.values().filter(|count| **count != 0).count();
         assert_eq!(open, 0, "{open} open edges of {}", edges.len());
+    }
+
+    fn dig_at(x: f32, z: f32) -> Edit {
+        Edit {
+            shape: EditShape::Sphere {
+                center: Vec3::new(x, 6.0, z),
+                radius: 2.0,
+            },
+            op: EditOp::Excavate,
+        }
+    }
+
+    #[test]
+    fn queued_edits_match_edits_made_one_by_one() {
+        let (mut alone, mut queued) = (world(), world());
+        let mut one = SdfTerrain::new(&mut alone, desc(hills())).unwrap();
+        let mut batch = SdfTerrain::new(&mut queued, desc(hills())).unwrap();
+        for edit in edits() {
+            one.edit(&mut alone, edit).unwrap();
+            batch.queue_edit(edit).unwrap();
+        }
+        for i in 0..6 {
+            let edit = dig_at(5.0 + i as f32 * 1.5, 9.0);
+            one.edit(&mut alone, edit).unwrap();
+            batch.queue_edit(edit).unwrap();
+        }
+        let mut commits = 0;
+        while let Some(job) = batch.next_job() {
+            assert!(batch.job_out());
+            assert!(batch.next_job().is_none());
+            let built = job.run(&Threads).unwrap();
+            batch.commit(&mut queued, built).unwrap();
+            commits += 1;
+        }
+        assert_eq!(batch.pending(), 0);
+        // the last digs share one job
+        assert!(commits < edits().len() + 6, "{commits}");
+        for key in all_keys(one.volume()) {
+            assert_eq!(
+                one.volume().brick_mesh(key),
+                batch.volume().brick_mesh(key),
+                "{key:?}"
+            );
+        }
+        assert_matches_reference(batch.volume());
+        assert_eq!(
+            one.volume().material_volume(),
+            batch.volume().material_volume()
+        );
+    }
+
+    #[test]
+    fn a_step_never_sees_an_edit_before_it_commits() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let ball = ball_at(&mut world, Vec3::new(12.0, 8.5, 12.0));
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let revision = terrain.volume().revision();
+        terrain
+            .queue_edit(Edit {
+                shape: EditShape::Box {
+                    center: Vec3::new(12.0, 6.0, 12.0),
+                    half_extents: Vec3::new(1.5, 2.5, 1.5),
+                    rotation: Quat::IDENTITY,
+                },
+                op: EditOp::Excavate,
+            })
+            .unwrap();
+        let job = terrain.next_job().unwrap();
+        // the world goes on while the job is out
+        let built = job.run(&Threads).unwrap();
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        assert_eq!(terrain.volume().revision(), revision);
+        assert!(
+            (height(&world, ball) - 8.4).abs() < 0.05,
+            "{}",
+            height(&world, ball)
+        );
+        let report = terrain.commit(&mut world, built).unwrap();
+        assert_eq!(report.edits, 1);
+        assert!(report.removed_mass > 0.0);
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        assert!(
+            (height(&world, ball) - 3.9).abs() < 0.1,
+            "{}",
+            height(&world, ball)
+        );
+    }
+
+    #[test]
+    fn stale_results_and_busy_calls_are_refused() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        terrain.queue_edit(dig_at(6.0, 6.0)).unwrap();
+        assert_eq!(
+            terrain.edit(&mut world, dig_at(9.0, 9.0)).map(|_| ()),
+            Err(PhysicsError::TerrainBusy)
+        );
+        let built = terrain.next_job().unwrap().run(&Sequential).unwrap();
+        terrain.abandon();
+        let revision = terrain.volume().revision();
+        assert_eq!(
+            terrain.commit(&mut world, built).map(|_| ()),
+            Err(PhysicsError::InvalidHandle)
+        );
+        assert_eq!(terrain.volume().revision(), revision);
+        assert_eq!(terrain.pending(), 0);
+        assert_eq!(terrain.volume().edit_count(), 0);
+        assert_matches_reference(terrain.volume());
+
+        // a tunnel can be closed while it still waits, and only once
+        let tunnel = terrain.queue_edit(edits()[1]).unwrap();
+        terrain.queue_close_tunnel(tunnel).unwrap();
+        assert_eq!(
+            terrain.queue_close_tunnel(tunnel),
+            Err(PhysicsError::InvalidHandle)
+        );
+        while let Some(job) = terrain.next_job() {
+            let built = job.run(&Sequential).unwrap();
+            terrain.commit(&mut world, built).unwrap();
+        }
+        assert_eq!(terrain.volume().edit_count(), 0);
+        assert_matches_reference(terrain.volume());
+    }
+
+    #[test]
+    fn a_failed_build_can_be_dropped_and_work_goes_on() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        terrain.queue_edit(dig_at(6.0, 6.0)).unwrap();
+        let job = terrain.next_job().unwrap();
+        assert_eq!(
+            job.run(&Lazy).map(|_| ()),
+            Err(PhysicsError::DispatchIncomplete)
+        );
+        terrain.abandon();
+        terrain.edit(&mut world, dig_at(9.0, 9.0)).unwrap();
+        assert_eq!(terrain.volume().edit_count(), 1);
+        assert_matches_reference(terrain.volume());
     }
 
     #[test]
