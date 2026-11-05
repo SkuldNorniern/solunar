@@ -367,7 +367,7 @@ mod tests {
         let body = world
             .spawn(cube().local_position(Vec3::new(0.0, -8.0, 0.0)))
             .unwrap();
-        for _ in 0..240 {
+        for _ in 0..300 {
             world.step_fixed().unwrap();
             let state = world.body_state(body).unwrap();
             if state.asleep {

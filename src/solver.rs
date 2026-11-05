@@ -39,10 +39,16 @@ pub(crate) struct CachedManifold {
     pub(crate) count: usize,
 }
 
+/// `arm_a[k]` is `offset_a × axes[k]`, `turn_a[k]` the spin of A per unit impulse along it.
+/// Both are worked out once a substep, the iterations only scale and add them.
 #[derive(Clone, Copy, Default)]
 struct SolverPoint {
     offset_a: Vec3,
     offset_b: Vec3,
+    arm_a: [Vec3; 3],
+    arm_b: [Vec3; 3],
+    turn_a: [Vec3; 3],
+    turn_b: [Vec3; 3],
     mass: Vec3,
     target: f32,
     bounce: f32,
@@ -63,6 +69,8 @@ struct SolverManifold {
     part_b: u32,
     axes: [Vec3; 3],
     friction: f32,
+    /// Zero for bodies that are not dynamic, they are never pushed.
+    inverse_mass: [f32; 2],
     points: [SolverPoint; MAX_CONTACTS],
     count: usize,
 }
@@ -390,7 +398,7 @@ pub(crate) fn solve_substep(
         &mut islands.row_ends,
     );
     for manifold in &mut scratch.manifolds {
-        refresh_manifold(state, manifold, last, dt);
+        refresh_manifold(bodies, state, manifold, last, dt);
     }
     for island in 0..count {
         let islands = &scratch.islands;
@@ -420,7 +428,7 @@ fn solve_island(
         warm_start_row(state, row);
     }
     for manifold in manifolds.iter() {
-        warm_start(bodies, state, manifold);
+        warm_start(state, manifold);
     }
     // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
     for iteration in 0..VELOCITY_ITERATIONS {
@@ -432,11 +440,11 @@ fn solve_island(
                 solve_row(state, row);
             }
             for manifold in manifolds.iter_mut() {
-                solve_manifold(bodies, state, manifold);
+                solve_manifold(state, manifold);
             }
         } else {
             for manifold in manifolds.iter_mut().rev() {
-                solve_manifold(bodies, state, manifold);
+                solve_manifold(state, manifold);
             }
             for row in rows.iter_mut().rev() {
                 solve_row(state, row);
@@ -454,19 +462,50 @@ fn solve_island(
             solve_row_recovery(state, row);
         }
         for manifold in manifolds.iter_mut() {
-            solve_recovery(bodies, state, manifold);
+            solve_recovery(state, manifold);
         }
     }
 }
 
 /// Bodies moved since the contacts were found, so gaps and arms follow them.
-fn refresh_manifold(state: &[Integrated], manifold: &mut SolverManifold, last: bool, dt: f32) {
+fn refresh_manifold(
+    bodies: &Bodies,
+    state: &[Integrated],
+    manifold: &mut SolverManifold,
+    last: bool,
+    dt: f32,
+) {
     let (a, b) = (&state[manifold.a], &state[manifold.b]);
     let center_b = b.position.offset_from(a.position).as_vec3();
     let normal = manifold.axes[0];
+    let [inverse_a, inverse_b] = manifold.inverse_mass;
+    let response = |dense: usize, rotation, arm: Vec3| {
+        if bodies.kind[dense] == BodyKind::Dynamic {
+            apply_diagonal(rotation, bodies.inverse_inertia[dense], arm)
+        } else {
+            Vec3::ZERO
+        }
+    };
     for point in &mut manifold.points[..manifold.count] {
         point.offset_a = a.rotation.rotate_vec3(point.local_a);
         point.offset_b = b.rotation.rotate_vec3(point.local_b);
+        let mut mass = [0.0; 3];
+        for (k, axis) in manifold.axes.iter().enumerate() {
+            point.arm_a[k] = point.offset_a.cross(*axis);
+            point.arm_b[k] = point.offset_b.cross(*axis);
+            point.turn_a[k] = response(manifold.a, a.rotation, point.arm_a[k]);
+            point.turn_b[k] = response(manifold.b, b.rotation, point.arm_b[k]);
+            let inverse = inverse_a
+                + inverse_b
+                + point.arm_a[k].dot(point.turn_a[k])
+                + point.arm_b[k].dot(point.turn_b[k]);
+            mass[k] = if inverse > 1e-12 {
+                inverse.recip()
+            } else {
+                0.0
+            };
+        }
+        point.mass = Vec3::new(mass[0], mass[1], mass[2]);
         let gap = (center_b + point.offset_b - point.offset_a).dot(normal);
         // still apart it may close the gap, and only arriving can bounce. arriving in the last
         // substep would clamp the speed the next step's bounce is worked out from, so it bounces now
@@ -618,6 +657,10 @@ fn contact_manifold(
         part_b,
         axes,
         friction: (material_a.friction * material_b.friction).sqrt(),
+        inverse_mass: [
+            dynamic_inverse_mass(bodies, a),
+            dynamic_inverse_mass(bodies, b),
+        ],
         points: [SolverPoint::default(); MAX_CONTACTS],
         count: raw.count,
     };
@@ -632,20 +675,6 @@ fn contact_manifold(
         let offset_b = middle - normal * (point.depth * 0.5) - center_b;
         let local_a = inverse_rotation_a.rotate_vec3(offset_a);
         let local_b = inverse_rotation_b.rotate_vec3(offset_b);
-        let mut mass = Vec3::ZERO;
-        for (index, axis) in axes.iter().enumerate() {
-            let inverse = effective_inverse_mass(bodies, a, b, offset_a, offset_b, *axis);
-            let value = if inverse > 1e-12 {
-                inverse.recip()
-            } else {
-                0.0
-            };
-            match index {
-                0 => mass.x = value,
-                1 => mass.y = value,
-                _ => mass.z = value,
-            }
-        }
         let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
         let reaches = -approach * dt >= -point.depth;
         let bounce = if reaches && approach < -RESTITUTION_THRESHOLD {
@@ -656,14 +685,11 @@ fn contact_manifold(
         *out = SolverPoint {
             offset_a,
             offset_b,
-            mass,
-            target: 0.0,
             bounce,
-            recovery: 0.0,
-            recovery_impulse: 0.0,
             impulse: matching_impulse(old, local_a, &mut claimed),
             local_a,
             local_b,
+            ..SolverPoint::default()
         };
     }
     manifold
@@ -693,148 +719,100 @@ fn matching_impulse(
     })
 }
 
-fn warm_start(bodies: &Bodies, state: &mut [Integrated], manifold: &SolverManifold) {
+fn warm_start(state: &mut [Integrated], manifold: &SolverManifold) {
     for point in &manifold.points[..manifold.count] {
-        let impulse = manifold.axes[0] * point.impulse.x
-            + manifold.axes[1] * point.impulse.y
-            + manifold.axes[2] * point.impulse.z;
-        apply_pair(bodies, state, manifold, point, impulse);
+        for k in 0..3 {
+            push(state, manifold, point, k, point.impulse[k]);
+        }
     }
 }
 
-fn solve_manifold(bodies: &Bodies, state: &mut [Integrated], manifold: &mut SolverManifold) {
-    let manifold_copy = *manifold;
-    for point in &mut manifold.points[..manifold_copy.count] {
+fn solve_manifold(state: &mut [Integrated], manifold: &mut SolverManifold) {
+    let shape = *manifold;
+    for point in &mut manifold.points[..shape.count] {
         // friction first, so the normal impulse has the last word on penetration
-        let limit = (manifold_copy.friction * point.impulse.x).max(0.0);
-        for (axis, mass, accumulated) in [
-            (manifold_copy.axes[1], point.mass.y, &mut point.impulse.y),
-            (manifold_copy.axes[2], point.mass.z, &mut point.impulse.z),
-        ] {
-            let speed = relative_velocity(
-                state,
-                manifold_copy.a,
-                manifold_copy.b,
-                point.offset_a,
-                point.offset_b,
-            )
-            .dot(axis);
+        let limit = (shape.friction * point.impulse.x).max(0.0);
+        for k in 1..3 {
+            let speed = speed_along(state, &shape, point, k);
+            let accumulated = point.impulse[k];
             // not `clamp`, it panics on a nan limit
-            let next = (*accumulated - speed * mass).min(limit).max(-limit);
-            let change = next - *accumulated;
-            *accumulated = next;
-            apply_offsets(
-                bodies,
-                state,
-                &manifold_copy,
-                point.offset_a,
-                point.offset_b,
-                axis * change,
-            );
+            let next = (accumulated - speed * point.mass[k]).min(limit).max(-limit);
+            point.impulse[k] = next;
+            push(state, &shape, point, k, next - accumulated);
         }
-
-        let normal = manifold_copy.axes[0];
-        let speed = relative_velocity(
-            state,
-            manifold_copy.a,
-            manifold_copy.b,
-            point.offset_a,
-            point.offset_b,
-        )
-        .dot(normal);
+        let speed = speed_along(state, &shape, point, 0);
         let next = (point.impulse.x + (point.target - speed) * point.mass.x).max(0.0);
         let change = next - point.impulse.x;
         point.impulse.x = next;
-        apply_offsets(
-            bodies,
-            state,
-            &manifold_copy,
-            point.offset_a,
-            point.offset_b,
-            normal * change,
-        );
+        push(state, &shape, point, 0, change);
     }
 }
 
 /// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
-fn solve_recovery(bodies: &Bodies, state: &mut [Integrated], manifold: &mut SolverManifold) {
+fn solve_recovery(state: &mut [Integrated], manifold: &mut SolverManifold) {
     let (a, b) = (manifold.a, manifold.b);
     let normal = manifold.axes[0];
+    let [inverse_a, inverse_b] = manifold.inverse_mass;
     for point in &mut manifold.points[..manifold.count] {
-        let at_a = state[a].recovery_linear + state[a].recovery_angular.cross(point.offset_a);
-        let at_b = state[b].recovery_linear + state[b].recovery_angular.cross(point.offset_b);
-        let speed = (at_b - at_a).dot(normal);
+        let speed = (state[b].recovery_linear - state[a].recovery_linear).dot(normal)
+            + state[b].recovery_angular.dot(point.arm_b[0])
+            - state[a].recovery_angular.dot(point.arm_a[0]);
         let next = (point.recovery_impulse + (point.recovery - speed) * point.mass.x).max(0.0);
-        let change = normal * (next - point.recovery_impulse);
+        let change = next - point.recovery_impulse;
         point.recovery_impulse = next;
-        apply_recovery(bodies, state, a, point.offset_a, -change);
-        apply_recovery(bodies, state, b, point.offset_b, change);
+        if inverse_a > 0.0 {
+            state[a].recovery_linear -= normal * (change * inverse_a);
+            state[a].recovery_angular -= point.turn_a[0] * change;
+        }
+        if inverse_b > 0.0 {
+            state[b].recovery_linear += normal * (change * inverse_b);
+            state[b].recovery_angular += point.turn_b[0] * change;
+        }
     }
 }
 
-fn apply_recovery(
-    bodies: &Bodies,
-    state: &mut [Integrated],
-    dense: usize,
-    offset: Vec3,
-    impulse: Vec3,
-) {
-    if bodies.kind[dense] != BodyKind::Dynamic {
-        return;
-    }
-    let body = &mut state[dense];
-    body.recovery_linear += impulse * bodies.inverse_mass[dense];
-    let rotation = body.rotation;
-    body.recovery_angular += apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[dense],
-        offset.cross(impulse),
-    );
+/// Speed of B against A at the point along axis `k`.
+fn speed_along(
+    state: &[Integrated],
+    manifold: &SolverManifold,
+    point: &SolverPoint,
+    k: usize,
+) -> f32 {
+    let (a, b) = (&state[manifold.a], &state[manifold.b]);
+    (b.linear - a.linear).dot(manifold.axes[k]) + b.angular.dot(point.arm_b[k])
+        - a.angular.dot(point.arm_a[k])
 }
 
-fn apply_pair(
-    bodies: &Bodies,
+/// `impulse` along axis `k` on B, its opposite on A.
+fn push(
     state: &mut [Integrated],
     manifold: &SolverManifold,
     point: &SolverPoint,
-    impulse: Vec3,
+    k: usize,
+    impulse: f32,
 ) {
-    apply_offsets(
-        bodies,
-        state,
-        manifold,
-        point.offset_a,
-        point.offset_b,
-        impulse,
-    );
-}
-
-/// `impulse` acts on B, its opposite on A.
-fn apply_offsets(
-    bodies: &Bodies,
-    state: &mut [Integrated],
-    manifold: &SolverManifold,
-    offset_a: Vec3,
-    offset_b: Vec3,
-    impulse: Vec3,
-) {
-    apply_one(bodies, state, manifold.a, offset_a, -impulse);
-    apply_one(bodies, state, manifold.b, offset_b, impulse);
-}
-
-fn apply_one(bodies: &Bodies, state: &mut [Integrated], dense: usize, offset: Vec3, impulse: Vec3) {
-    if bodies.kind[dense] != BodyKind::Dynamic {
-        return;
+    let axis = manifold.axes[k];
+    let [inverse_a, inverse_b] = manifold.inverse_mass;
+    if inverse_a > 0.0 {
+        let body = &mut state[manifold.a];
+        body.linear -= axis * (impulse * inverse_a);
+        body.angular -= point.turn_a[k] * impulse;
+        body.touched = true;
     }
-    let body = &mut state[dense];
-    body.linear += impulse * bodies.inverse_mass[dense];
-    let rotation = body.rotation;
-    body.angular += apply_diagonal(
-        rotation,
-        bodies.inverse_inertia[dense],
-        offset.cross(impulse),
-    );
-    body.touched = true;
+    if inverse_b > 0.0 {
+        let body = &mut state[manifold.b];
+        body.linear += axis * (impulse * inverse_b);
+        body.angular += point.turn_b[k] * impulse;
+        body.touched = true;
+    }
+}
+
+fn dynamic_inverse_mass(bodies: &Bodies, dense: usize) -> f32 {
+    if bodies.kind[dense] == BodyKind::Dynamic {
+        bodies.inverse_mass[dense]
+    } else {
+        0.0
+    }
 }
 
 fn relative_velocity(
@@ -847,26 +825,6 @@ fn relative_velocity(
     let at_a = state[a].linear + state[a].angular.cross(offset_a);
     let at_b = state[b].linear + state[b].angular.cross(offset_b);
     at_b - at_a
-}
-
-fn effective_inverse_mass(
-    bodies: &Bodies,
-    a: usize,
-    b: usize,
-    offset_a: Vec3,
-    offset_b: Vec3,
-    axis: Vec3,
-) -> f32 {
-    let part = |dense: usize, offset: Vec3| {
-        let arm = offset.cross(axis);
-        bodies.inverse_mass[dense]
-            + arm.dot(apply_diagonal(
-                bodies.rotation[dense],
-                bodies.inverse_inertia[dense],
-                arm,
-            ))
-    };
-    part(a, offset_a) + part(b, offset_b)
 }
 
 fn tangent_of(normal: Vec3) -> Vec3 {
