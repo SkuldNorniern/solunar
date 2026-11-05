@@ -40,6 +40,20 @@ impl PhysicsWorld {
         Some((&mesh.vertices, &mesh.triangles))
     }
 
+    /// Fills out with the hull's edges in body axes. False when the shape is not a known hull.
+    pub fn convex_edges(&self, shape: &Shape, out: &mut Vec<(Vec3, Vec3)>) -> bool {
+        match self.bodies.assets.convex(shape) {
+            Some(hull) => {
+                hull.outline(out);
+                true
+            }
+            None => {
+                out.clear();
+                false
+            }
+        }
+    }
+
     pub fn joint_handles(&self) -> impl Iterator<Item = JointHandle> + '_ {
         self.joints.handles()
     }
@@ -135,6 +149,23 @@ mod tests {
         let (vertices, triangles) = world.mesh_triangles(&mesh).unwrap();
         assert_eq!((vertices.len(), triangles.len()), (3, 1));
         assert_eq!(world.mesh_triangles(&info.shape), None);
+        let mut points = Vec::new();
+        for x in [-0.5, 0.5] {
+            for y in [-0.5, 0.5] {
+                for z in [-0.5, 0.5] {
+                    points.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let cube = world.add_convex(&points).unwrap();
+        let mut edges = Vec::new();
+        assert!(world.convex_edges(&cube.shape, &mut edges));
+        assert_eq!(edges.len(), 12);
+        for (a, b) in &edges {
+            assert!(((*a - *b).length() - 1.0).abs() < 1e-4);
+        }
+        assert!(!world.convex_edges(&mesh, &mut edges));
+        assert!(edges.is_empty());
     }
 
     #[test]

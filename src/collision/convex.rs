@@ -261,6 +261,24 @@ impl ConvexHull {
         })
     }
 
+    /// Each outline edge once, in hull axes.
+    pub(crate) fn outline(&self, out: &mut Vec<(Vec3, Vec3)>) {
+        out.clear();
+        for face in self.face_starts.windows(2) {
+            let corners = &self.face_corners[face[0] as usize..face[1] as usize];
+            for (at, first) in corners.iter().enumerate() {
+                let second = corners[(at + 1) % corners.len()];
+                // every edge is on two faces, keep the one where it runs low to high
+                if *first < second {
+                    out.push((
+                        self.vertices[*first as usize],
+                        self.vertices[second as usize],
+                    ));
+                }
+            }
+        }
+    }
+
     pub(crate) fn hull(&self, rotation: Quat, center: DVec3) -> Hull<'_> {
         Hull::Points {
             vertices: &self.vertices,
