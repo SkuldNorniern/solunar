@@ -27,6 +27,9 @@ const EJECT_GAP: f32 = 0.02;
 /// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
 /// Bodies a host puts on this bit look like ground to [`SdfTerrain::raycast`].
 pub const GROUND_LAYER: u32 = 1 << 31;
+/// Bytes of kept samples a volume holds by default. Past it the bricks edited longest ago let go
+/// of theirs, and build from their edits when next edited.
+const CACHE_BYTES: usize = 256 << 20;
 /// Most edits one job takes, so a long queue still commits in steps.
 const MAX_BATCH: usize = 64;
 /// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
@@ -216,6 +219,7 @@ pub struct SdfVolume {
     next_edit: u32,
     bricks: HashMap<BrickKey, Brick>,
     revision: u64,
+    cache_bytes: usize,
 }
 
 impl SdfVolume {
@@ -237,6 +241,7 @@ impl SdfVolume {
             next_edit: 0,
             bricks: HashMap::new(),
             revision: 1,
+            cache_bytes: CACHE_BYTES,
         };
         let [bx, by, bz] = desc.bricks;
         let mut keys = Vec::with_capacity((bx * by * bz) as usize);
@@ -276,6 +281,34 @@ impl SdfVolume {
 
     pub fn edit_count(&self) -> usize {
         self.edits.len()
+    }
+
+    /// Most bytes of kept samples to hold. The result of an edit does not depend on it, only how
+    /// long the next edit of a brick takes.
+    pub fn set_cache_limit(&mut self, bytes: usize) {
+        self.cache_bytes = bytes;
+        self.trim_cache();
+    }
+
+    fn trim_cache(&mut self) {
+        let each = self.side().pow(3) * size_of::<f32>();
+        let allowed = self.cache_bytes / each;
+        let mut kept: Vec<(u64, BrickKey)> = self
+            .bricks
+            .iter()
+            .filter(|(_, brick)| brick.values.is_some())
+            .map(|(key, brick)| (brick.revision, *key))
+            .collect();
+        if kept.len() <= allowed {
+            return;
+        }
+        kept.sort_unstable();
+        let extra = kept.len() - allowed;
+        for (_, key) in &kept[..extra] {
+            if let Some(brick) = self.bricks.get_mut(key) {
+                brick.values = None;
+            }
+        }
     }
 
     /// Bricks keeping samples for the next edit, and the bytes they hold.
@@ -351,11 +384,12 @@ impl SdfVolume {
         ]);
         let point = Vec3::new(sample.x as f32, sample.y as f32, sample.z as f32) * step;
         let (low, high) = self.brick_samples(key);
-        let raw = match self
-            .bricks
-            .get(&key)
-            .and_then(|brick| brick.values.as_ref())
-        {
+        let brick = self.bricks.get(&key);
+        if brick.is_some_and(|brick| brick.values.is_none() && !brick.edits.is_empty()) {
+            // its samples were let go, the edits are the only record of it
+            return self.distance(point);
+        }
+        let raw = match brick.and_then(|brick| brick.values.as_ref()) {
             Some(values) if inside(sample, low, high) => {
                 let side = self.side();
                 let local = sample - low;
@@ -615,6 +649,7 @@ impl SdfVolume {
             next_edit: 0,
             bricks: HashMap::new(),
             revision: 0,
+            cache_bytes: 0,
         }
     }
 
@@ -639,6 +674,7 @@ impl SdfVolume {
         self.bricks.retain(|_, brick| {
             brick.inside > 0 || !brick.mesh.is_empty() || !brick.edits.is_empty()
         });
+        self.trim_cache();
         (self.revision, change)
     }
 }
@@ -728,6 +764,11 @@ impl SdfTerrain {
 
     pub fn volume(&self) -> &SdfVolume {
         &self.volume
+    }
+
+    /// See [`SdfVolume::set_cache_limit`].
+    pub fn set_cache_limit(&mut self, bytes: usize) {
+        self.volume.set_cache_limit(bytes);
     }
 
     /// The first ground along `ray`, whatever other bodies are in the way.
@@ -2129,6 +2170,42 @@ mod tests {
             "{}",
             height(&world, ball)
         );
+    }
+
+    #[test]
+    fn a_small_cache_only_costs_time() {
+        let (mut big, mut small) = (world(), world());
+        let mut plenty = SdfTerrain::new(&mut big, desc(hills())).unwrap();
+        let mut tight = SdfTerrain::new(&mut small, desc(hills())).unwrap();
+        // room for two bricks of 8 cells
+        tight.set_cache_limit(2 * 10 * 10 * 10 * 4);
+        for i in 0..30 {
+            let edit = dig_at(3.0 + (i % 10) as f32 * 2.0, 3.0 + (i % 7) as f32 * 2.5);
+            plenty.edit(&mut big, edit).unwrap();
+            tight.edit(&mut small, edit).unwrap();
+            let (count, bytes) = tight.volume().cached_bricks();
+            assert!(count <= 2 && bytes <= 8000, "{count} {bytes}");
+        }
+        for key in all_keys(plenty.volume()) {
+            assert_eq!(
+                plenty.volume().brick_mesh(key),
+                tight.volume().brick_mesh(key),
+                "{key:?}"
+            );
+        }
+        assert_matches_reference(tight.volume());
+        // bricks with edits and no samples still answer right
+        let step = tight.volume().desc.voxel;
+        for x in (0..96).step_by(3) {
+            let at = Vec3::new(x as f32, 12.0, 12.0) * step;
+            let (full, quick) = (
+                tight.volume().distance(at),
+                tight.volume().quick_distance(at),
+            );
+            assert_eq!(full < 0.0, quick < 0.0, "{at:?} {full} {quick}");
+        }
+        tight.set_cache_limit(0);
+        assert_eq!(tight.volume().cached_bricks(), (0, 0));
     }
 
     #[test]
