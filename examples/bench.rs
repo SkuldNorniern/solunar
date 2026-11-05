@@ -20,7 +20,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 9] = [
+const SUITES: [(&str, Suite); 10] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -30,6 +30,7 @@ const SUITES: [(&str, Suite); 9] = [
     ("queries", queries),
     ("bullets", bullets),
     ("tunnel", tunnel),
+    ("commit", tunnel_commit),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -589,6 +590,62 @@ fn tunnel() -> Result<Outcome> {
             built.as_secs_f64() * 1e3,
             step_p99.as_secs_f64() * 1e3,
             removed(&terrain),
+        ),
+    })
+}
+
+/// The same bore built as a job. Times are the commit alone, what stays between steps when the
+/// build runs elsewhere.
+fn tunnel_commit() -> Result<Outcome> {
+    let mut world = world()?;
+    let mut terrain = SdfTerrain::new(
+        &mut world,
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [16, 6, 16],
+            base: Base::Hills {
+                seed: 5,
+                height: 24.0,
+                amplitude: 3.0,
+                wavelength: 30.0,
+                octaves: 4,
+            },
+            material: Material::default(),
+        },
+    )?;
+    let mut commits = Vec::new();
+    let mut builds = Vec::new();
+    for i in 0..400 {
+        let x = 4.0 + i as f32 * 0.3;
+        terrain.queue_edit(Edit {
+            shape: EditShape::Capsule {
+                a: Vec3::new(x - 0.3, 22.0, 63.0),
+                b: Vec3::new(x, 22.0, 63.0),
+                radius: 2.0,
+            },
+            op: EditOp::Excavate,
+        })?;
+        let Some(job) = terrain.next_job() else {
+            continue;
+        };
+        let started = Instant::now();
+        let built = job.run(&Sequential)?;
+        builds.push(started.elapsed());
+        let started = Instant::now();
+        terrain.commit(&mut world, built)?;
+        commits.push(started.elapsed());
+    }
+    builds.sort_unstable();
+    let build_p50 = builds[builds.len() / 2];
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times: commits,
+        unit: "ms",
+        check: format!(
+            "build on one thread p50 {:.2} ms",
+            build_p50.as_secs_f64() * 1e3
         ),
     })
 }
