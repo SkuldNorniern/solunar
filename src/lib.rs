@@ -15,6 +15,7 @@ mod shape;
 mod sleep;
 mod snapshot;
 mod solver;
+mod vehicle;
 mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
@@ -36,4 +37,5 @@ pub use position::{CELL_SIZE, GridPosition};
 pub use profile::StepReport;
 pub use shape::{MassProperties, Shape};
 pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};
+pub use vehicle::{Controls, Vehicle, WheelContact, WheelDesc, WheelState};
 pub use world::{Advance, PhysicsSettings, PhysicsWorld};
