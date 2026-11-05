@@ -37,8 +37,8 @@ pub use material::Material;
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};
 pub use sdf::{
-    Base, BrickKey, BrickMesh, Edit, EditId, EditOp, EditReport, EditShape, SdfDesc, SdfTerrain,
-    SdfVolume,
+    Base, BrickKey, BrickMesh, Edit, EditId, EditOp, EditReport, EditShape, GROUND_LAYER, SdfDesc,
+    SdfTerrain, SdfVolume,
 };
 pub use shape::{MassProperties, Shape};
 pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};

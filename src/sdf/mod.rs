@@ -10,11 +10,14 @@ pub use field::{Base, Edit, EditOp, EditShape};
 pub use nets::BrickMesh;
 
 use crate::{
-    BodyHandle, GridPosition, JobDispatch, Material, PhysicsError, PhysicsWorld, RigidBodyDesc,
-    Sequential, Shape,
+    BodyHandle, CastHit, CollisionFilter, GridPosition, JobDispatch, Material, PhysicsError,
+    PhysicsWorld, QueryFilter, Ray, RigidBodyDesc, Sequential, Shape,
 };
 
 const MAX_BRICKS: u64 = 1 << 20;
+/// Layer bit brick bodies carry besides the default one, so a query can ask for the ground alone.
+/// Bodies a host puts on this bit look like ground to [`SdfTerrain::raycast`].
+pub const GROUND_LAYER: u32 = 1 << 31;
 /// Lattice steps an edit reaches past its shape. There the shape's distance is at least two
 /// steps, so cutting the edit off never moves a surface.
 const EDIT_APRON: f32 = 2.0;
@@ -539,6 +542,24 @@ impl SdfTerrain {
         &self.volume
     }
 
+    /// The first ground along `ray`, whatever other bodies are in the way.
+    ///
+    /// # Errors
+    /// Fails on a bad ray.
+    pub fn raycast(
+        &self,
+        world: &PhysicsWorld,
+        ray: &Ray,
+    ) -> Result<Option<CastHit>, PhysicsError> {
+        world.raycast(
+            ray,
+            &QueryFilter {
+                mask: GROUND_LAYER,
+                ..QueryFilter::default()
+            },
+        )
+    }
+
     pub fn body_of(&self, key: BrickKey) -> Option<BodyHandle> {
         self.bodies.get(&key).map(|(body, _)| *body)
     }
@@ -568,7 +589,11 @@ impl SdfTerrain {
                 world.spawn(
                     RigidBodyDesc::fixed(shape)
                         .position(position)
-                        .material(self.volume.desc.material),
+                        .material(self.volume.desc.material)
+                        .filter(CollisionFilter {
+                            layers: CollisionFilter::default().layers | GROUND_LAYER,
+                            mask: u32::MAX,
+                        }),
                 )
             });
         match placed {
@@ -1052,6 +1077,43 @@ mod tests {
         );
         assert_eq!(many.volume().revision(), revision);
         assert!(SdfVolume::new_with(desc(hills()), &Lazy).is_err());
+    }
+
+    #[test]
+    fn a_ground_ray_ignores_bodies_in_the_way_and_they_still_land() {
+        let mut world = world();
+        let terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        // two overlapping balls right on the ray
+        let mut balls = Vec::new();
+        for y in [10.0, 10.5] {
+            balls.push(
+                world
+                    .spawn(
+                        RigidBodyDesc::dynamic(Shape::sphere(0.5))
+                            .position(GridPosition::from_local(Vec3::new(12.0, y, 12.0)).unwrap()),
+                    )
+                    .unwrap(),
+            );
+        }
+        let ray = Ray {
+            origin: GridPosition::from_local(Vec3::new(12.0, 20.0, 12.0)).unwrap(),
+            direction: Vec3::NEG_Y,
+            max_distance: 50.0,
+        };
+        let hit = terrain.raycast(&world, &ray).unwrap().unwrap();
+        assert!(terrain.bodies().any(|body| body == hit.body));
+        assert!((hit.distance - 12.0).abs() < 0.01, "{}", hit.distance);
+        let up = Ray {
+            direction: Vec3::Y,
+            ..ray
+        };
+        assert_eq!(terrain.raycast(&world, &up).unwrap(), None);
+        // the bit changes nothing for collisions
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        let y = world.body_state(balls[0]).unwrap().position.to_dvec3().y;
+        assert!((y - 8.5).abs() < 0.1, "{y}");
     }
 
     #[test]
