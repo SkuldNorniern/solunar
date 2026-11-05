@@ -27,7 +27,7 @@ pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
-pub use inspect::ContactView;
+pub use inspect::{ContactView, IslandStats};
 pub use joint::{
     JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,
     Joints,

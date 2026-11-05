@@ -103,7 +103,7 @@ pub struct PhysicsWorld {
     pub(crate) contact_cache: Vec<CachedManifold>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
-    contact_scratch: ContactScratch,
+    pub(crate) contact_scratch: ContactScratch,
     sleep: SleepScratch,
     scratch: Vec<Integrated>,
     frame_gravity: Vec<Vec3>,
@@ -876,7 +876,7 @@ mod tests {
     use algebrix::IVec3;
 
     use super::*;
-    use crate::{CELL_SIZE, Shape};
+    use crate::{CELL_SIZE, IslandStats, Shape};
 
     fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
@@ -927,6 +927,94 @@ mod tests {
         }
 
         fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
+    }
+
+    fn island_scene() -> PhysicsWorld {
+        let mut world = world();
+        let ground = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(30.0, 1.0, 30.0)))
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+        for x in [-6.0_f32, 0.0, 6.0] {
+            for i in 0..5 {
+                world
+                    .spawn(cube().local_position(Vec3::new(x, 0.51 + i as f32 * 1.01, 0.0)))
+                    .unwrap();
+            }
+        }
+        let post = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(Vec3::new(0.0, 8.0, 6.0)),
+            )
+            .unwrap();
+        let mut last = post;
+        for i in 1..=4 {
+            let at = Vec3::new(i as f32 * 0.8, 8.0, 6.0);
+            let ball = world
+                .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.2)).local_position(at))
+                .unwrap();
+            let anchor = GridPosition::from_local(at - Vec3::X * 0.4).unwrap();
+            let joint = world
+                .joint_at(JointDesc::ball(last, ball), anchor, Quat::IDENTITY)
+                .unwrap();
+            world.add_joint(joint).unwrap();
+            last = ball;
+        }
+        let door = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(0.5, 1.0, 0.05)))
+                    .local_position(Vec3::new(-5.5, 1.2, 6.0))
+                    .angular_velocity(Vec3::Y * 2.0),
+            )
+            .unwrap();
+        let hinge = world
+            .joint_at(
+                JointDesc::hinge(ground, door),
+                GridPosition::from_local(Vec3::new(-6.0, 1.2, 6.0)).unwrap(),
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            )
+            .unwrap();
+        world.add_joint(hinge).unwrap();
+        world
+    }
+
+    #[test]
+    fn islands_split_at_static_bodies_and_join_by_joints() {
+        let mut world = island_scene();
+        assert_eq!(world.island_stats(), IslandStats::default());
+        world.step_fixed().unwrap();
+        // three stacks on the ground, the chain on its post, the door on its hinge
+        let stats = world.island_stats();
+        assert_eq!(stats.count, 5, "{stats:?}");
+        assert_eq!(stats.largest_bodies, 5);
+        // four contacts and their manifolds per stack, chain links count as joints
+        assert!(stats.largest_constraints >= 5, "{stats:?}");
+    }
+
+    #[test]
+    fn sleeping_stacks_leave_the_islands() {
+        let mut world = island_scene();
+        for _ in 0..600 {
+            world.step_fixed().unwrap();
+        }
+        let stats = world.island_stats();
+        assert!(stats.count < 5, "{stats:?}");
+        assert_eq!(
+            world.sleeping_body_count() + count_awake_dynamic(&world),
+            15 + 5
+        );
+    }
+
+    fn count_awake_dynamic(world: &PhysicsWorld) -> usize {
+        world
+            .body_handles()
+            .filter(|body| {
+                let state = world.body_state(*body).unwrap();
+                state.kind == BodyKind::Dynamic && !state.asleep
+            })
+            .count()
     }
 
     #[test]

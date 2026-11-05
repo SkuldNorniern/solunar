@@ -76,6 +76,102 @@ pub(crate) struct ContactScratch {
     joint_points: Vec<JointPoint>,
     joint_rows: Vec<JointRow>,
     joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
+    islands: Islands,
+}
+
+/// Awake dynamic bodies joined by contacts and joints. Static, kinematic and sleeping bodies
+/// never join two islands. Each island's constraints sit together, in the order they had.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Islands {
+    parent: Vec<u32>,
+    /// Island of each dense body, `NONE` when it is not awake and dynamic.
+    of: Vec<u32>,
+    bodies: Vec<u32>,
+    manifold_ends: Vec<u32>,
+    point_ends: Vec<u32>,
+    row_ends: Vec<u32>,
+    spare_manifolds: Vec<SolverManifold>,
+    spare_points: Vec<JointPoint>,
+    spare_rows: Vec<JointRow>,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl Islands {
+    fn find(&mut self, mut dense: usize) -> usize {
+        while self.parent[dense] as usize != dense {
+            let up = self.parent[dense] as usize;
+            self.parent[dense] = self.parent[up];
+            dense = up;
+        }
+        dense
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (a, b) = (self.find(a), self.find(b));
+        // the lower index stays the root, so the result does not depend on link order
+        if a != b {
+            let (low, high) = (a.min(b), a.max(b));
+            self.parent[high] = low as u32;
+        }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Bodies and constraints in each island, in island order. Constraints count joint rows
+    /// from the last substep.
+    pub(crate) fn sizes(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (0..self.count()).map(|island| {
+            let span = |ends: &[u32]| {
+                let start = if island == 0 { 0 } else { ends[island - 1] };
+                (ends[island] - start) as usize
+            };
+            let constraints =
+                span(&self.manifold_ends) + span(&self.point_ends) + span(&self.row_ends);
+            (self.bodies[island] as usize, constraints)
+        })
+    }
+
+    fn range(ends: &[u32], island: usize) -> std::ops::Range<usize> {
+        let start = if island == 0 { 0 } else { ends[island - 1] };
+        start as usize..ends[island] as usize
+    }
+}
+
+/// Puts items of island 0 first, then 1 and on, keeping their order inside an island.
+fn group<T: Copy>(
+    items: &mut [T],
+    spare: &mut Vec<T>,
+    count: usize,
+    island: impl Fn(&T) -> u32,
+    ends: &mut Vec<u32>,
+) {
+    ends.clear();
+    ends.resize(count, 0);
+    for item in items.iter() {
+        ends[island(item) as usize] += 1;
+    }
+    let mut next = 0;
+    for end in ends.iter_mut() {
+        let size = *end;
+        *end = next;
+        next += size;
+    }
+    spare.clear();
+    spare.extend_from_slice(items);
+    for item in spare.iter() {
+        let slot = &mut ends[island(item) as usize];
+        items[*slot as usize] = *item;
+        *slot += 1;
+    }
+}
+
+impl ContactScratch {
+    pub(crate) fn islands(&self) -> &Islands {
+        &self.islands
+    }
 }
 
 impl ContactScratch {
@@ -167,6 +263,7 @@ pub(crate) fn prepare_contacts(
     dt: f32,
 ) {
     build_manifolds(bodies, awake, joints, state, cache, scratch, dt);
+    find_islands(bodies, awake, joints, scratch);
     scratch.joint_impulses.clear();
     scratch
         .joint_impulses
@@ -174,6 +271,61 @@ pub(crate) fn prepare_contacts(
             slot.state
                 .map_or([0.0; JOINT_IMPULSES], |live| live.impulses)
         }));
+}
+
+fn find_islands(bodies: &Bodies, awake: &[bool], joints: &Joints, scratch: &mut ContactScratch) {
+    let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
+    let islands = &mut scratch.islands;
+    let count = bodies.len();
+    islands.parent.clear();
+    islands.parent.extend(0..count as u32);
+    for manifold in &scratch.manifolds {
+        if active(manifold.a) && active(manifold.b) {
+            islands.union(manifold.a, manifold.b);
+        }
+    }
+    for (_, state) in joints.live() {
+        let (Ok(a), Ok(b)) = (
+            bodies.dense_index(state.desc.a),
+            bodies.dense_index(state.desc.b),
+        ) else {
+            continue;
+        };
+        if active(a) && active(b) {
+            islands.union(a, b);
+        }
+    }
+    islands.of.clear();
+    islands.of.resize(count, NONE);
+    islands.bodies.clear();
+    for dense in 0..count {
+        if !active(dense) {
+            continue;
+        }
+        let root = islands.find(dense);
+        if islands.of[root] == NONE {
+            islands.of[root] = islands.bodies.len() as u32;
+            islands.bodies.push(0);
+        }
+        let island = islands.of[root];
+        islands.of[dense] = island;
+        islands.bodies[island as usize] += 1;
+    }
+    let islands = &mut scratch.islands;
+    let of = &islands.of;
+    group(
+        &mut scratch.manifolds,
+        &mut islands.spare_manifolds,
+        islands.bodies.len(),
+        |manifold| {
+            if of[manifold.a] != NONE {
+                of[manifold.a]
+            } else {
+                of[manifold.b]
+            }
+        },
+        &mut islands.manifold_ends,
+    );
 }
 
 /// One substep of velocities. Joints rebuild from the moved bodies, contacts refresh their gaps.
@@ -196,58 +348,92 @@ pub(crate) fn solve_substep(
         &mut scratch.joint_rows,
         dt,
     );
+    let islands = &mut scratch.islands;
+    let count = islands.count();
+    let of = &islands.of;
+    let pair = |(a, b): (usize, usize)| if of[a] != NONE { of[a] } else { of[b] };
+    group(
+        &mut scratch.joint_points,
+        &mut islands.spare_points,
+        count,
+        |point| pair(point.bodies()),
+        &mut islands.point_ends,
+    );
+    group(
+        &mut scratch.joint_rows,
+        &mut islands.spare_rows,
+        count,
+        |row| pair(row.bodies()),
+        &mut islands.row_ends,
+    );
     for manifold in &mut scratch.manifolds {
         refresh_manifold(state, manifold, last, dt);
     }
-    for point in &scratch.joint_points {
-        warm_start_point(bodies, state, point);
-    }
-    for row in &scratch.joint_rows {
-        warm_start_row(state, row);
-    }
-    for manifold in &scratch.manifolds {
-        warm_start(bodies, state, manifold);
-    }
-    // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
-    for iteration in 0..VELOCITY_ITERATIONS {
-        if (substep as usize + iteration).is_multiple_of(2) {
-            for point in &mut scratch.joint_points {
-                solve_point(bodies, state, point);
-            }
-            for row in &mut scratch.joint_rows {
-                solve_row(state, row);
-            }
-            for manifold in &mut scratch.manifolds {
-                solve_manifold(bodies, state, manifold);
-            }
-        } else {
-            for manifold in scratch.manifolds.iter_mut().rev() {
-                solve_manifold(bodies, state, manifold);
-            }
-            for row in scratch.joint_rows.iter_mut().rev() {
-                solve_row(state, row);
-            }
-            for point in scratch.joint_points.iter_mut().rev() {
-                solve_point(bodies, state, point);
-            }
-        }
-    }
-    for _ in 0..RECOVERY_ITERATIONS {
-        for point in &mut scratch.joint_points {
-            solve_point_recovery(bodies, state, point);
-        }
-        for row in &mut scratch.joint_rows {
-            solve_row_recovery(state, row);
-        }
-        for manifold in &mut scratch.manifolds {
-            solve_recovery(bodies, state, manifold);
-        }
+    for island in 0..count {
+        let islands = &scratch.islands;
+        let points = &mut scratch.joint_points[Islands::range(&islands.point_ends, island)];
+        let rows = &mut scratch.joint_rows[Islands::range(&islands.row_ends, island)];
+        let manifolds = &mut scratch.manifolds[Islands::range(&islands.manifold_ends, island)];
+        solve_island(bodies, state, (points, rows, manifolds), substep);
     }
     capture_impulses(
         &scratch.joint_points,
         &scratch.joint_rows,
         &mut scratch.joint_impulses,
     );
+}
+
+/// Islands share no moving body, so solving one after another gives what one big sweep did.
+fn solve_island(
+    bodies: &Bodies,
+    state: &mut [Integrated],
+    (points, rows, manifolds): (&mut [JointPoint], &mut [JointRow], &mut [SolverManifold]),
+    substep: u32,
+) {
+    for point in points.iter() {
+        warm_start_point(bodies, state, point);
+    }
+    for row in rows.iter() {
+        warm_start_row(state, row);
+    }
+    for manifold in manifolds.iter() {
+        warm_start(bodies, state, manifold);
+    }
+    // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
+    for iteration in 0..VELOCITY_ITERATIONS {
+        if (substep as usize + iteration).is_multiple_of(2) {
+            for point in points.iter_mut() {
+                solve_point(bodies, state, point);
+            }
+            for row in rows.iter_mut() {
+                solve_row(state, row);
+            }
+            for manifold in manifolds.iter_mut() {
+                solve_manifold(bodies, state, manifold);
+            }
+        } else {
+            for manifold in manifolds.iter_mut().rev() {
+                solve_manifold(bodies, state, manifold);
+            }
+            for row in rows.iter_mut().rev() {
+                solve_row(state, row);
+            }
+            for point in points.iter_mut().rev() {
+                solve_point(bodies, state, point);
+            }
+        }
+    }
+    for _ in 0..RECOVERY_ITERATIONS {
+        for point in points.iter_mut() {
+            solve_point_recovery(bodies, state, point);
+        }
+        for row in rows.iter_mut() {
+            solve_row_recovery(state, row);
+        }
+        for manifold in manifolds.iter_mut() {
+            solve_recovery(bodies, state, manifold);
+        }
+    }
 }
 
 /// Bodies moved since the contacts were found, so gaps and arms follow them.
@@ -673,6 +859,8 @@ fn tangent_of(normal: Vec3) -> Vec3 {
 mod tests {
     use algebrix::IVec3;
 
+    use super::{Islands, group};
+
     use crate::{
         BodyHandle, CollisionFilter, FrameDesc, FrameId, GridPosition, Material, PhysicsSettings,
         PhysicsWorld, Quat, RigidBodyDesc, Shape, Vec3,
@@ -709,6 +897,17 @@ mod tests {
 
     fn y(world: &PhysicsWorld, body: BodyHandle) -> f32 {
         world.body_state(body).unwrap().position.local.y
+    }
+
+    #[test]
+    fn grouping_keeps_order_inside_each_island() {
+        let mut items = vec![(1, 'a'), (0, 'b'), (2, 'c'), (0, 'd'), (1, 'e')];
+        let (mut spare, mut ends) = (Vec::new(), Vec::new());
+        group(&mut items, &mut spare, 3, |item| item.0, &mut ends);
+        let order: String = items.iter().map(|item| item.1).collect();
+        assert_eq!(order, "bdaec");
+        assert_eq!(ends, [2, 4, 5]);
+        assert_eq!(Islands::range(&ends, 1), 2..4);
     }
 
     #[test]

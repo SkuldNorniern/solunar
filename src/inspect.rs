@@ -13,8 +13,29 @@ pub struct ContactView {
     pub load: f32,
 }
 
+/// Islands solved in the last step. Sleeping islands are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IslandStats {
+    pub count: usize,
+    pub largest_bodies: usize,
+    pub largest_constraints: usize,
+}
+
 /// Read only views for tools and debug drawing. Nothing here changes the simulation.
 impl PhysicsWorld {
+    pub fn island_stats(&self) -> IslandStats {
+        let islands = self.contact_scratch.islands();
+        let mut stats = IslandStats {
+            count: islands.count(),
+            ..IslandStats::default()
+        };
+        for (bodies, constraints) in islands.sizes() {
+            stats.largest_bodies = stats.largest_bodies.max(bodies);
+            stats.largest_constraints = stats.largest_constraints.max(constraints);
+        }
+        stats
+    }
+
     pub fn body_handles(&self) -> impl Iterator<Item = BodyHandle> + '_ {
         (0..self.bodies.len()).map(|dense| self.bodies.handle_at(dense))
     }

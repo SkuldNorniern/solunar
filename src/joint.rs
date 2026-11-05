@@ -451,6 +451,18 @@ impl Joints {
 }
 
 /// Keeps this substep's impulses for the next one to start from.
+impl JointPoint {
+    pub(crate) fn bodies(&self) -> (usize, usize) {
+        (self.a, self.b)
+    }
+}
+
+impl JointRow {
+    pub(crate) fn bodies(&self) -> (usize, usize) {
+        (self.a, self.b)
+    }
+}
+
 pub(crate) fn capture_impulses(
     points: &[JointPoint],
     rows: &[JointRow],
