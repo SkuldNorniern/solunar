@@ -138,6 +138,15 @@ impl<'a, T: Copy> Shared<'a, T> {
     }
 
     /// # Safety
+    /// No other job may use `start..start + len` while the slice lives.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
+        assert!(start <= self.len && len <= self.len - start);
+        // SAFETY: in bounds, and the caller gives the range to one job only.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(start), len) }
+    }
+
+    /// # Safety
     /// No other job may use `index` while the reference lives.
     #[allow(clippy::mut_from_ref)]
     unsafe fn get(&self, index: usize) -> &mut T {
@@ -166,22 +175,25 @@ pub(crate) struct CachedManifold {
 
 /// `arm_a[k]` is `offset_a × axes[k]`, `turn_a[k]` the spin of A per unit impulse along it.
 /// Both are worked out once a substep, the iterations only scale and add them.
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct SolverPoint {
-    offset_a: Vec3,
-    offset_b: Vec3,
     arm_a: [Vec3; 3],
     arm_b: [Vec3; 3],
     turn_a: [Vec3; 3],
     turn_b: [Vec3; 3],
     mass: Vec3,
     target: f32,
-    bounce: f32,
     recovery: f32,
     recovery_impulse: f32,
     impulse: Vec3,
+}
+
+/// What a contact point keeps that the iterations never read, apart so a pass reads less.
+#[derive(Debug, Clone, Copy, Default)]
+struct PointFrame {
     local_a: Vec3,
     local_b: Vec3,
+    bounce: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +208,8 @@ struct SolverManifold {
     friction: f32,
     /// Zero for bodies that are not dynamic, they are never pushed.
     inverse_mass: [f32; 2],
-    points: [SolverPoint; MAX_CONTACTS],
+    /// Its points are `first..first + count` in the scratch point lists.
+    first: usize,
     count: usize,
 }
 
@@ -207,6 +220,8 @@ pub(crate) struct ContactScratch {
     pairs: Vec<(u32, u32)>,
     moving: MovingPairs,
     manifolds: Vec<SolverManifold>,
+    points: Vec<SolverPoint>,
+    frames: Vec<PointFrame>,
     joint_points: Vec<JointPoint>,
     joint_rows: Vec<JointRow>,
     joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
@@ -524,8 +539,10 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    for manifold in &mut scratch.manifolds {
-        refresh_manifold(bodies, state, manifold, last, dt);
+    for manifold in &scratch.manifolds {
+        let range = manifold.first..manifold.first + manifold.count;
+        let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
+        refresh_manifold(bodies, state, manifold, points, last, dt);
     }
     color_constraints(bodies, scratch);
     scratch.motions.clear();
@@ -541,6 +558,7 @@ pub(crate) fn solve_substep(
         Shared::new(&mut scratch.joint_points),
         Shared::new(&mut scratch.joint_rows),
         Shared::new(&mut scratch.manifolds),
+        Shared::new(&mut scratch.points),
     );
     plan_stages(&mut scratch.colors, substep);
     let colors = &scratch.colors;
@@ -880,12 +898,13 @@ type SharedParts<'a> = (
     Shared<'a, JointPoint>,
     Shared<'a, JointRow>,
     Shared<'a, SolverManifold>,
+    Shared<'a, SolverPoint>,
 );
 
 /// # Safety
 /// No other running job may use this constraint or its dynamic bodies.
 unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass: Pass) {
-    let (states, points, rows, manifolds) = shared;
+    let (states, points, rows, manifolds, contacts) = shared;
     let (a, b) = match item {
         // SAFETY: the caller gives this constraint to this job only.
         Item::Point(index) => unsafe { points.get(index as usize) }.bodies(),
@@ -931,10 +950,12 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
         }
         Item::Manifold(index) => {
             let manifold = unsafe { manifolds.get(index as usize) };
+            // SAFETY: a manifold's points are its own, and the manifold is this job's.
+            let points = unsafe { contacts.slice(manifold.first, manifold.count) };
             match pass {
-                Pass::WarmStart => warm_start(&mut pair, manifold),
-                Pass::Velocity => solve_manifold(&mut pair, manifold),
-                Pass::Recovery => solve_recovery(&mut pair, manifold),
+                Pass::WarmStart => warm_start(&mut pair, manifold, points),
+                Pass::Velocity => solve_manifold(&mut pair, manifold, points),
+                Pass::Recovery => solve_recovery(&mut pair, manifold, points),
             }
         }
     }
@@ -944,7 +965,8 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
 fn refresh_manifold(
     bodies: &Bodies,
     state: &[Integrated],
-    manifold: &mut SolverManifold,
+    manifold: &SolverManifold,
+    (points, frames): (&mut [SolverPoint], &[PointFrame]),
     last: bool,
     dt: f32,
 ) {
@@ -959,13 +981,13 @@ fn refresh_manifold(
             Vec3::ZERO
         }
     };
-    for point in &mut manifold.points[..manifold.count] {
-        point.offset_a = a.rotation.rotate_vec3(point.local_a);
-        point.offset_b = b.rotation.rotate_vec3(point.local_b);
+    for (point, frame) in points.iter_mut().zip(frames) {
+        let offset_a = a.rotation.rotate_vec3(frame.local_a);
+        let offset_b = b.rotation.rotate_vec3(frame.local_b);
         let mut mass = [0.0; 3];
         for (k, axis) in manifold.axes.iter().enumerate() {
-            point.arm_a[k] = point.offset_a.cross(*axis);
-            point.arm_b[k] = point.offset_b.cross(*axis);
+            point.arm_a[k] = offset_a.cross(*axis);
+            point.arm_b[k] = offset_b.cross(*axis);
             point.turn_a[k] = response(manifold.a, a.rotation, point.arm_a[k]);
             point.turn_b[k] = response(manifold.b, b.rotation, point.arm_b[k]);
             let inverse = inverse_a
@@ -979,22 +1001,16 @@ fn refresh_manifold(
             };
         }
         point.mass = Vec3::new(mass[0], mass[1], mass[2]);
-        let gap = (center_b + point.offset_b - point.offset_a).dot(normal);
+        let gap = (center_b + offset_b - offset_a).dot(normal);
         // still apart it may close the gap, and only arriving can bounce. arriving in the last
         // substep would clamp the speed the next step's bounce is worked out from, so it bounces now
-        let speed = relative_velocity(
-            state,
-            manifold.a,
-            manifold.b,
-            point.offset_a,
-            point.offset_b,
-        )
-        .dot(normal);
+        let speed =
+            relative_velocity(state, manifold.a, manifold.b, offset_a, offset_b).dot(normal);
         let arrives = -speed * dt >= gap;
-        point.target = if gap > 0.0 && !(last && arrives && point.bounce > 0.0) {
+        point.target = if gap > 0.0 && !(last && arrives && frame.bounce > 0.0) {
             -gap / dt
         } else {
-            point.bounce
+            frame.bounce
         };
         point.recovery =
             (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
@@ -1019,9 +1035,13 @@ pub(crate) fn finish_contacts(
     );
     for manifold in &scratch.manifolds {
         let mut points = [CachedPoint::default(); MAX_CONTACTS];
-        for (out, point) in points.iter_mut().zip(&manifold.points[..manifold.count]) {
+        let range = manifold.first..manifold.first + manifold.count;
+        let solved = scratch.points[range.clone()]
+            .iter()
+            .zip(&scratch.frames[range]);
+        for (out, (point, frame)) in points.iter_mut().zip(solved) {
             *out = CachedPoint {
-                local_a: point.local_a,
+                local_a: frame.local_a,
                 impulse: point.impulse,
             };
         }
@@ -1048,6 +1068,8 @@ fn build_manifolds(
 ) {
     let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
     scratch.manifolds.clear();
+    scratch.points.clear();
+    scratch.frames.clear();
     for &(first, second) in &scratch.pairs {
         let (mut a, mut b) = (first as usize, second as usize);
         if !active(a) && !active(b) {
@@ -1065,6 +1087,7 @@ fn build_manifolds(
         }
         let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
         let manifolds = &mut scratch.manifolds;
+        let points = (&mut scratch.points, &mut scratch.frames);
         bodies.assets.for_each_contact(
             (&bodies.shape[a], bodies.rotation[a]),
             (&bodies.shape[b], bodies.rotation[b]),
@@ -1081,6 +1104,7 @@ fn build_manifolds(
                     raw,
                     at_a,
                     center_b,
+                    (&mut *points.0, &mut *points.1),
                     dt,
                 ));
             },
@@ -1106,6 +1130,7 @@ fn contact_manifold(
     raw: &RawManifold,
     at_a: Vec3,
     center_b: Vec3,
+    (points, frames): (&mut Vec<SolverPoint>, &mut Vec<PointFrame>),
     dt: f32,
 ) -> SolverManifold {
     let (handle_a, handle_b) = (bodies.handle_at(a), bodies.handle_at(b));
@@ -1121,7 +1146,7 @@ fn contact_manifold(
     let axes = [normal, tangent, normal.cross(tangent)];
     let (material_a, material_b) = (&bodies.material[a], &bodies.material[b]);
     let restitution = material_a.restitution.max(material_b.restitution);
-    let mut manifold = SolverManifold {
+    let manifold = SolverManifold {
         a,
         b,
         handle_a,
@@ -1134,13 +1159,13 @@ fn contact_manifold(
             dynamic_inverse_mass(bodies, a),
             dynamic_inverse_mass(bodies, b),
         ],
-        points: [SolverPoint::default(); MAX_CONTACTS],
+        first: points.len(),
         count: raw.count,
     };
     let inverse_rotation_a = bodies.rotation[a].conjugate();
     let inverse_rotation_b = bodies.rotation[b].conjugate();
     let mut claimed = [false; MAX_CONTACTS];
-    for (out, point) in manifold.points.iter_mut().zip(&raw.points[..raw.count]) {
+    for point in &raw.points[..raw.count] {
         // raw points sit between the surfaces, each side anchors on its own. an anchor out in the
         // gap would swing on a long lever as soon as the body turned
         let middle = point.position + at_a;
@@ -1155,15 +1180,15 @@ fn contact_manifold(
         } else {
             0.0
         };
-        *out = SolverPoint {
-            offset_a,
-            offset_b,
-            bounce,
+        points.push(SolverPoint {
             impulse: matching_impulse(old, local_a, &mut claimed),
+            ..SolverPoint::default()
+        });
+        frames.push(PointFrame {
             local_a,
             local_b,
-            ..SolverPoint::default()
-        };
+            bounce,
+        });
     }
     manifold
 }
@@ -1192,8 +1217,8 @@ fn matching_impulse(
     })
 }
 
-fn warm_start(pair: &mut Pair, manifold: &SolverManifold) {
-    for point in &manifold.points[..manifold.count] {
+fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &[SolverPoint]) {
+    for point in points {
         for k in 0..3 {
             push(
                 pair,
@@ -1206,10 +1231,10 @@ fn warm_start(pair: &mut Pair, manifold: &SolverManifold) {
     }
 }
 
-fn solve_manifold(pair: &mut Pair, manifold: &mut SolverManifold) {
+fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
     let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
     let friction = manifold.friction;
-    for point in &mut manifold.points[..manifold.count] {
+    for point in points {
         // friction first, so the normal impulse has the last word on penetration
         let limit = (friction * point.impulse.x).max(0.0);
         for k in 1..3 {
@@ -1229,10 +1254,10 @@ fn solve_manifold(pair: &mut Pair, manifold: &mut SolverManifold) {
 }
 
 /// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
-fn solve_recovery(pair: &mut Pair, manifold: &mut SolverManifold) {
+fn solve_recovery(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
     let normal = manifold.axes[0];
     let [inverse_a, inverse_b] = manifold.inverse_mass;
-    for point in &mut manifold.points[..manifold.count] {
+    for point in points {
         let (a, b) = (&mut *pair.a, &mut *pair.b);
         let speed = (b.recovery_linear - a.recovery_linear).dot(normal)
             + b.recovery_angular.dot(point.arm_b[0])
