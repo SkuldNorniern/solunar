@@ -1,8 +1,8 @@
 use std::any::Any;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use algebrix::Vec3;
 
@@ -13,7 +13,7 @@ use crate::joint::{
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
 use crate::world::Integrated;
-use crate::{BodyHandle, BodyKind, JobDispatch, Shape};
+use crate::{BodyHandle, BodyKind, JobDispatch, PhysicsError, Shape};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
@@ -31,6 +31,8 @@ const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
 const COLOR_CHUNK: usize = if cfg!(miri) { 2 } else { 64 };
 /// Below this many blocks in a substep the solve stays on the calling thread.
 const PARALLEL_BLOCKS: usize = if cfg!(miri) { 2 } else { 8 };
+/// Pairs in one job of contact finding. Fixed, so the output does not depend on the thread count.
+const PAIR_CHUNK: usize = 128;
 /// Spins before a waiting thread yields.
 const SPINS: u32 = 64;
 /// Colors smaller than this, next to each other, go in one block, one color after another.
@@ -213,6 +215,15 @@ struct SolverManifold {
     count: usize,
 }
 
+/// What one job of contact finding made. `first` in its manifolds is local to it.
+#[derive(Debug, Clone, Default)]
+struct FoundContacts {
+    manifolds: Vec<SolverManifold>,
+    points: Vec<SolverPoint>,
+    frames: Vec<PointFrame>,
+    done: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContactScratch {
     bounds: Vec<Bounds>,
@@ -222,6 +233,7 @@ pub(crate) struct ContactScratch {
     manifolds: Vec<SolverManifold>,
     points: Vec<SolverPoint>,
     frames: Vec<PointFrame>,
+    found: Vec<FoundContacts>,
     joint_points: Vec<JointPoint>,
     joint_rows: Vec<JointRow>,
     joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
@@ -428,6 +440,7 @@ pub(crate) fn add_woken_pairs(bodies: &Bodies, awake: &[bool], scratch: &mut Con
 }
 
 /// Finds contacts once per step and loads the working joint impulses.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_contacts(
     bodies: &Bodies,
     awake: &[bool],
@@ -435,9 +448,10 @@ pub(crate) fn prepare_contacts(
     state: &[Integrated],
     cache: &[CachedManifold],
     scratch: &mut ContactScratch,
+    dispatch: &dyn JobDispatch,
     dt: f32,
-) {
-    build_manifolds(bodies, awake, joints, state, cache, scratch, dt);
+) -> Result<(), PhysicsError> {
+    build_manifolds(bodies, awake, joints, state, cache, scratch, dispatch, dt)?;
     find_islands(bodies, awake, joints, scratch);
     scratch.joint_impulses.clear();
     scratch
@@ -446,6 +460,7 @@ pub(crate) fn prepare_contacts(
             slot.state
                 .map_or([0.0; JOINT_IMPULSES], |live| live.impulses)
         }));
+    Ok(())
 }
 
 fn find_islands(bodies: &Bodies, awake: &[bool], joints: &Joints, scratch: &mut ContactScratch) {
@@ -1118,6 +1133,7 @@ pub(crate) fn finish_contacts(
     cache.sort_unstable_by_key(|entry| (entry.a, entry.b, entry.part_a, entry.part_b));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_manifolds(
     bodies: &Bodies,
     awake: &[bool],
@@ -1125,13 +1141,77 @@ fn build_manifolds(
     state: &[Integrated],
     cache: &[CachedManifold],
     scratch: &mut ContactScratch,
+    dispatch: &dyn JobDispatch,
     dt: f32,
-) {
-    let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
+) -> Result<(), PhysicsError> {
+    let chunks = scratch.pairs.len().div_ceil(PAIR_CHUNK);
+    scratch.found.resize_with(chunks, FoundContacts::default);
+    let find = |at: usize, out: &mut FoundContacts| {
+        out.manifolds.clear();
+        out.points.clear();
+        out.frames.clear();
+        let start = at * PAIR_CHUNK;
+        let pairs = &scratch.pairs[start..(start + PAIR_CHUNK).min(scratch.pairs.len())];
+        find_contacts(bodies, awake, joints, state, cache, pairs, out, dt);
+        out.done = true;
+    };
+    if chunks < 2 || dispatch.parallelism() < 2 {
+        for (at, out) in scratch.found.iter_mut().enumerate() {
+            find(at, out);
+        }
+    } else {
+        let slots: Vec<Mutex<&mut FoundContacts>> =
+            scratch.found.iter_mut().map(Mutex::new).collect();
+        dispatch.run(chunks, &|at| {
+            if let Some(slot) = slots.get(at) {
+                let mut out = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                find(at, &mut out);
+            }
+        });
+    }
     scratch.manifolds.clear();
     scratch.points.clear();
     scratch.frames.clear();
-    for &(first, second) in &scratch.pairs {
+    let mut all_done = true;
+    for out in &mut scratch.found {
+        all_done &= std::mem::take(&mut out.done);
+        let base = scratch.points.len();
+        scratch
+            .manifolds
+            .extend(out.manifolds.iter().map(|manifold| SolverManifold {
+                first: manifold.first + base,
+                ..*manifold
+            }));
+        scratch.points.extend_from_slice(&out.points);
+        scratch.frames.extend_from_slice(&out.frames);
+    }
+    if !all_done {
+        return Err(PhysicsError::DispatchIncomplete);
+    }
+    scratch.manifolds.sort_unstable_by_key(|manifold| {
+        (
+            manifold.handle_a,
+            manifold.handle_b,
+            manifold.part_a,
+            manifold.part_b,
+        )
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_contacts(
+    bodies: &Bodies,
+    awake: &[bool],
+    joints: &Joints,
+    state: &[Integrated],
+    cache: &[CachedManifold],
+    pairs: &[(u32, u32)],
+    out: &mut FoundContacts,
+    dt: f32,
+) {
+    let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
+    for &(first, second) in pairs {
         let (mut a, mut b) = (first as usize, second as usize);
         if !active(a) && !active(b) {
             continue;
@@ -1147,8 +1227,7 @@ fn build_manifolds(
             std::mem::swap(&mut a, &mut b);
         }
         let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
-        let manifolds = &mut scratch.manifolds;
-        let points = (&mut scratch.points, &mut scratch.frames);
+        let (manifolds, points, frames) = (&mut out.manifolds, &mut out.points, &mut out.frames);
         bodies.assets.for_each_contact(
             (&bodies.shape[a], bodies.rotation[a]),
             (&bodies.shape[b], bodies.rotation[b]),
@@ -1165,20 +1244,12 @@ fn build_manifolds(
                     raw,
                     at_a,
                     center_b,
-                    (&mut *points.0, &mut *points.1),
+                    (&mut *points, &mut *frames),
                     dt,
                 ));
             },
         );
     }
-    scratch.manifolds.sort_unstable_by_key(|manifold| {
-        (
-            manifold.handle_a,
-            manifold.handle_b,
-            manifold.part_a,
-            manifold.part_b,
-        )
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1893,6 +1964,30 @@ mod tests {
             world.state_hash()
         };
         assert_eq!(run(&Workers(3)), run(&Sequential));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_dispatcher_skipping_contact_jobs_fails_and_leaves_state() {
+        struct Skips;
+        impl JobDispatch for Skips {
+            fn parallelism(&self) -> usize {
+                2
+            }
+
+            fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
+        }
+        // under the size where integration dispatches, so contact finding is what skips
+        let (mut world, _, _) = pyramid(40);
+        assert!(world.body_count() < 1024);
+        world.step_fixed().unwrap();
+        let before = world.state_hash();
+        assert_eq!(
+            world.step_with(&Skips),
+            Err(crate::PhysicsError::DispatchIncomplete)
+        );
+        assert_eq!(world.state_hash(), before);
+        world.step_fixed().unwrap();
     }
 
     #[test]

@@ -694,8 +694,9 @@ impl PhysicsWorld {
             &self.scratch,
             &self.contact_cache,
             &mut self.contact_scratch,
+            dispatch,
             dt,
-        );
+        )?;
         lap(&mut phases.narrowphase);
         for substep in 0..substeps {
             // outside forces were worked out at the start of the step, so they go in whole before
