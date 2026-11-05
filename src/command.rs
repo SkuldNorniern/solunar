@@ -1,7 +1,8 @@
-use algebrix::Vec3;
+use algebrix::{Quat, Vec3};
 
 use crate::{
-    BodyHandle, FrameId, JointDesc, JointDof, JointHandle, JointMotor, PhysicsError, RigidBodyDesc,
+    BodyHandle, FrameId, GridPosition, JointDesc, JointDof, JointHandle, JointMotor, PhysicsError,
+    RigidBodyDesc,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -13,6 +14,7 @@ pub enum Command {
     ApplyImpulse(BodyHandle, Vec3),
     ApplyImpulseAt(BodyHandle, Vec3, Vec3),
     SetVelocity(BodyHandle, Vec3, Vec3),
+    SetKinematicTarget(BodyHandle, GridPosition, Quat),
     TransferToFrame(BodyHandle, FrameId),
     Wake(BodyHandle),
     CreateJoint(JointDesc),

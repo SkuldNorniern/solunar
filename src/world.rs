@@ -444,6 +444,32 @@ impl PhysicsWorld {
         })
     }
 
+    /// Sets a kinematic body's velocity so the next step ends at `position` and `rotation`, in
+    /// its frame. It keeps that velocity after, set a new target or a velocity each step.
+    ///
+    /// # Errors
+    /// Fails on a stale handle, a body that is not kinematic, bad input or a target too far.
+    pub fn set_kinematic_target(
+        &mut self,
+        body: BodyHandle,
+        position: GridPosition,
+        rotation: Quat,
+    ) -> Result<(), PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        if self.bodies.kind[dense] != BodyKind::Kinematic {
+            return Err(PhysicsError::NotKinematic);
+        }
+        finite(position.local, "position")?;
+        if !rotation.is_finite() || rotation.length_squared() < 1e-12 {
+            return Err(PhysicsError::NonFinite("rotation"));
+        }
+        let dt = self.settings.fixed_timestep;
+        let travel = position.offset_from(self.bodies.position(dense)).as_vec3();
+        let turn =
+            (rotation.normalize() * self.bodies.rotation[dense].conjugate()).to_scaled_axis();
+        self.set_velocity(body, travel / dt, turn / dt)
+    }
+
     /// # Errors
     /// Fails on a stale handle, a static body or non finite input.
     pub fn set_velocity(
@@ -543,6 +569,9 @@ impl PhysicsWorld {
                 }
                 Command::SetVelocity(body, linear, angular) => {
                     self.set_velocity(body, linear, angular)
+                }
+                Command::SetKinematicTarget(body, position, rotation) => {
+                    self.set_kinematic_target(body, position, rotation)
                 }
                 Command::TransferToFrame(body, frame) => self.transfer_to_frame(body, frame),
                 Command::Wake(body) => self.wake(body),
@@ -876,7 +905,7 @@ mod tests {
     use algebrix::IVec3;
 
     use super::*;
-    use crate::{CELL_SIZE, IslandStats, Shape};
+    use crate::{CELL_SIZE, Command, CommandBuffer, IslandStats, Shape};
 
     fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
@@ -1015,6 +1044,40 @@ mod tests {
                 state.kind == BodyKind::Dynamic && !state.asleep
             })
             .count()
+    }
+
+    #[test]
+    fn a_kinematic_target_is_reached_in_one_step() {
+        let mut world = world();
+        let platform = world
+            .spawn(RigidBodyDesc::kinematic(Shape::cuboid(Vec3::ONE)))
+            .unwrap();
+        let target = GridPosition::from_local(Vec3::new(2.0, 1.0, -0.5)).unwrap();
+        let turn = Quat::from_rotation_y(1.2) * Quat::from_rotation_x(0.3);
+        let mut buffer = CommandBuffer::new();
+        buffer.push(Command::SetKinematicTarget(platform, target, turn));
+        assert!(world.apply_commands(&mut buffer).rejected.is_empty());
+        world.step_fixed().unwrap();
+        let state = world.body_state(platform).unwrap();
+        assert!(
+            (state.position.local - target.local).length() < 1e-4,
+            "{state:?}"
+        );
+        assert!(state.rotation.angle_between(turn) < 1e-4);
+        let dynamic = world.spawn(cube()).unwrap();
+        assert_eq!(
+            world.set_kinematic_target(dynamic, target, turn),
+            Err(PhysicsError::NotKinematic)
+        );
+        let nan = GridPosition::from_local(Vec3::ZERO).map(|mut at| {
+            at.local.x = f32::NAN;
+            at
+        });
+        assert!(
+            world
+                .set_kinematic_target(platform, nan.unwrap(), turn)
+                .is_err()
+        );
     }
 
     #[test]
