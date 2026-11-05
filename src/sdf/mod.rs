@@ -71,6 +71,9 @@ struct Brick {
     mesh: BrickMesh,
     /// Edits that reach it, oldest first.
     edits: Vec<EditId>,
+    /// Samples after the base and every edit, before the floor. Kept while the brick has edits,
+    /// so the next edit runs alone on top.
+    values: Option<Vec<f32>>,
 }
 
 /// What an edit or removal changed.
@@ -90,6 +93,7 @@ struct Rebuilt {
     key: BrickKey,
     inside: u64,
     mesh: BrickMesh,
+    values: Option<Vec<f32>>,
 }
 
 /// Ground as a signed distance field: a base and ordered edits, sampled in sparse bricks. Only
@@ -130,6 +134,7 @@ impl SdfVolume {
                                 inside: built.inside,
                                 mesh: built.mesh,
                                 edits: Vec::new(),
+                                values: None,
                             },
                         );
                     }
@@ -150,6 +155,17 @@ impl SdfVolume {
 
     pub fn edit_count(&self) -> usize {
         self.edits.len()
+    }
+
+    /// Bricks keeping samples for the next edit, and the bytes they hold.
+    pub fn cached_bricks(&self) -> (usize, usize) {
+        let kept = self
+            .bricks
+            .values()
+            .filter_map(|brick| brick.values.as_ref());
+        kept.fold((0, 0), |(count, bytes), values| {
+            (count + 1, bytes + values.len() * size_of::<f32>())
+        })
     }
 
     /// Material volume in cubic meters, one lattice sample is one cell of it.
@@ -268,9 +284,7 @@ impl SdfVolume {
 
     /// Samples and meshes one brick from scratch.
     fn build(&self, key: BrickKey, edits: &[EditEntry]) -> Rebuilt {
-        let n = self.cells();
         let (low, high) = self.brick_samples(key);
-        let step = self.desc.voxel;
         if edits.is_empty()
             && let Some(solid) = self.uniform(low, high)
         {
@@ -283,9 +297,11 @@ impl SdfVolume {
                 key,
                 inside,
                 mesh: BrickMesh::default(),
+                values: None,
             };
         }
-        let side = (n + 2) as usize;
+        let side = self.side();
+        let step = self.desc.voxel;
         let mut values = vec![0.0_f32; side * side * side];
         for z in 0..side {
             for x in 0..side {
@@ -299,28 +315,64 @@ impl SdfVolume {
             }
         }
         for entry in edits {
-            let from = entry.low.max(low);
-            let to = entry.high.min(high);
-            for gz in from.z..=to.z {
-                for gy in from.y..=to.y {
-                    for gx in from.x..=to.x {
-                        let p = Vec3::new(gx as f32, gy as f32, gz as f32) * step;
-                        let slot = (gx - low.x) as usize
-                            + side * ((gy - low.y) as usize + side * (gz - low.z) as usize);
-                        values[slot] = entry
-                            .edit
-                            .op
-                            .apply(values[slot], entry.edit.shape.distance(p));
-                    }
+            self.apply(key, &mut values, entry);
+        }
+        self.finish(key, values)
+    }
+
+    /// One more edit on a brick: on its kept samples when it has them, else from scratch.
+    fn extend(&self, key: BrickKey, entry: &EditEntry) -> Rebuilt {
+        match self
+            .bricks
+            .get(&key)
+            .and_then(|brick| brick.values.as_ref())
+        {
+            Some(kept) => {
+                let mut values = kept.clone();
+                self.apply(key, &mut values, entry);
+                self.finish(key, values)
+            }
+            None => self.build(key, &self.entries_of(key, Some(entry), None)),
+        }
+    }
+
+    fn side(&self) -> usize {
+        (self.cells() + 2) as usize
+    }
+
+    fn apply(&self, key: BrickKey, values: &mut [f32], entry: &EditEntry) {
+        let (low, high) = self.brick_samples(key);
+        let side = self.side();
+        let step = self.desc.voxel;
+        let from = entry.low.max(low);
+        let to = entry.high.min(high);
+        for gz in from.z..=to.z {
+            for gy in from.y..=to.y {
+                for gx in from.x..=to.x {
+                    let p = Vec3::new(gx as f32, gy as f32, gz as f32) * step;
+                    let slot = (gx - low.x) as usize
+                        + side * ((gy - low.y) as usize + side * (gz - low.z) as usize);
+                    values[slot] = entry
+                        .edit
+                        .op
+                        .apply(values[slot], entry.edit.shape.distance(p));
                 }
             }
         }
+    }
+
+    /// Floor, material count and triangles from a brick's samples.
+    fn finish(&self, key: BrickKey, values: Vec<f32>) -> Rebuilt {
+        let (low, _) = self.brick_samples(key);
+        let side = self.side();
+        let step = self.desc.voxel;
         let floor = FLOOR_STEPS * step;
+        let mut floored = values.clone();
         for z in 0..side {
             for y in 0..side {
                 let gy = (low.y + y as i32) as f32 * step;
                 for x in 0..side {
-                    let slot = &mut values[x + side * (y + side * z)];
+                    let slot = &mut floored[x + side * (y + side * z)];
                     *slot = slot.min(gy - floor);
                 }
             }
@@ -329,14 +381,15 @@ impl SdfVolume {
         for z in 1..side - 1 {
             for y in 1..side - 1 {
                 for x in 1..side - 1 {
-                    inside += u64::from(values[x + side * (y + side * z)] < 0.0);
+                    inside += u64::from(floored[x + side * (y + side * z)] < 0.0);
                 }
             }
         }
         Rebuilt {
             key,
             inside,
-            mesh: nets::surface_nets(&values, side, step),
+            mesh: nets::surface_nets(&floored, side, step),
+            values: Some(values),
         }
     }
 
@@ -379,6 +432,11 @@ impl SdfVolume {
             brick.mesh = item.mesh;
             brick.revision = self.revision;
             edit_change(&mut brick.edits);
+            brick.values = if brick.edits.is_empty() {
+                None
+            } else {
+                item.values
+            };
         }
         self.bricks.retain(|_, brick| {
             brick.inside > 0 || !brick.mesh.is_empty() || !brick.edits.is_empty()
@@ -490,7 +548,12 @@ impl SdfTerrain {
         edit.shape.validate()?;
         let id = EditId(self.volume.next_edit);
         let entry = self.volume.entry(edit);
-        let rebuilt = self.volume.rebuild(&entry, Some(&entry), None);
+        let rebuilt = self
+            .volume
+            .reached(&entry)
+            .into_iter()
+            .map(|key| self.volume.extend(key, &entry))
+            .collect();
         let mut report = self.swap(world, rebuilt, |edits| edits.push(id))?;
         self.volume.edits.insert(id, entry);
         self.volume.next_edit += 1;
@@ -828,6 +891,35 @@ mod tests {
             terrain.remove_tunnel(&mut world, dug.edit).map(|_| ()),
             Err(PhysicsError::InvalidHandle)
         );
+    }
+
+    #[test]
+    fn digging_one_spot_many_times_matches_a_full_rebuild() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        for i in 0..25 {
+            let edit = Edit {
+                shape: EditShape::Sphere {
+                    center: Vec3::new(9.0 + (i % 5) as f32 * 0.4, 6.5 - i as f32 * 0.15, 9.0),
+                    radius: 1.5 + (i % 3) as f32 * 0.3,
+                },
+                op: if i % 4 == 3 {
+                    EditOp::Add
+                } else {
+                    EditOp::Excavate
+                },
+            };
+            terrain.edit(&mut world, edit).unwrap();
+        }
+        assert_matches_reference(terrain.volume());
+        let (bricks, bytes) = terrain.volume().cached_bricks();
+        assert!(
+            bricks > 0 && bytes == bricks * 10 * 10 * 10 * 4,
+            "{bricks} {bytes}"
+        );
+        let tunnel = terrain.edit(&mut world, edits()[1]).unwrap();
+        terrain.remove_tunnel(&mut world, tunnel.edit).unwrap();
+        assert_matches_reference(terrain.volume());
     }
 
     #[test]
