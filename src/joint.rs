@@ -347,6 +347,16 @@ impl Joints {
         self.excluded_stale = true;
     }
 
+    pub(crate) fn handles(&self) -> impl Iterator<Item = JointHandle> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.state.as_ref()?;
+            Some(JointHandle {
+                index: index as u32,
+                generation: slot.generation,
+            })
+        })
+    }
+
     pub(crate) fn touching(&self, body: BodyHandle) -> impl Iterator<Item = JointHandle> + '_ {
         self.slots
             .iter()

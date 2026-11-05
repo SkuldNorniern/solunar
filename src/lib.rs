@@ -5,6 +5,7 @@ mod compound;
 mod dispatch;
 mod error;
 mod frame;
+mod inspect;
 mod joint;
 mod material;
 mod position;
@@ -23,6 +24,7 @@ pub use compound::{CompoundChild, CompoundId, CompoundInfo, MeshId};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
+pub use inspect::ContactView;
 pub use joint::{
     JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,
     Joints,

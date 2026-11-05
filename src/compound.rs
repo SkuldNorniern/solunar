@@ -132,6 +132,13 @@ impl ShapeAssets {
         }
     }
 
+    pub(crate) fn parts(&self, shape: &Shape) -> Option<&[CompoundChild]> {
+        match *shape {
+            Shape::Compound(id) => self.compound(id).map(|found| found.children.as_slice()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn validate(&self, shape: &Shape) -> Result<(), PhysicsError> {
         match *shape {
             Shape::TriMesh(_) => self
