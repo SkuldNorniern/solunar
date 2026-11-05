@@ -199,6 +199,11 @@ pub struct BuiltBricks {
 enum Queued {
     Edit(EditId, EditEntry),
     Close(EditId, EditEntry),
+    Move {
+        id: EditId,
+        old: EditEntry,
+        new: EditEntry,
+    },
 }
 
 /// Ground as a signed distance field: a base and ordered edits, sampled in sparse bricks. Only
@@ -446,6 +451,35 @@ impl SdfVolume {
             .collect()
     }
 
+    /// The brick's edits with `id` where it stood in the order, now as `moved` or gone.
+    fn entries_moved(
+        &self,
+        key: BrickKey,
+        id: EditId,
+        moved: Option<&EditEntry>,
+    ) -> Vec<EditEntry> {
+        let listed = self
+            .bricks
+            .get(&key)
+            .map_or(&[][..], |brick| &brick.edits[..]);
+        let mut ids: Vec<EditId> = listed
+            .iter()
+            .copied()
+            .filter(|other| *other != id)
+            .collect();
+        let at = ids.partition_point(|other| *other < id);
+        let mut entries: Vec<EditEntry> = ids
+            .drain(..at)
+            .filter_map(|other| self.edits.get(&other).copied())
+            .collect();
+        entries.extend(moved.copied());
+        entries.extend(
+            ids.iter()
+                .filter_map(|other| self.edits.get(other).copied()),
+        );
+        entries
+    }
+
     /// Samples and meshes one brick from scratch.
     fn build(&self, key: BrickKey, edits: &[EditEntry]) -> Rebuilt {
         let (low, high) = self.brick_samples(key);
@@ -593,8 +627,9 @@ impl SdfVolume {
             brick.inside = item.inside;
             brick.mesh = item.mesh;
             brick.revision = self.revision;
-            brick.edits.extend(item.added);
             brick.edits.retain(|other| Some(*other) != item.closed);
+            brick.edits.extend(item.added);
+            brick.edits.sort_unstable();
             brick.values = if brick.edits.is_empty() {
                 None
             } else {
@@ -787,20 +822,58 @@ impl SdfTerrain {
     /// # Errors
     /// Fails when `id` is not a tunnel here, or it is already on its way out.
     pub fn queue_close_tunnel(&mut self, id: EditId) -> Result<(), PhysicsError> {
-        let waiting = || self.queue.iter().chain(&self.flying);
-        if waiting().any(|item| matches!(item, Queued::Close(other, _) if *other == id)) {
-            return Err(PhysicsError::InvalidHandle);
-        }
-        let asked = waiting().find_map(|item| match item {
-            Queued::Edit(other, entry) if *other == id => Some(*entry),
-            _ => None,
-        });
-        let entry = asked
-            .or_else(|| self.volume.edits.get(&id).copied())
-            .filter(|entry| entry.edit.op == EditOp::Tunnel)
-            .ok_or(PhysicsError::InvalidHandle)?;
+        let entry = self.open_tunnel(id)?;
         self.queue.push_back(Queued::Close(id, entry));
         Ok(())
+    }
+
+    /// Asks for a tunnel to be somewhere else: the hole moves and the ground closes behind it.
+    /// It keeps its place among the edits, and a cost of only the bricks it leaves and reaches. A
+    /// move still waiting is replaced, so asking faster than jobs finish does not pile up.
+    ///
+    /// # Errors
+    /// Fails on a bad shape, when `id` is not a tunnel here, or it is on its way out.
+    pub fn queue_move_tunnel(&mut self, id: EditId, shape: EditShape) -> Result<(), PhysicsError> {
+        shape.validate()?;
+        let old = self.open_tunnel(id)?;
+        let new = self.volume.entry(Edit {
+            shape,
+            op: EditOp::Tunnel,
+        });
+        if let Some(Queued::Move {
+            id: waiting,
+            new: place,
+            ..
+        }) = self.queue.back_mut()
+            && *waiting == id
+        {
+            *place = new;
+            return Ok(());
+        }
+        self.queue.push_back(Queued::Move { id, old, new });
+        Ok(())
+    }
+
+    /// Where a tunnel will be once everything asked for has landed.
+    fn open_tunnel(&self, id: EditId) -> Result<EditEntry, PhysicsError> {
+        let mut latest = self.volume.edits.get(&id).copied();
+        for item in self.flying.iter().chain(&self.queue) {
+            match *item {
+                Queued::Edit(other, entry)
+                | Queued::Move {
+                    id: other,
+                    new: entry,
+                    ..
+                } if other == id => {
+                    latest = Some(entry);
+                }
+                Queued::Close(other, _) if other == id => latest = None,
+                _ => {}
+            }
+        }
+        latest
+            .filter(|entry| entry.edit.op == EditOp::Tunnel)
+            .ok_or(PhysicsError::InvalidHandle)
     }
 
     /// Edits asked for and not landed yet.
@@ -872,6 +945,21 @@ impl SdfTerrain {
                                 closed: Some(id),
                             },
                         );
+                    }
+                }
+                Queued::Move { id, old, new } => {
+                    let reaches = self.volume.reached(&new);
+                    let mut keys = self.volume.reached(&old);
+                    keys.extend(reaches.iter().copied());
+                    for key in keys {
+                        let moved = reaches.contains(&key);
+                        bricks.entry(key).or_insert_with(|| JobBrick {
+                            key,
+                            kept: None,
+                            edits: self.volume.entries_moved(key, id, moved.then_some(&new)),
+                            added: if moved { vec![id] } else { Vec::new() },
+                            closed: Some(id),
+                        });
                     }
                 }
             }
@@ -957,6 +1045,11 @@ impl SdfTerrain {
                     self.volume.edits.remove(&id);
                     report.edit = id;
                     report.ejected += self.eject(world, &entry)?;
+                }
+                Queued::Move { id, old, new } => {
+                    self.volume.edits.insert(id, new);
+                    report.edit = id;
+                    report.ejected += self.eject(world, &old)?;
                 }
             }
         }
@@ -1849,6 +1942,193 @@ mod tests {
                 height(&world, body)
             );
         }
+    }
+
+    fn hole_at(x: f32) -> EditShape {
+        EditShape::Sphere {
+            center: Vec3::new(x, 6.0, 12.0),
+            radius: 2.5,
+        }
+    }
+
+    fn drain(terrain: &mut SdfTerrain, world: &mut PhysicsWorld) -> usize {
+        let mut jobs = 0;
+        while let Some(job) = terrain.next_job() {
+            let built = job.run(&Threads).unwrap();
+            terrain.commit(world, built).unwrap();
+            jobs += 1;
+        }
+        jobs
+    }
+
+    #[test]
+    fn a_moved_tunnel_is_like_one_made_there_and_the_ground_closes_behind() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 12.0 })).unwrap();
+        let start = terrain.volume().material_volume();
+        // an edit before and after it, so its place in the order matters
+        terrain.edit(&mut world, dig_at(6.0, 12.0)).unwrap();
+        let tunnel = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: hole_at(4.0),
+                    op: EditOp::Tunnel,
+                },
+            )
+            .unwrap()
+            .edit;
+        terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: EditShape::Sphere {
+                        center: Vec3::new(8.0, 6.0, 12.0),
+                        radius: 1.5,
+                    },
+                    op: EditOp::Add,
+                },
+            )
+            .unwrap();
+        for x in [6.0, 9.0, 14.0, 20.0] {
+            terrain.queue_move_tunnel(tunnel, hole_at(x)).unwrap();
+            drain(&mut terrain, &mut world);
+            assert_matches_reference(terrain.volume());
+        }
+        assert!(terrain.volume().distance(Vec3::new(20.0, 6.0, 12.0)) > 0.0);
+        // far behind it the rock is back
+        assert!(terrain.volume().distance(Vec3::new(14.0, 6.0, 12.0)) < 0.0);
+        terrain.remove_tunnel(&mut world, tunnel).unwrap();
+        assert_matches_reference(terrain.volume());
+        assert!(terrain.volume().material_volume() < start);
+    }
+
+    #[test]
+    fn moves_faster_than_jobs_collapse_into_the_last_one() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        let tunnel = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: hole_at(4.0),
+                    op: EditOp::Tunnel,
+                },
+            )
+            .unwrap()
+            .edit;
+        for i in 0..50 {
+            terrain
+                .queue_move_tunnel(tunnel, hole_at(4.0 + i as f32 * 0.3))
+                .unwrap();
+        }
+        assert_eq!(terrain.pending(), 1);
+        assert_eq!(drain(&mut terrain, &mut world), 1);
+        assert_matches_reference(terrain.volume());
+        assert!(
+            terrain
+                .volume()
+                .distance(Vec3::new(4.0 + 49.0 * 0.3, 6.0, 12.0))
+                > 0.0
+        );
+        assert!(terrain.volume().distance(Vec3::new(4.0, 6.0, 12.0)) < 0.0);
+
+        // one waiting behind a job out stays apart from what the job holds
+        terrain.queue_move_tunnel(tunnel, hole_at(6.0)).unwrap();
+        let out = terrain.next_job().unwrap();
+        terrain.queue_move_tunnel(tunnel, hole_at(8.0)).unwrap();
+        terrain.queue_move_tunnel(tunnel, hole_at(10.0)).unwrap();
+        assert_eq!(terrain.pending(), 2);
+        terrain
+            .commit(&mut world, out.run(&Threads).unwrap())
+            .unwrap();
+        drain(&mut terrain, &mut world);
+        assert!(terrain.volume().distance(Vec3::new(10.0, 6.0, 12.0)) > 0.0);
+        assert_matches_reference(terrain.volume());
+    }
+
+    #[test]
+    fn only_open_tunnels_move() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+        let dug = terrain.edit(&mut world, dig_at(6.0, 6.0)).unwrap().edit;
+        assert_eq!(
+            terrain.queue_move_tunnel(dug, hole_at(9.0)),
+            Err(PhysicsError::InvalidHandle)
+        );
+        let tunnel = terrain
+            .queue_edit(Edit {
+                shape: hole_at(4.0),
+                op: EditOp::Tunnel,
+            })
+            .unwrap();
+        // it can move while it still waits to land
+        terrain.queue_move_tunnel(tunnel, hole_at(9.0)).unwrap();
+        terrain.queue_close_tunnel(tunnel).unwrap();
+        assert_eq!(
+            terrain.queue_move_tunnel(tunnel, hole_at(12.0)),
+            Err(PhysicsError::InvalidHandle)
+        );
+        assert_eq!(
+            terrain.queue_close_tunnel(tunnel),
+            Err(PhysicsError::InvalidHandle)
+        );
+        let bad = EditShape::Sphere {
+            center: Vec3::ZERO,
+            radius: f32::NAN,
+        };
+        assert_eq!(
+            terrain.queue_move_tunnel(tunnel, bad),
+            Err(PhysicsError::InvalidShape)
+        );
+        drain(&mut terrain, &mut world);
+        assert_eq!(terrain.volume().edit_count(), 1);
+        assert_matches_reference(terrain.volume());
+    }
+
+    #[test]
+    fn a_passing_hole_drops_a_body_and_closing_lifts_it_back() {
+        let mut world = world();
+        let mut terrain = SdfTerrain::new(&mut world, desc(Base::Plane { height: 8.0 })).unwrap();
+        let ball = ball_at(&mut world, Vec3::new(12.0, 8.5, 12.0));
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let far = EditShape::Sphere {
+            center: Vec3::new(4.0, 7.0, 12.0),
+            radius: 2.5,
+        };
+        let tunnel = terrain
+            .edit(
+                &mut world,
+                Edit {
+                    shape: far,
+                    op: EditOp::Tunnel,
+                },
+            )
+            .unwrap()
+            .edit;
+        assert!((height(&world, ball) - 8.4).abs() < 0.05);
+        let under = EditShape::Sphere {
+            center: Vec3::new(12.0, 7.0, 12.0),
+            radius: 2.5,
+        };
+        terrain.queue_move_tunnel(tunnel, under).unwrap();
+        drain(&mut terrain, &mut world);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        assert!(height(&world, ball) < 6.0, "{}", height(&world, ball));
+        terrain.queue_move_tunnel(tunnel, far).unwrap();
+        drain(&mut terrain, &mut world);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        assert!(
+            (height(&world, ball) - 8.4).abs() < 0.1,
+            "{}",
+            height(&world, ball)
+        );
     }
 
     #[test]
