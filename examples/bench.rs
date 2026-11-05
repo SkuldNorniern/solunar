@@ -20,7 +20,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 10] = [
+const SUITES: [(&str, Suite); 11] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -31,6 +31,7 @@ const SUITES: [(&str, Suite); 10] = [
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
+    ("moving", moving_tunnel),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -646,6 +647,85 @@ fn tunnel_commit() -> Result<Outcome> {
         check: format!(
             "build on one thread p50 {:.2} ms",
             build_p50.as_secs_f64() * 1e3
+        ),
+    })
+}
+
+/// A hole travelling under boxes lying on hills, the ground closing behind it. Times are one
+/// move each, build and commit, as often as a step.
+fn moving_tunnel() -> Result<Outcome> {
+    let mut world = world()?;
+    let mut terrain = SdfTerrain::new(
+        &mut world,
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [16, 6, 16],
+            base: Base::Hills {
+                seed: 5,
+                height: 24.0,
+                amplitude: 3.0,
+                wavelength: 30.0,
+                octaves: 4,
+            },
+            material: Material::default(),
+        },
+    )?;
+    let mut boxes = Vec::new();
+    for i in 0..200 {
+        let x = 10.0 + (i % 50) as f32 * 2.2;
+        let z = 60.0 + (i / 50) as f32 * 2.5;
+        boxes.push(
+            world.spawn(
+                RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.4)))
+                    .local_position(Vec3::new(x, 31.0, z)),
+            )?,
+        );
+    }
+    steps(&mut world, 240)?;
+    let place = |x: f32| EditShape::Sphere {
+        center: Vec3::new(x, 22.0, 63.0),
+        radius: 4.0,
+    };
+    let tunnel = terrain
+        .edit(
+            &mut world,
+            Edit {
+                shape: place(4.0),
+                op: EditOp::Tunnel,
+            },
+        )?
+        .edit;
+    let mut moves = Vec::new();
+    let mut rescued = 0;
+    for i in 0..400 {
+        let started = Instant::now();
+        terrain.queue_move_tunnel(tunnel, place(4.0 + i as f32 * 0.3))?;
+        if let Some(job) = terrain.next_job() {
+            let built = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+                Some(pool) => job.run(pool),
+                None => job.run(&Sequential),
+            })?;
+            terrain.commit(&mut world, built)?;
+        }
+        moves.push(started.elapsed());
+        steps(&mut world, 1)?;
+        rescued += terrain.rescue(&mut world)?;
+    }
+    let mut fell = 0;
+    for body in &boxes {
+        if world.body_state(*body)?.position.to_dvec3().y < 0.0 {
+            fell += 1;
+        }
+    }
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times: moves,
+        unit: "ms",
+        check: format!(
+            "{fell} fell out, {rescued} rescued, {} edits kept",
+            terrain.volume().edit_count()
         ),
     })
 }
