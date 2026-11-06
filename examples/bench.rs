@@ -4,9 +4,10 @@
 use std::time::{Duration, Instant};
 
 use solunar::{
-    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, GridPosition, JobDispatch, JointDesc,
-    JointHandle, Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat,
-    QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, Shape, ShapeCast, Vec3,
+    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, FluidSettings, FluidWorld,
+    GridPosition, JobDispatch, JointDesc, JointHandle, Material, PhaseTimes, PhysicsError,
+    PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain,
+    Sequential, Shape, ShapeCast, Vec3,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -20,7 +21,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 11] = [
+const SUITES: [(&str, Suite); 13] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -32,6 +33,8 @@ const SUITES: [(&str, Suite); 11] = [
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
     ("moving", moving_tunnel),
+    ("dam", dam_small),
+    ("dam-fine", dam_medium),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -120,6 +123,52 @@ fn main() {
             mean(sum.broadphase + sum.narrowphase + sum.solve + sum.integrate + sum.finish),
         );
     }
+}
+
+fn dam_small() -> Result<Outcome> {
+    dam(0.05)
+}
+
+fn dam_medium() -> Result<Outcome> {
+    dam(0.03)
+}
+
+/// A water column 0.6 m tall and wide in a 2.4 m tank, let go at once. Timed per 60 hz tick, which
+/// holds as many fluid substeps as the flow needs.
+fn dam(spacing: f32) -> Result<Outcome> {
+    let mut fluid = FluidWorld::new(FluidSettings {
+        spacing,
+        ..FluidSettings::default()
+    })?;
+    fluid.add_box_container(Vec3::ZERO, Vec3::new(2.4, 1.0, 0.3))?;
+    fluid.fill_box(Vec3::ZERO, Vec3::new(0.6, 0.6, 0.3))?;
+    let mut times = Vec::new();
+    let mut substeps = 0;
+    let mut held = 0;
+    let mut squeeze = 0.0_f32;
+    // two seconds, the wave hits the far wall and comes back
+    for _ in 0..120 {
+        let started = Instant::now();
+        let report = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => fluid.step(1.0 / 60.0, pool),
+            None => fluid.step(1.0 / 60.0, &Sequential),
+        })?;
+        times.push(started.elapsed());
+        substeps += report.substeps;
+        held += report.held_back;
+        squeeze = squeeze.max(report.max_compression);
+    }
+    Ok(Outcome {
+        bodies: fluid.len(),
+        times,
+        unit: "ms",
+        check: format!(
+            "{:.1} substeps a tick, most squeezed {:.1}%, {held} held back, hash {:016x}",
+            f64::from(substeps) / 120.0,
+            squeeze * 100.0,
+            fluid.state_hash()
+        ),
+    })
 }
 
 fn print_row(name: &str, outcome: &Outcome) {
