@@ -10,6 +10,7 @@ mod frame;
 mod inspect;
 mod joint;
 mod material;
+mod planet;
 mod position;
 mod profile;
 mod sdf;
@@ -40,6 +41,7 @@ pub use joint::{
     Joints,
 };
 pub use material::Material;
+pub use planet::{MAX_LEVEL, Planet, PlanetDesc, TileKey, direction, face_of};
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};
 pub use sdf::{
