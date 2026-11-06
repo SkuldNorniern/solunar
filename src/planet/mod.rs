@@ -4,6 +4,10 @@ use algebrix::DVec3;
 
 use crate::error::PhysicsError;
 
+mod ground;
+
+pub use ground::{PlanetGround, level_at, level_for};
+
 /// Deepest a tile is split, a planet the size of the earth gets tiles of a few meters there.
 pub const MAX_LEVEL: u8 = 22;
 /// Most tiles one choice may hand back, so a bad detail can not run away.

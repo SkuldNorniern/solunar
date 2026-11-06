@@ -41,7 +41,9 @@ pub use joint::{
     Joints,
 };
 pub use material::Material;
-pub use planet::{MAX_LEVEL, Planet, PlanetDesc, TileKey, direction, face_of};
+pub use planet::{
+    MAX_LEVEL, Planet, PlanetDesc, PlanetGround, TileKey, direction, face_of, level_at, level_for,
+};
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};
 pub use sdf::{
