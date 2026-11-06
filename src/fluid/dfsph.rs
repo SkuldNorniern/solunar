@@ -21,6 +21,25 @@ enum Solve {
     Density,
 }
 
+/// Kernel gradient of every listed pair, in list order, worked out once a substep: positions
+/// do not move while the solves run, only velocities do.
+struct Gradients {
+    fluid: Vec<Vec3>,
+    walls: Vec<Vec3>,
+}
+
+impl Gradients {
+    fn fluid(&self, world: &FluidWorld, index: usize) -> &[Vec3] {
+        let lists = &world.neighbors;
+        &self.fluid[lists.start[index] as usize..lists.start[index + 1] as usize]
+    }
+
+    fn walls(&self, world: &FluidWorld, index: usize) -> &[Vec3] {
+        let lists = &world.wall_neighbors;
+        &self.walls[lists.start[index] as usize..lists.start[index + 1] as usize]
+    }
+}
+
 impl FluidWorld {
     /// Divergence free sph: pressure from two small solves each substep instead of an equation
     /// of state, so the step is held by how fast water moves, not by a sound speed.
@@ -65,8 +84,9 @@ impl FluidWorld {
     ) -> Result<u32, PhysicsError> {
         self.update_neighbors(dispatch)?;
         self.compute_densities(dispatch)?;
-        let factors = self.factors(dispatch)?;
-        let mut iterations = self.solve(Solve::Divergence, dt, &factors, dispatch)?;
+        let gradients = self.gradients(dispatch)?;
+        let factors = self.factors(&gradients, dispatch)?;
+        let mut iterations = self.solve(Solve::Divergence, dt, &factors, &gradients, dispatch)?;
         let world = &*self;
         let gravity = self.settings.gravity;
         let pushes = in_chunks(dispatch, self.len(), |range| {
@@ -77,7 +97,7 @@ impl FluidWorld {
         for (velocity, push) in self.velocities.iter_mut().zip(pushes.into_iter().flatten()) {
             *velocity += push * dt;
         }
-        iterations += self.solve(Solve::Density, dt, &factors, dispatch)?;
+        iterations += self.solve(Solve::Density, dt, &factors, &gradients, dispatch)?;
         *held += self.advance(dt)?;
         Ok(iterations)
     }
@@ -85,27 +105,54 @@ impl FluidWorld {
     /// For each particle, one over how much its own pressure changes its density rate: the
     /// square of the summed kernel gradient, walls in it, plus each neighbor's alone. Zero for a
     /// lone particle.
-    fn factors(&self, dispatch: &dyn JobDispatch) -> Result<Vec<f32>, PhysicsError> {
+    fn gradients(&self, dispatch: &dyn JobDispatch) -> Result<Gradients, PhysicsError> {
+        let parts = in_chunks(dispatch, self.len(), |range| {
+            let mut fluid = Vec::new();
+            let mut walls = Vec::new();
+            for index in range {
+                let at = self.positions[index];
+                fluid.extend(
+                    self.neighbors
+                        .of(index)
+                        .iter()
+                        .map(|&other| self.kernel.gradient(at - self.positions[other as usize])),
+                );
+                walls.extend(self.wall_neighbors.of(index).iter().map(|&wall| {
+                    self.kernel
+                        .gradient(at - self.walls.positions[wall as usize])
+                }));
+            }
+            (fluid, walls)
+        })?;
+        let mut gradients = Gradients {
+            fluid: Vec::with_capacity(self.neighbors.items.len()),
+            walls: Vec::with_capacity(self.wall_neighbors.items.len()),
+        };
+        for (fluid, walls) in parts {
+            gradients.fluid.extend(fluid);
+            gradients.walls.extend(walls);
+        }
+        Ok(gradients)
+    }
+
+    fn factors(
+        &self,
+        gradients: &Gradients,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<Vec<f32>, PhysicsError> {
         let parts = in_chunks(dispatch, self.len(), |range| {
             range
                 .map(|index| {
-                    let at = self.positions[index];
                     let mut sum = Vec3::ZERO;
                     let mut squares = 0.0;
-                    for &other in self.neighbors.of(index) {
-                        if other as usize == index {
-                            continue;
-                        }
-                        let part =
-                            self.kernel.gradient(at - self.positions[other as usize]) * self.mass;
+                    // its own entry has no gradient
+                    for gradient in gradients.fluid(self, index) {
+                        let part = *gradient * self.mass;
                         sum += part;
                         squares += part.length_squared();
                     }
-                    for &wall in self.wall_neighbors.of(index) {
-                        sum += self
-                            .kernel
-                            .gradient(at - self.walls.positions[wall as usize])
-                            * self.mass;
+                    for gradient in gradients.walls(self, index) {
+                        sum += *gradient * self.mass;
                     }
                     let total = sum.length_squared() + squares;
                     if total > 0.0 { 1.0 / total } else { 0.0 }
@@ -116,20 +163,19 @@ impl FluidWorld {
     }
 
     /// How fast the density sum is changing, walls standing still.
-    fn density_rate(&self, index: usize) -> f32 {
-        let at = self.positions[index];
+    fn density_rate(&self, index: usize, gradients: &Gradients) -> f32 {
         let velocity = self.velocities[index];
         let mut rate = 0.0;
-        for &other in self.neighbors.of(index) {
-            let other = other as usize;
-            let gradient = self.kernel.gradient(at - self.positions[other]);
-            rate += (velocity - self.velocities[other]).dot(gradient);
+        let pairs = self
+            .neighbors
+            .of(index)
+            .iter()
+            .zip(gradients.fluid(self, index));
+        for (&other, gradient) in pairs {
+            rate += (velocity - self.velocities[other as usize]).dot(*gradient);
         }
-        for &wall in self.wall_neighbors.of(index) {
-            let gradient = self
-                .kernel
-                .gradient(at - self.walls.positions[wall as usize]);
-            rate += velocity.dot(gradient);
+        for gradient in gradients.walls(self, index) {
+            rate += velocity.dot(*gradient);
         }
         rate * self.mass
     }
@@ -139,28 +185,21 @@ impl FluidWorld {
         &mut self,
         stiffness: &[f32],
         dt: f32,
+        gradients: &Gradients,
         dispatch: &dyn JobDispatch,
     ) -> Result<(), PhysicsError> {
         let world = &*self;
         let changes = in_chunks(dispatch, self.len(), |range| {
             range
                 .map(|index| {
-                    let at = world.positions[index];
                     let own = stiffness[index];
                     let mut change = Vec3::ZERO;
-                    for &other in world.neighbors.of(index) {
-                        let other = other as usize;
-                        if other == index {
-                            continue;
-                        }
-                        let gradient = world.kernel.gradient(at - world.positions[other]);
-                        change -= gradient * (world.mass * (own + stiffness[other]));
+                    let pairs = world.neighbors.of(index).iter();
+                    for (&other, gradient) in pairs.zip(gradients.fluid(world, index)) {
+                        change -= *gradient * (world.mass * (own + stiffness[other as usize]));
                     }
-                    for &wall in world.wall_neighbors.of(index) {
-                        let gradient = world
-                            .kernel
-                            .gradient(at - world.walls.positions[wall as usize]);
-                        change -= gradient * (world.mass * own);
+                    for gradient in gradients.walls(world, index) {
+                        change -= *gradient * (world.mass * own);
                     }
                     change * dt
                 })
@@ -185,6 +224,7 @@ impl FluidWorld {
         solve: Solve,
         dt: f32,
         factors: &[f32],
+        gradients: &Gradients,
         dispatch: &dyn JobDispatch,
     ) -> Result<u32, PhysicsError> {
         let rest = self.settings.rest_density;
@@ -199,7 +239,7 @@ impl FluidWorld {
             let parts = in_chunks(dispatch, count, |range| {
                 range
                     .map(|index| {
-                        let rate = world.density_rate(index);
+                        let rate = world.density_rate(index, gradients);
                         let (target, error) = match solve {
                             Solve::Density => {
                                 let over = (world.densities[index] + dt * rate - rest).max(0.0);
@@ -229,7 +269,7 @@ impl FluidWorld {
             if settled || iterations >= MAX_ITERATIONS {
                 return Ok(iterations);
             }
-            self.push_apart(&stiffness, dt, dispatch)?;
+            self.push_apart(&stiffness, dt, gradients, dispatch)?;
             iterations += 1;
         }
     }
