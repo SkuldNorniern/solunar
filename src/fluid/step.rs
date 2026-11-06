@@ -30,6 +30,9 @@ pub struct FluidReport {
     pub held_back: u32,
     /// Pressure solve iterations, all substeps together. Zero for the weakly compressible solver.
     pub iterations: u32,
+    /// Particles emitters added and drains took after the step.
+    pub emitted: u32,
+    pub drained: u32,
 }
 
 impl FluidWorld {
@@ -48,13 +51,21 @@ impl FluidWorld {
             return Err(PhysicsError::NonFinite("fluid step"));
         }
         let mut report = FluidReport::default();
-        if dt == 0.0 || self.is_empty() {
+        if dt == 0.0 {
             return Ok(report);
         }
-        match self.settings.solver {
-            FluidSolver::Wcsph => self.wcsph(dt, dispatch, &mut report)?,
-            FluidSolver::Dfsph => self.dfsph(dt, dispatch, &mut report)?,
+        if !self.is_empty() {
+            match self.settings.solver {
+                FluidSolver::Wcsph => self.wcsph(dt, dispatch, &mut report)?,
+                FluidSolver::Dfsph => self.dfsph(dt, dispatch, &mut report)?,
+            }
         }
+        let flowed = self.run_flows();
+        if let Ok((emitted, drained)) = flowed {
+            report.emitted = emitted;
+            report.drained = drained;
+        }
+        flowed?;
         report.max_speed = self.fastest();
         let rest = self.settings.rest_density;
         report.max_compression = self

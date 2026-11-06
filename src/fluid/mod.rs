@@ -11,11 +11,14 @@ use crate::snapshot::fnv1a;
 mod boundary;
 mod couple;
 mod dfsph;
+mod flow;
 mod step;
 
 pub use boundary::BoundaryId;
 use boundary::Walls;
 use couple::{Coupled, Movers};
+pub use flow::FlowId;
+use flow::Flows;
 pub use step::FluidReport;
 
 /// Particles per job. Fixed, so the split of work and every sum in it never depend on how many
@@ -310,6 +313,7 @@ pub struct FluidWorld {
     movers: Movers,
     /// Body points near each particle, indexes into `movers`.
     mover_neighbors: Lists,
+    flows: Flows,
 }
 
 impl FluidWorld {
@@ -333,6 +337,7 @@ impl FluidWorld {
             coupled: Vec::new(),
             movers: Movers::default(),
             mover_neighbors: Lists::default(),
+            flows: Flows::default(),
         })
     }
 
