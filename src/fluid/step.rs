@@ -6,6 +6,9 @@ use crate::error::PhysicsError;
 
 /// Exponent of the Tait equation of state for water.
 const TAIT: i32 = 7;
+/// Artificial viscosity against walls, on motion into them only. The front of a wave has few
+/// neighbors, so its density and pressure read low even at a wall. This is what stops it there.
+const WALL_DAMPING: f32 = 1.0;
 
 /// What one [`FluidWorld::step`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -108,21 +111,32 @@ impl FluidWorld {
                         };
                         push -= gradient * (mass * (pressure + damp));
                     }
-                    // a wall pushes back with this particle's own pressure, as water would
+                    // a wall pushes back with this particle's own pressure, as water would. damping
+                    // takes only motion into the wall: on all motion it was friction that held the
+                    // dam break front 40% back, with none the front of a wave got through
+                    let walls = world.wall_neighbors.of(index);
+                    let away: Vec3 = walls
+                        .iter()
+                        .map(|&wall| {
+                            -world
+                                .kernel
+                                .gradient(at - world.walls.positions[wall as usize])
+                        })
+                        .fold(Vec3::ZERO, |sum, part| sum + part);
+                    let normal = away.normalize_or(Vec3::ZERO);
+                    let into = normal * velocity.dot(normal).min(0.0);
                     let mirrored = own + pressures[index] / (rest * rest);
-                    for &wall in world.wall_neighbors.of(index) {
+                    for &wall in walls {
                         let offset = at - world.walls.positions[wall as usize];
-                        let gradient = world.kernel.gradient(offset);
-                        let share = mass;
-                        let toward = velocity.dot(offset);
+                        let toward = into.dot(offset);
                         let damp = if toward < 0.0 {
                             let squeeze =
                                 toward / (offset.length_squared() + 0.01 * radius * radius);
-                            -viscosity * squeeze / density
+                            -WALL_DAMPING * settings.sound_speed * radius * squeeze / density
                         } else {
                             0.0
                         };
-                        push -= gradient * (share * (mirrored + damp));
+                        push -= world.kernel.gradient(offset) * (mass * (mirrored + damp));
                     }
                     push + settings.gravity
                 })
@@ -281,6 +295,68 @@ mod tests {
         assert!(last - start > 0.4, "{last}");
         assert!(inside(&fluid, size));
         assert_eq!(held, 0, "water got through the walls");
+    }
+
+    /// Martin and Moyce 1952, figure 3, a column twice as tall as wide (n^2 = 2, a = 2.25 in):
+    /// t sqrt(2 g / a) against front distance over a. As digitized in pysph's `db_exp_data.py`.
+    const MARTIN_MOYCE: [(f32, f32); 10] = [
+        (0.832, 1.217),
+        (1.219, 1.474),
+        (1.997, 2.292),
+        (2.547, 2.995),
+        (3.345, 4.134),
+        (4.034, 4.944),
+        (4.418, 5.881),
+        (5.091, 6.980),
+        (5.685, 7.945),
+        (6.306, 8.966),
+    ];
+
+    #[test]
+    fn the_dam_break_front_follows_martin_and_moyce() {
+        let width = 0.3;
+        let spacing = 0.3 / 18.0;
+        let mut fluid = FluidWorld::new(FluidSettings {
+            spacing,
+            ..FluidSettings::default()
+        })
+        .unwrap();
+        // long enough that the front never reaches the far wall
+        let size = Vec3::new(3.2, 0.8, 0.1);
+        fluid.add_box_container(Vec3::ZERO, size).unwrap();
+        fluid
+            .fill_box(Vec3::ZERO, Vec3::new(width, 2.0 * width, 0.1))
+            .unwrap();
+        let count = fluid.len();
+        let scale = (2.0 * 9.81 / width).sqrt();
+        let tick = 1.0 / 240.0;
+        let mut time = 0.0_f32;
+        let mut errors = Vec::new();
+        let mut held = 0;
+        for (when, measured) in MARTIN_MOYCE {
+            while time * scale < when {
+                held += fluid.step(tick, &Sequential).unwrap().held_back;
+                time += tick;
+            }
+            // particle centers sit half a spacing in from the water's edge
+            let edge = fluid
+                .positions()
+                .iter()
+                .fold(0.0_f32, |most, at| most.max(at.x));
+            let front = (edge + spacing / 2.0) / width;
+            let error = (front - measured) / measured;
+            // ahead by up to 15% early, about 4% late, never behind
+            assert!(
+                error < 0.16 && error > -0.03,
+                "at {when}: {front} against {measured}"
+            );
+            errors.push(error);
+        }
+        let mean = errors.iter().sum::<f32>() / errors.len() as f32;
+        assert!(mean < 0.10, "{errors:?}");
+        assert_eq!(fluid.len(), count);
+        assert_eq!(held, 0);
+        assert!(inside(&fluid, size));
     }
 
     #[test]
