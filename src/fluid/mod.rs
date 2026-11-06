@@ -12,6 +12,7 @@ mod boundary;
 mod couple;
 mod dfsph;
 mod flow;
+mod shallow;
 mod step;
 mod terrain;
 
@@ -20,6 +21,7 @@ use boundary::Walls;
 use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;
+pub use shallow::{ShallowReport, ShallowSettings, ShallowWater};
 pub use step::FluidReport;
 use terrain::{GroundSites, TerrainField};
 

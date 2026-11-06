@@ -29,7 +29,10 @@ pub use command::{ApplyReport, Command, CommandBuffer};
 pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo, MeshId};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
-pub use fluid::{BoundaryId, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel};
+pub use fluid::{
+    BoundaryId, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel, ShallowReport,
+    ShallowSettings, ShallowWater,
+};
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
 pub use inspect::{ContactEvent, ContactView, IslandStats};
 pub use joint::{
