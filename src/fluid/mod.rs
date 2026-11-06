@@ -9,6 +9,7 @@ use crate::error::PhysicsError;
 use crate::snapshot::fnv1a;
 
 mod boundary;
+mod dfsph;
 mod step;
 
 pub use boundary::BoundaryId;
@@ -24,8 +25,21 @@ const SUPPORT_RANGE: (f32, f32) = (1.5, 4.0);
 const DENSE_PER_CELL: i64 = 64;
 const DENSE_SLACK: i64 = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FluidSolver {
+    /// Weakly compressible: pressure from an equation of state. Checked against martin and moyce,
+    /// its step is held by `sound_speed`.
+    #[default]
+    Wcsph,
+    /// Divergence free: pressure from small solves each substep, steps held by the flow speed.
+    /// Not ready: squeezes far less at rest, but still water keeps sloshing, its bottom layer
+    /// reaches the floor plane, hard impacts squeeze it more and the dam break front runs ahead.
+    Dfsph,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FluidSettings {
+    pub solver: FluidSolver,
     /// Distance between particles at rest, in meters.
     pub spacing: f32,
     /// Kilograms per cubic meter.
@@ -33,9 +47,10 @@ pub struct FluidSettings {
     /// Kernel reach as a multiple of `spacing`.
     pub support: f32,
     pub max_particles: usize,
-    /// Meters a second. The equation of state is stiff enough that the fluid squeezes about
-    /// `(fastest flow / sound_speed)^2`, so ten times the fastest flow keeps it near one percent.
-    /// Higher costs more substeps.
+    /// Meters a second. For the weakly compressible solver the equation of state is stiff enough
+    /// that the fluid squeezes about `(fastest flow / sound_speed)^2`, so ten times the fastest
+    /// flow keeps it near one percent, higher costs more substeps. Both solvers scale viscosity by
+    /// it.
     pub sound_speed: f32,
     /// Artificial viscosity. Below about 0.1 still water on a cubic lattice keeps churning as the
     /// lattice settles into a denser packing. It also slows fast flow a little.
@@ -50,6 +65,7 @@ pub struct FluidSettings {
 impl Default for FluidSettings {
     fn default() -> Self {
         Self {
+            solver: FluidSolver::default(),
             spacing: 0.05,
             rest_density: 1000.0,
             support: 2.0,
