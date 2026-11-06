@@ -19,6 +19,10 @@ pub use step::FluidReport;
 /// threads run it.
 const CHUNK: usize = 512;
 const SUPPORT_RANGE: (f32, f32) = (1.5, 4.0);
+/// A dense cell table is kept while its box holds at most this many cells per occupied one, plus
+/// the slack. Water spread thin falls back to searching.
+const DENSE_PER_CELL: i64 = 64;
+const DENSE_SLACK: i64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FluidSettings {
@@ -135,6 +139,11 @@ type CellKey = (i32, i32, i32);
 #[derive(Debug, Clone, Default)]
 struct Grid {
     cells: Vec<(CellKey, Range<u32>)>,
+    /// Slot in `cells` for every cell of the box they span, `u32::MAX` for empty ones. Left
+    /// empty when the box is much bigger than the cells in it, lookups then search `cells`.
+    dense: Vec<u32>,
+    low: CellKey,
+    span: (i64, i64, i64),
 }
 
 impl Grid {
@@ -148,11 +157,61 @@ impl Grid {
                 _ => cells.push((cell, index..index + 1)),
             }
         }
-        Self { cells }
+        let mut grid = Self {
+            cells,
+            ..Self::default()
+        };
+        grid.index();
+        grid
+    }
+
+    fn index(&mut self) {
+        let Some(first) = self.cells.first() else {
+            return;
+        };
+        let (mut low, mut high) = (first.0, first.0);
+        for (cell, _) in &self.cells {
+            low = (low.0.min(cell.0), low.1.min(cell.1), low.2.min(cell.2));
+            high = (high.0.max(cell.0), high.1.max(cell.1), high.2.max(cell.2));
+        }
+        let side = |a: i32, b: i32| i64::from(b) - i64::from(a) + 1;
+        let span = (
+            side(low.0, high.0),
+            side(low.1, high.1),
+            side(low.2, high.2),
+        );
+        let volume = span.0.saturating_mul(span.1).saturating_mul(span.2);
+        if volume > DENSE_PER_CELL * self.cells.len() as i64 + DENSE_SLACK {
+            return;
+        }
+        let mut dense = vec![u32::MAX; volume as usize];
+        for (slot, (cell, _)) in self.cells.iter().enumerate() {
+            let at = (i64::from(cell.0 - low.0) * span.1 + i64::from(cell.1 - low.1)) * span.2
+                + i64::from(cell.2 - low.2);
+            dense[at as usize] = slot as u32;
+        }
+        self.dense = dense;
+        self.low = low;
+        self.span = span;
     }
 
     fn range(&self, key: CellKey) -> Option<Range<u32>> {
-        let slot = self.cells.binary_search_by_key(&key, |cell| cell.0).ok()?;
+        let slot = if self.dense.is_empty() {
+            self.cells.binary_search_by_key(&key, |cell| cell.0).ok()?
+        } else {
+            let offset = |value: i32, low: i32, span: i64| {
+                let at = i64::from(value) - i64::from(low);
+                (0..span).contains(&at).then_some(at)
+            };
+            let x = offset(key.0, self.low.0, self.span.0)?;
+            let y = offset(key.1, self.low.1, self.span.1)?;
+            let z = offset(key.2, self.low.2, self.span.2)?;
+            let slot = self.dense[((x * self.span.1 + y) * self.span.2 + z) as usize];
+            if slot == u32::MAX {
+                return None;
+            }
+            slot as usize
+        };
         Some(self.cells[slot].1.clone())
     }
 
@@ -609,6 +668,33 @@ mod tests {
         let gradient = kernel.gradient(Vec3::new(0.03, 0.0, 0.0));
         assert!(gradient.x < 0.0 && gradient.y == 0.0);
         assert_eq!(kernel.gradient(Vec3::ZERO), Vec3::ZERO);
+    }
+
+    #[test]
+    fn the_dense_table_and_the_search_find_the_same_cells() {
+        let keys: Vec<CellKey> = vec![(-3, 0, 2), (-3, 0, 2), (-1, 4, 0), (0, 0, 0), (5, -2, 1)];
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let dense = Grid::build(sorted.iter().copied());
+        assert!(!dense.dense.is_empty());
+        let mut search = dense.clone();
+        search.dense.clear();
+        for x in -5..7 {
+            for y in -4..6 {
+                for z in -2..4 {
+                    assert_eq!(
+                        dense.range((x, y, z)),
+                        search.range((x, y, z)),
+                        "{x} {y} {z}"
+                    );
+                }
+            }
+        }
+        // spread far apart, no table
+        let far = Grid::build([(-100_000, 0, 0), (100_000, 0, 0)].into_iter());
+        assert!(far.dense.is_empty());
+        assert_eq!(far.range((100_000, 0, 0)), Some(1..2));
+        assert_eq!(far.range((i32::MAX, i32::MIN, 0)), None);
     }
 
     #[test]
