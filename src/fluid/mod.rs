@@ -238,29 +238,33 @@ impl Grid {
         Some(self.cells[slot].1.clone())
     }
 
-    /// Indexes within `reach` of `at` in the 27 cells around it, in a fixed order.
-    fn near(
-        &self,
-        positions: &[Vec3],
-        at: Vec3,
-        (cx, cy, cz): CellKey,
-        reach: f32,
-        out: &mut Vec<u32>,
-    ) {
+    /// Ranges of the 27 cells around `cell` that hold anything, in a fixed order.
+    fn around(&self, (cx, cy, cz): CellKey, out: &mut Vec<Range<u32>>) {
+        out.clear();
         for dz in -1..=1 {
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    let Some(range) = self.range((cx + dx, cy + dy, cz + dz)) else {
-                        continue;
-                    };
-                    for other in range {
-                        if (positions[other as usize] - at).length_squared() < reach {
-                            out.push(other);
-                        }
+                    if let Some(range) = self.range((cx + dx, cy + dy, cz + dz)) {
+                        out.push(range);
                     }
                 }
             }
         }
+    }
+}
+
+/// Indexes in `ranges` within `reach` of `at`, in their order.
+fn near(positions: &[Vec3], ranges: &[Range<u32>], at: Vec3, reach: f32, out: &mut Vec<u32>) {
+    for range in ranges {
+        // every candidate is written and only the near ones kept, a branch on each guessed wrong
+        // too often
+        let mut kept = out.len();
+        out.resize(kept + range.len(), 0);
+        for other in range.clone() {
+            out[kept] = other;
+            kept += usize::from((positions[other as usize] - at).length_squared() < reach);
+        }
+        out.truncate(kept);
     }
 }
 
@@ -495,23 +499,22 @@ impl FluidWorld {
             let mut fluid = (Vec::with_capacity(range.len()), Vec::new());
             let mut walls = (Vec::with_capacity(range.len()), Vec::new());
             let mut movers = (Vec::with_capacity(range.len()), Vec::new());
+            // particles are sorted by cell, the cells around are looked up once per cell
+            let mut last = None;
+            let mut around = (Vec::new(), Vec::new(), Vec::new());
             for index in range {
                 let at = world.positions[index];
                 let cell = world.cell_of(at);
+                if last != Some(cell) {
+                    last = Some(cell);
+                    world.grid.around(cell, &mut around.0);
+                    world.walls.grid.around(cell, &mut around.1);
+                    world.movers.grid.around(cell, &mut around.2);
+                }
                 let before = (fluid.1.len(), walls.1.len(), movers.1.len());
-                world
-                    .grid
-                    .near(&world.positions, at, cell, reach, &mut fluid.1);
-                let wall_at = &world.walls.positions;
-                world
-                    .walls
-                    .grid
-                    .near(wall_at, at, cell, reach, &mut walls.1);
-                let mover_at = &world.movers.positions;
-                world
-                    .movers
-                    .grid
-                    .near(mover_at, at, cell, reach, &mut movers.1);
+                near(&world.positions, &around.0, at, reach, &mut fluid.1);
+                near(&world.walls.positions, &around.1, at, reach, &mut walls.1);
+                near(&world.movers.positions, &around.2, at, reach, &mut movers.1);
                 fluid.0.push((fluid.1.len() - before.0) as u32);
                 walls.0.push((walls.1.len() - before.1) as u32);
                 movers.0.push((movers.1.len() - before.2) as u32);
