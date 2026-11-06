@@ -1,7 +1,7 @@
 use algebrix::Vec3;
 
 use super::couple::shape_points;
-use super::in_chunks;
+use super::in_chunks_of;
 use crate::body::BodyHandle;
 use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
@@ -12,6 +12,8 @@ use crate::world::PhysicsWorld;
 
 /// Most cells one shallow water grid may hold.
 const MAX_CELLS: usize = 1 << 24;
+/// About this many cells to a job, a job is whole rows.
+const CELLS_PER_JOB: usize = 4096;
 /// Most points one held body is sampled with.
 const MAX_BODY_POINTS: usize = 1 << 16;
 /// Drag of a body point against the flow, as for a blunt body.
@@ -282,16 +284,29 @@ impl ShallowWater {
             * area
     }
 
-    fn fastest_wave(&self) -> f32 {
-        let gravity = self.settings.gravity;
-        (0..self.depth.len())
-            .filter(|&index| self.depth[index] >= self.settings.dry)
-            .map(|index| {
+    fn rows_per_job(&self) -> usize {
+        (CELLS_PER_JOB / self.size.0).max(1)
+    }
+
+    /// The fastest wave and the fastest flow over all wet cells.
+    fn fastest(&self, dispatch: &dyn JobDispatch) -> Result<(f32, f32), PhysicsError> {
+        let (nx, gravity, dry) = (self.size.0, self.settings.gravity, self.settings.dry);
+        let parts = in_chunks_of(dispatch, self.size.1, self.rows_per_job(), |rows| {
+            let mut most = (0.0_f32, 0.0_f32);
+            for index in rows.start * nx..rows.end * nx {
                 let depth = self.depth[index];
-                let speed = (self.flow_x[index].abs()).max(self.flow_z[index].abs()) / depth;
-                speed + (gravity * depth).sqrt()
-            })
-            .fold(0.0, f32::max)
+                if depth < dry {
+                    continue;
+                }
+                let (x, z) = (self.flow_x[index] / depth, self.flow_z[index] / depth);
+                let wave = x.abs().max(z.abs()) + (gravity * depth).sqrt();
+                most = (most.0.max(wave), most.1.max((x * x + z * z).sqrt()));
+            }
+            most
+        })?;
+        Ok(parts
+            .into_iter()
+            .fold((0.0, 0.0), |a, b| (a.0.max(b.0), a.1.max(b.1))))
     }
 
     /// Advances `dt` seconds in as many substeps as the fastest wave needs.
@@ -309,7 +324,7 @@ impl ShallowWater {
         let mut report = ShallowReport::default();
         let mut left = dt;
         while left > 0.0 {
-            let wave = self.fastest_wave();
+            let (wave, _) = self.fastest(dispatch)?;
             let mut small = if wave > 0.0 {
                 self.settings.courant * self.settings.cell / wave
             } else {
@@ -324,12 +339,7 @@ impl ShallowWater {
             report.substeps += 1;
             left -= small;
         }
-        report.max_speed = (0..self.depth.len())
-            .map(|index| {
-                let (x, z) = (index % self.size.0, index / self.size.0);
-                self.velocity((x, z)).length()
-            })
-            .fold(0.0, f32::max);
+        report.max_speed = self.fastest(dispatch)?.1;
         Ok(report)
     }
 
@@ -367,33 +377,36 @@ impl ShallowWater {
     fn substep(&mut self, dt: f32, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
         let (nx, nz) = self.size;
         let half = self.settings.gravity * 0.5;
-        let world = &*self;
-        // faces x: between (x, z) and (x + 1, z), (nx - 1) per row; z: between (x, z) and (x, z + 1)
-        let faces_x = in_chunks(dispatch, nz, |rows| {
-            let mut out = Vec::with_capacity(rows.len() * nx.saturating_sub(1));
-            for z in rows {
-                for x in 0..nx - 1 {
-                    out.push(world.face(world.index(x, z), world.index(x + 1, z), true));
-                }
-            }
-            out
-        })?
-        .concat();
-        let faces_z = in_chunks(dispatch, nz.saturating_sub(1), |rows| {
-            let mut out = Vec::with_capacity(rows.len() * nx);
-            for z in rows {
-                for x in 0..nx {
-                    out.push(world.face(world.index(x, z), world.index(x, z + 1), false));
-                }
-            }
-            out
-        })?
-        .concat();
         let scale = dt / self.settings.cell;
         let dry = self.settings.dry;
-        let next = in_chunks(dispatch, nz, |rows| {
-            let mut out = Vec::with_capacity(rows.len() * nx);
-            for z in rows {
+        let world = &*self;
+        // each job works out the faces its rows touch, the z faces on its edges twice, and its
+        // rows' next state: nothing is shared or copied between jobs
+        let next = in_chunks_of(dispatch, nz, self.rows_per_job(), |rows| {
+            // x faces between (x, z) and (x + 1, z), nx - 1 a row
+            let mut faces_x = Vec::with_capacity(rows.len() * nx.saturating_sub(1));
+            for z in rows.clone() {
+                for x in 0..nx - 1 {
+                    faces_x.push(world.face(world.index(x, z), world.index(x + 1, z), true));
+                }
+            }
+            // z faces between (x, z) and (x, z + 1), from the row before the first
+            let first = rows.start.saturating_sub(1);
+            let last = rows.end.min(nz - 1);
+            let mut faces_z = Vec::with_capacity((last - first) * nx);
+            for z in first..last {
+                for x in 0..nx {
+                    faces_z.push(world.face(world.index(x, z), world.index(x, z + 1), false));
+                }
+            }
+            let cells = rows.len() * nx;
+            let mut out = (
+                Vec::with_capacity(cells),
+                Vec::with_capacity(cells),
+                Vec::with_capacity(cells),
+            );
+            for z in rows.clone() {
+                let row_x = (z - rows.start) * (nx - 1);
                 for x in 0..nx {
                     let index = world.index(x, z);
                     let depth = world.depth[index];
@@ -401,8 +414,8 @@ impl ShallowWater {
                     let (mut mass, mut along_x, mut along_z) = (0.0, 0.0, 0.0);
                     // x faces: flux leaves through the right face, comes in through the left
                     let (right, left) = (
-                        (x + 1 < nx).then(|| faces_x[z * (nx - 1) + x]),
-                        (x > 0).then(|| faces_x[z * (nx - 1) + x - 1]),
+                        (x + 1 < nx).then(|| faces_x[row_x + x]),
+                        (x > 0).then(|| faces_x[row_x + x - 1]),
                     );
                     match right {
                         Some((flux, own, _)) => {
@@ -421,8 +434,8 @@ impl ShallowWater {
                         None => along_x += wall,
                     }
                     let (up, down) = (
-                        (z + 1 < nz).then(|| faces_z[z * nx + x]),
-                        (z > 0).then(|| faces_z[(z - 1) * nx + x]),
+                        (z + 1 < nz).then(|| faces_z[(z - first) * nx + x]),
+                        (z > 0).then(|| faces_z[(z - 1 - first) * nx + x]),
                     );
                     match up {
                         Some((flux, own, _)) => {
@@ -449,18 +462,24 @@ impl ShallowWater {
                             world.flow_z[index] + scale * along_z,
                         )
                     };
-                    out.push((depth, flow_x, flow_z));
+                    out.0.push(depth);
+                    out.1.push(flow_x);
+                    out.2.push(flow_z);
                 }
             }
             out
         })?;
-        for (index, (depth, flow_x, flow_z)) in next.into_iter().flatten().enumerate() {
-            if !(depth.is_finite() && flow_x.is_finite() && flow_z.is_finite()) {
+        let mut at = 0;
+        for (depth, flow_x, flow_z) in next {
+            let end = at + depth.len();
+            let finite = |list: &[f32]| list.iter().all(|value| value.is_finite());
+            if !(finite(&depth) && finite(&flow_x) && finite(&flow_z)) {
                 return Err(PhysicsError::NonFinite("shallow water cell"));
             }
-            self.depth[index] = depth;
-            self.flow_x[index] = flow_x;
-            self.flow_z[index] = flow_z;
+            self.depth[at..end].copy_from_slice(&depth);
+            self.flow_x[at..end].copy_from_slice(&flow_x);
+            self.flow_z[at..end].copy_from_slice(&flow_z);
+            at = end;
         }
         Ok(())
     }

@@ -644,10 +644,21 @@ fn in_chunks<R: Send>(
     count: usize,
     work: impl Fn(Range<usize>) -> R + Sync,
 ) -> Result<Vec<R>, PhysicsError> {
-    let jobs = count.div_ceil(CHUNK);
+    in_chunks_of(dispatch, count, CHUNK, work)
+}
+
+/// [`in_chunks`] with `chunk` items a job.
+fn in_chunks_of<R: Send>(
+    dispatch: &dyn JobDispatch,
+    count: usize,
+    chunk: usize,
+    work: impl Fn(Range<usize>) -> R + Sync,
+) -> Result<Vec<R>, PhysicsError> {
+    let chunk = chunk.max(1);
+    let jobs = count.div_ceil(chunk);
     let slots: Vec<Mutex<Option<R>>> = (0..jobs).map(|_| Mutex::new(None)).collect();
     dispatch.run(jobs, &|job| {
-        let range = job * CHUNK..((job + 1) * CHUNK).min(count);
+        let range = job * chunk..((job + 1) * chunk).min(count);
         let result = work(range);
         *slots[job].lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
     });
