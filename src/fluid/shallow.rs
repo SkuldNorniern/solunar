@@ -509,7 +509,8 @@ impl ShallowWater {
         // each body's points in the world, with their velocity
         let mut placed = Vec::with_capacity(self.held.len());
         self.blocked.fill(false);
-        let mut owners = vec![u32::MAX; self.depth.len()];
+        // body points by the cell they are in, cell then owner then order
+        let mut in_cells: Vec<(usize, u32, Vec3)> = Vec::new();
         for (owner, held) in self.held.iter().enumerate() {
             let state = world.body_state(held.body)?;
             let center = state.position.to_dvec3().as_vec3();
@@ -521,15 +522,16 @@ impl ShallowWater {
                 if let Some(cell) = self.cell_at(at) {
                     let index = self.index(cell.0, cell.1);
                     // standing on the bed: nothing gets under it
-                    if at.y <= self.bed[index] + spacing && owners[index] == u32::MAX {
+                    if at.y <= self.bed[index] + spacing {
                         self.blocked[index] = true;
-                        owners[index] = owner as u32;
                     }
+                    in_cells.push((index, owner as u32, at));
                 }
                 points.push((at, velocity));
             }
             placed.push((center, points));
         }
+        in_cells.sort_by_key(|item| (item.0, item.1));
         let report = self.step(dt, dispatch)?;
         if dt <= 0.0 {
             return Ok(report);
@@ -537,7 +539,10 @@ impl ShallowWater {
         let settings = self.settings;
         let weight = settings.density * settings.gravity;
         let mut pushes = vec![(Vec3::ZERO, Vec3::ZERO); self.held.len()];
-        // pressure on each face a body blocks, from the water beside it
+        // pressure on each face a body blocks, from the water beside it, shared by the points in
+        // the blocked cell at their own depth: a dam's bottom block takes the bottom's push, not
+        // the whole column's
+        let layer = (settings.cell / spacing).powi(2);
         let (nx, nz) = self.size;
         for z in 0..nz {
             for x in 0..nx {
@@ -546,6 +551,7 @@ impl ShallowWater {
                 if self.blocked[index] || depth < settings.dry {
                     continue;
                 }
+                let surface = self.bed[index] + depth;
                 let sides = [
                     (x + 1 < nx, (x + 1, z), Vec3::X),
                     (x > 0, (x.wrapping_sub(1), z), -Vec3::X),
@@ -556,19 +562,23 @@ impl ShallowWater {
                     if !inside {
                         continue;
                     }
-                    let owner = owners[self.index(bx, bz)];
-                    if owner == u32::MAX {
+                    let blocked = self.index(bx, bz);
+                    if !self.blocked[blocked] {
                         continue;
                     }
-                    let force = toward * (weight * 0.5 * depth * depth * settings.cell);
-                    let face = self.origin
-                        + Vec3::new(x as f32 + 0.5, 0.0, z as f32 + 0.5) * settings.cell
-                        + toward * (settings.cell / 2.0);
-                    let at = Vec3::new(face.x, self.bed[index] + depth / 3.0, face.z);
-                    let (center, _) = &placed[owner as usize];
-                    let push = &mut pushes[owner as usize];
-                    push.0 += force;
-                    push.1 += (at - *center).cross(force);
+                    let start = in_cells.partition_point(|item| item.0 < blocked);
+                    let end = in_cells.partition_point(|item| item.0 <= blocked);
+                    for &(_, owner, at) in &in_cells[start..end] {
+                        if at.y >= surface {
+                            continue;
+                        }
+                        let pressure = weight * (surface - at.y);
+                        let force = toward * (pressure * spacing * settings.cell / layer);
+                        let (center, _) = &placed[owner as usize];
+                        let push = &mut pushes[owner as usize];
+                        push.0 += force;
+                        push.1 += (at - *center).cross(force);
+                    }
                 }
             }
         }
@@ -883,8 +893,13 @@ mod tests {
             .unwrap();
         world.step_fixed().unwrap();
         let velocity = world.body_state(body).unwrap().linear_velocity;
-        // 1.2 m of water on a 2 m wide face pushes about 14 kN, the block weighs 18 kN
-        assert!(velocity.x > 0.01, "{velocity:?}");
+        // 1.2 m of water on a 2 m wide face pushes 1000 * 9.81 * 1.2^2 / 2 * 2 = 14.1 kN, on
+        // 3600 kg that is 0.065 m/s in a tick
+        let ideal = 14126.0 / 3600.0 * TICK;
+        assert!(
+            (velocity.x - ideal).abs() < ideal * 0.15,
+            "{velocity:?} {ideal}"
+        );
         assert!(velocity.z.abs() < velocity.x * 0.01, "{velocity:?}");
     }
 
