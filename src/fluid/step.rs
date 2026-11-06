@@ -102,8 +102,13 @@ impl FluidWorld {
             .collect();
         let world = &*self;
         let mass = self.mass;
+        let bodies = self.coupled.len();
+        let radius = settings.radius();
+        let damping = (WALL_DAMPING * settings.sound_speed * radius)
+            .min(STABLE_WALL_DAMPING * radius * radius / dt);
         let parts = in_chunks(dispatch, self.len(), |range| {
-            range
+            let mut felt = vec![(Vec3::ZERO, Vec3::ZERO); bodies];
+            let pushes = range
                 .map(|index| {
                     let at = world.positions[index];
                     let density = world.densities[index];
@@ -125,12 +130,22 @@ impl FluidWorld {
                         let offset = at - world.walls.positions[wall as usize];
                         push -= world.kernel.gradient(offset) * (mass * mirrored);
                     }
+                    world.mover_push(index, mirrored, damping, &mut push, &mut felt);
                     push + world.viscous(index, dt) + settings.gravity
                 })
-                .collect::<Vec<Vec3>>()
+                .collect::<Vec<Vec3>>();
+            (pushes, felt)
         })?;
-        for (velocity, push) in self.velocities.iter_mut().zip(parts.into_iter().flatten()) {
-            *velocity += push * dt;
+        let mut velocities = self.velocities.iter_mut();
+        for (pushes, felt) in parts {
+            // pushes first: zip asks its left side first, and must not take a velocity past the chunk
+            for (push, velocity) in pushes.into_iter().zip(velocities.by_ref()) {
+                *velocity += push * dt;
+            }
+            for (known, (force, torque)) in self.coupled.iter_mut().zip(felt) {
+                known.impulse.0 += force * dt;
+                known.impulse.1 += torque * dt;
+            }
         }
         self.advance(dt)
     }

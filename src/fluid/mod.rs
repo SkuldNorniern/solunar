@@ -9,11 +9,13 @@ use crate::error::PhysicsError;
 use crate::snapshot::fnv1a;
 
 mod boundary;
+mod couple;
 mod dfsph;
 mod step;
 
 pub use boundary::BoundaryId;
 use boundary::Walls;
+use couple::{Coupled, Movers};
 pub use step::FluidReport;
 
 /// Particles per job. Fixed, so the split of work and every sum in it never depend on how many
@@ -304,6 +306,10 @@ pub struct FluidWorld {
     /// Walls near each particle, indexes into `walls`.
     wall_neighbors: Lists,
     walls: Walls,
+    coupled: Vec<Coupled>,
+    movers: Movers,
+    /// Body points near each particle, indexes into `movers`.
+    mover_neighbors: Lists,
 }
 
 impl FluidWorld {
@@ -324,6 +330,9 @@ impl FluidWorld {
             neighbors: Lists::default(),
             wall_neighbors: Lists::default(),
             walls: Walls::default(),
+            coupled: Vec::new(),
+            movers: Movers::default(),
+            mover_neighbors: Lists::default(),
         })
     }
 
@@ -468,10 +477,11 @@ impl FluidWorld {
         let lists = in_chunks(dispatch, self.len(), |range| {
             let mut fluid = (Vec::with_capacity(range.len()), Vec::new());
             let mut walls = (Vec::with_capacity(range.len()), Vec::new());
+            let mut movers = (Vec::with_capacity(range.len()), Vec::new());
             for index in range {
                 let at = world.positions[index];
                 let cell = world.cell_of(at);
-                let before = (fluid.1.len(), walls.1.len());
+                let before = (fluid.1.len(), walls.1.len(), movers.1.len());
                 world
                     .grid
                     .near(&world.positions, at, cell, reach, &mut fluid.1);
@@ -480,14 +490,28 @@ impl FluidWorld {
                     .walls
                     .grid
                     .near(wall_at, at, cell, reach, &mut walls.1);
+                let mover_at = &world.movers.positions;
+                world
+                    .movers
+                    .grid
+                    .near(mover_at, at, cell, reach, &mut movers.1);
                 fluid.0.push((fluid.1.len() - before.0) as u32);
                 walls.0.push((walls.1.len() - before.1) as u32);
+                movers.0.push((movers.1.len() - before.2) as u32);
             }
-            (fluid, walls)
+            (fluid, walls, movers)
         })?;
-        let (fluid, walls): (Vec<_>, Vec<_>) = lists.into_iter().unzip();
+        let mut fluid = Vec::with_capacity(lists.len());
+        let mut walls = Vec::with_capacity(lists.len());
+        let mut movers = Vec::with_capacity(lists.len());
+        for (a, b, c) in lists {
+            fluid.push(a);
+            walls.push(b);
+            movers.push(c);
+        }
         self.neighbors = Lists::join(fluid.into_iter());
         self.wall_neighbors = Lists::join(walls.into_iter());
+        self.mover_neighbors = Lists::join(movers.into_iter());
         Ok(())
     }
 
@@ -529,7 +553,16 @@ impl FluidWorld {
                             world.kernel.value(distance)
                         })
                         .sum();
-                    mass * (sum + walls)
+                    let movers: f32 = world
+                        .mover_neighbors
+                        .of(index)
+                        .iter()
+                        .map(|&point| {
+                            let distance = (world.movers.positions[point as usize] - at).length();
+                            world.kernel.value(distance)
+                        })
+                        .sum();
+                    mass * (sum + walls + movers)
                 })
                 .collect::<Vec<f32>>()
         })?;
