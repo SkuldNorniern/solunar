@@ -18,6 +18,7 @@ pub enum PhysicsError {
     BodyHasJoints,
     ShapeInUse,
     TerrainBusy,
+    FluidFull,
 }
 
 impl fmt::Display for PhysicsError {
@@ -38,6 +39,7 @@ impl fmt::Display for PhysicsError {
             Self::BodyHasJoints => f.write_str("body has joints"),
             Self::ShapeInUse => f.write_str("a body still uses the shape"),
             Self::TerrainBusy => f.write_str("terrain edits are still waiting"),
+            Self::FluidFull => f.write_str("fluid has no room for more particles"),
         }
     }
 }

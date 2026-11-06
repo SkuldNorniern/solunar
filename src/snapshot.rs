@@ -742,7 +742,7 @@ fn kind_from_tag(tag: u8) -> Result<BodyKind, SnapshotError> {
     }
 }
 
-fn fnv1a(data: &[u8]) -> u64 {
+pub(crate) fn fnv1a(data: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in data {
         hash ^= u64::from(*byte);
