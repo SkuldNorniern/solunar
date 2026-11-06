@@ -15,16 +15,23 @@ use super::step::FluidReport;
 pub(super) struct Coupled {
     body: BodyHandle,
     points: Vec<Vec3>,
-    /// Where the body was this step, for torque.
+    /// Where the body was at the start of this step and how fast it went, for torque.
     pub(super) center: Vec3,
+    velocity: Vec3,
     /// What the water did to it this step: impulse and angular impulse about `center`.
     pub(super) impulse: (Vec3, Vec3),
+    /// How far the center has gone this step.
+    moved: Vec3,
 }
 
-/// The points of every coupled body, placed for this step. Bodies hold still while the water
-/// takes its substeps, the exchange happens once a step.
+/// The points of every coupled body for this step. Through the water's substeps they move on
+/// at their body's speed from where the step began, so the water sees a body sweep through. Held
+/// still, a fast body jumped a third of a meter into the water each tick and the pressure blew
+/// bricks apart. The exchange of pushes still happens once a step.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Movers {
+    /// Where each point was when the step began.
+    start: Vec<Vec3>,
     pub(super) positions: Vec<Vec3>,
     pub(super) velocities: Vec<Vec3>,
     /// Index into the coupled bodies.
@@ -56,7 +63,9 @@ impl FluidWorld {
             body,
             points,
             center: Vec3::ZERO,
+            velocity: Vec3::ZERO,
             impulse: (Vec3::ZERO, Vec3::ZERO),
+            moved: Vec3::ZERO,
         });
         self.coupled.sort_by_key(|known| known.body);
         Ok(())
@@ -169,6 +178,7 @@ impl FluidWorld {
             };
             let center = state.position.to_dvec3().as_vec3();
             known.center = center;
+            known.velocity = state.linear_velocity;
             known.impulse = (Vec3::ZERO, Vec3::ZERO);
             for local in &known.points {
                 let arm = state.rotation.rotate_vec3(*local);
@@ -183,14 +193,52 @@ impl FluidWorld {
                 placed.push((key, owner as u32, at, velocity));
             }
         }
-        // stable on equal keys, so points keep the order they were listed in
-        placed.sort_by_key(|item| (item.0, item.1));
         self.movers = Movers {
+            start: placed.iter().map(|item| item.2).collect(),
             positions: placed.iter().map(|item| item.2).collect(),
             velocities: placed.iter().map(|item| item.3).collect(),
             owners: placed.iter().map(|item| item.1).collect(),
-            grid: Grid::build(placed.iter().map(|item| item.0)),
+            grid: Grid::default(),
         };
+        self.carry_movers(0.0);
+    }
+
+    /// Moves body points on to `elapsed` seconds into the step, and sorts them by cell again.
+    pub(super) fn carry_movers(&mut self, elapsed: f32) {
+        let radius = self.settings.radius();
+        let movers = &mut self.movers;
+        let mut order: Vec<(CellKey, u32, usize)> = (0..movers.start.len())
+            .map(|index| {
+                let at = movers.start[index] + movers.velocities[index] * elapsed;
+                movers.positions[index] = at;
+                let cell = at / radius;
+                let key = (
+                    cell.x.floor() as i32,
+                    cell.y.floor() as i32,
+                    cell.z.floor() as i32,
+                );
+                (key, movers.owners[index], index)
+            })
+            .collect();
+        // owner and place in the body's list break ties, so the order never depends on threads
+        order.sort_unstable();
+        let pick = |list: &[Vec3]| order.iter().map(|item| list[item.2]).collect::<Vec<Vec3>>();
+        movers.start = pick(&movers.start);
+        movers.positions = pick(&movers.positions);
+        movers.velocities = pick(&movers.velocities);
+        movers.owners = order.iter().map(|item| item.1).collect();
+        movers.grid = Grid::build(order.iter().map(|item| item.0));
+        for known in &mut self.coupled {
+            known.moved = known.velocity * elapsed;
+        }
+    }
+
+    /// The fastest body point, for the substep length.
+    pub(super) fn fastest_mover(&self) -> f32 {
+        self.movers
+            .velocities
+            .iter()
+            .fold(0.0_f32, |most, velocity| most.max(velocity.length()))
     }
 
     /// Pressure and damping between particle `index` and the body points near it. Adds what the
@@ -227,7 +275,8 @@ impl FluidWorld {
             // the body gets the opposite of what this particle got
             let force = -part * self.mass;
             let owner = self.movers.owners[point] as usize;
-            let arm = self.movers.positions[point] - self.coupled[owner].center;
+            let known = &self.coupled[owner];
+            let arm = self.movers.positions[point] - (known.center + known.moved);
             bodies[owner].0 += force;
             bodies[owner].1 += arm.cross(force);
         }

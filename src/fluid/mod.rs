@@ -34,7 +34,7 @@ pub enum FluidSolver {
     #[default]
     Wcsph,
     /// Divergence free: pressure from small solves each substep, steps held by the flow speed.
-    /// Not ready: squeezes far less at rest, but still water keeps sloshing, its bottom layer
+    /// Not ready: still water keeps sloshing and squeezes more than the reference, its bottom layer
     /// reaches the floor plane, hard impacts squeeze it more and the dam break front runs ahead.
     Dfsph,
 }
