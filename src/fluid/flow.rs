@@ -3,6 +3,9 @@ use algebrix::Vec3;
 use super::FluidWorld;
 use crate::error::PhysicsError;
 
+/// New water goes only where none is nearer than this share of a spacing.
+const CLEAR_SHARE: f32 = 0.9;
+
 /// An emitter or drain, so it can be taken away again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FlowId(u32);
@@ -140,20 +143,32 @@ impl FluidWorld {
             if total == 0 {
                 continue;
             }
-            // a slot is taken when water is within half a spacing of its center
+            // a slot is taken when water is nearer its center than most of a spacing. by cell
+            // alone, water a hair past the slot's edge left it empty, the new particle landed on
+            // top of it, the squeeze threw water out and emptied more slots
+            let clear = (CLEAR_SHARE * spacing).powi(2);
             let mut taken = vec![false; total as usize];
             for at in &self.positions {
-                let local = (*at - flow.low) / spacing;
-                let slot = |value: f32, cells: i64| {
-                    let index = value.floor() as i64;
-                    (0..cells).contains(&index).then_some(index)
-                };
-                if let (Some(x), Some(y), Some(z)) = (
-                    slot(local.x, cells.0),
-                    slot(local.y, cells.1),
-                    slot(local.z, cells.2),
-                ) {
-                    taken[((y * cells.2 + z) * cells.0 + x) as usize] = true;
+                let local = (*at - flow.low) / spacing - Vec3::splat(0.5);
+                let nearest = |value: f32| value.round() as i64;
+                let (cx, cy, cz) = (nearest(local.x), nearest(local.y), nearest(local.z));
+                for y in cy - 1..=cy + 1 {
+                    for z in cz - 1..=cz + 1 {
+                        for x in cx - 1..=cx + 1 {
+                            if !((0..cells.0).contains(&x)
+                                && (0..cells.1).contains(&y)
+                                && (0..cells.2).contains(&z))
+                            {
+                                continue;
+                            }
+                            let center = flow.low
+                                + Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5)
+                                    * spacing;
+                            if (*at - center).length_squared() < clear {
+                                taken[((y * cells.2 + z) * cells.0 + x) as usize] = true;
+                            }
+                        }
+                    }
                 }
             }
             for y in 0..cells.1 {
@@ -236,6 +251,29 @@ mod tests {
         // it sloshes a little between emitter and drain
         assert!(spread < 0.15, "{low} {high}");
         assert!(fluid.positions().iter().all(|at| at.x < 1.8 + 0.1));
+    }
+
+    #[test]
+    fn an_emitter_never_puts_water_on_top_of_water() {
+        let mut fluid = channel();
+        let spacing = fluid.settings().spacing;
+        // a particle a little past the first slot's edge
+        fluid
+            .add_particle(
+                Vec3::new(spacing * 1.05, spacing * 0.5, spacing * 0.5),
+                Vec3::ZERO,
+            )
+            .unwrap();
+        fluid
+            .add_emitter(Vec3::ZERO, Vec3::new(0.1, 0.05, 0.05), Vec3::ZERO)
+            .unwrap();
+        fluid.run_flows().unwrap();
+        let positions = fluid.positions();
+        for (a, at) in positions.iter().enumerate() {
+            for other in &positions[a + 1..] {
+                assert!((*at - *other).length() > 0.5 * spacing, "{at:?} {other:?}");
+            }
+        }
     }
 
     #[test]
