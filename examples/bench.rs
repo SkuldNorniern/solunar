@@ -7,7 +7,7 @@ use solunar::{
     Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, FluidSettings, FluidSolver, FluidWorld,
     GridPosition, JobDispatch, JointDesc, JointHandle, Material, PhaseTimes, PhysicsError,
     PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain,
-    Sequential, Shape, ShapeCast, Vec3,
+    Sequential, ShallowSettings, ShallowWater, Shape, ShapeCast, Vec3,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -21,7 +21,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 14] = [
+const SUITES: [(&str, Suite); 15] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -36,6 +36,7 @@ const SUITES: [(&str, Suite); 14] = [
     ("dam", dam_small),
     ("dam-fine", dam_medium),
     ("dam-dfsph", dam_dfsph),
+    ("shallow", shallow),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -177,6 +178,44 @@ fn dam_with(spacing: f32, solver: FluidSolver) -> Result<Outcome> {
             f64::from(substeps) / 120.0,
             squeeze * 100.0,
             fluid.state_hash()
+        ),
+    })
+}
+
+/// A reservoir let go down a 100 by 25 m valley on 0.25 m cells, 40k of them, timed per 60 hz
+/// tick.
+fn shallow() -> Result<Outcome> {
+    let size = (400, 100);
+    let mut bed = Vec::with_capacity(size.0 * size.1);
+    for z in 0..size.1 {
+        for x in 0..size.0 {
+            // falls along x, rises to both banks
+            let across = (z as f32 - 50.0) / 50.0;
+            bed.push(-0.02 * x as f32 + 3.0 * across * across);
+        }
+    }
+    let mut water = ShallowWater::new(ShallowSettings::default(), Vec3::ZERO, size, bed)?;
+    water.fill((0, 0), (99, 99), 2.0)?;
+    let mut times = Vec::new();
+    let mut substeps = 0;
+    for _ in 0..120 {
+        let started = Instant::now();
+        let report = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => water.step(1.0 / 60.0, pool),
+            None => water.step(1.0 / 60.0, &Sequential),
+        })?;
+        times.push(started.elapsed());
+        substeps += report.substeps;
+    }
+    Ok(Outcome {
+        bodies: size.0 * size.1,
+        times,
+        unit: "ms",
+        check: format!(
+            "{:.1} substeps a tick, {:.1} m3 held, hash {:016x}",
+            f64::from(substeps) / 120.0,
+            water.volume(),
+            water.state_hash()
         ),
     })
 }
