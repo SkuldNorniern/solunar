@@ -305,6 +305,9 @@ pub struct FluidWorld {
     positions: Vec<Vec3>,
     velocities: Vec<Vec3>,
     densities: Vec<f32>,
+    /// How the ground's density changes at each particle, from the last density pass, empty
+    /// without terrains. Summed once there, it is the dearest part of the ground.
+    ground_slopes: Vec<Vec3>,
     next_id: u32,
     grid: Grid,
     neighbors: Lists,
@@ -336,6 +339,7 @@ impl FluidWorld {
             positions: Vec::new(),
             velocities: Vec::new(),
             densities: Vec::new(),
+            ground_slopes: Vec::new(),
             next_id: 0,
             grid: Grid::default(),
             neighbors: Lists::default(),
@@ -575,12 +579,23 @@ impl FluidWorld {
                             world.kernel.value(distance)
                         })
                         .sum();
-                    let ground: f32 = world.ground_near(at).map(|ground| ground.density).sum();
-                    mass * (sum + walls + movers) + ground
+                    let (ground, slope) = world.ground_near(at).fold(
+                        (0.0, Vec3::ZERO),
+                        |(density, slope), ground| {
+                            (density + ground.density, slope + ground.gradient)
+                        },
+                    );
+                    (mass * (sum + walls + movers) + ground, slope)
                 })
-                .collect::<Vec<f32>>()
+                .collect::<Vec<(f32, Vec3)>>()
         })?;
-        self.densities = parts.into_iter().flatten().collect();
+        let (densities, slopes): (Vec<f32>, Vec<Vec3>) = parts.into_iter().flatten().unzip();
+        self.densities = densities;
+        self.ground_slopes = if self.terrains.is_empty() {
+            Vec::new()
+        } else {
+            slopes
+        };
         Ok(())
     }
 

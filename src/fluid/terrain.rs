@@ -91,7 +91,12 @@ impl TerrainField {
         let (distance, change) = self.read(&self.distances, point)?;
         let (mut density, mut gradient) = (0.0, Vec3::ZERO);
         if distance < sites.reach {
-            for (offset, weight) in &sites.offsets {
+            let open = distance - sites.spacing / 2.0;
+            for (offset, weight, far) in &sites.offsets {
+                // a distance moves no faster than the point, this site can not be in the ground
+                if *far <= open {
+                    continue;
+                }
                 let Some((there, toward)) = self.read(&self.distances, point + *offset) else {
                     continue;
                 };
@@ -119,7 +124,8 @@ pub(super) struct GroundSites {
     spacing: f32,
     /// Past this distance from the surface no site is solid.
     reach: f32,
-    offsets: Vec<(Vec3, f32)>,
+    /// Site, density it adds, how far from the particle.
+    offsets: Vec<(Vec3, f32, f32)>,
     low: f32,
     step: f32,
     damping: Vec<f32>,
@@ -135,7 +141,7 @@ impl GroundSites {
                     let offset = Vec3::new(x as f32, y as f32, z as f32) * spacing;
                     let far = offset.length();
                     if far < radius {
-                        offsets.push((offset, mass * kernel.value(far)));
+                        offsets.push((offset, mass * kernel.value(far), far));
                     }
                 }
             }
