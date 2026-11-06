@@ -8,6 +8,13 @@ use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
 use crate::snapshot::fnv1a;
 
+mod boundary;
+mod step;
+
+pub use boundary::BoundaryId;
+use boundary::Walls;
+pub use step::FluidReport;
+
 /// Particles per job. Fixed, so the split of work and every sum in it never depend on how many
 /// threads run it.
 const CHUNK: usize = 512;
@@ -22,6 +29,18 @@ pub struct FluidSettings {
     /// Kernel reach as a multiple of `spacing`.
     pub support: f32,
     pub max_particles: usize,
+    /// Meters a second. The equation of state is stiff enough that the fluid squeezes about
+    /// `(fastest flow / sound_speed)^2`, so ten times the fastest flow keeps it near one percent.
+    /// Higher costs more substeps.
+    pub sound_speed: f32,
+    /// Artificial viscosity. Below about 0.1 still water on a cubic lattice keeps churning as the
+    /// lattice settles into a denser packing. It also slows fast flow a little.
+    pub viscosity: f32,
+    pub gravity: Vec3,
+    /// Share of the kernel radius a particle may move in a substep.
+    pub courant: f32,
+    /// Most substeps one step may take. A step that needs more is reported, not cut short.
+    pub max_substeps: u32,
 }
 
 impl Default for FluidSettings {
@@ -31,6 +50,11 @@ impl Default for FluidSettings {
             rest_density: 1000.0,
             support: 2.0,
             max_particles: 1 << 22,
+            sound_speed: 20.0,
+            viscosity: 0.15,
+            gravity: Vec3::new(0.0, -9.81, 0.0),
+            courant: 0.4,
+            max_substeps: 2000,
         }
     }
 }
@@ -43,6 +67,13 @@ impl FluidSettings {
             && positive(self.rest_density)
             && support
             && self.max_particles > 0
+            && positive(self.sound_speed)
+            && self.viscosity.is_finite()
+            && self.viscosity >= 0.0
+            && self.gravity.is_finite()
+            && self.courant > 0.0
+            && self.courant <= 1.0
+            && self.max_substeps > 0
         {
             Ok(())
         } else {
@@ -100,6 +131,88 @@ impl Kernel {
 
 type CellKey = (i32, i32, i32);
 
+/// Cells in key order, each with its range in an array sorted the same way.
+#[derive(Debug, Clone, Default)]
+struct Grid {
+    cells: Vec<(CellKey, Range<u32>)>,
+}
+
+impl Grid {
+    /// `keys` must already be sorted.
+    fn build(keys: impl Iterator<Item = CellKey>) -> Self {
+        let mut cells: Vec<(CellKey, Range<u32>)> = Vec::new();
+        for (index, cell) in keys.enumerate() {
+            let index = index as u32;
+            match cells.last_mut() {
+                Some((last, range)) if *last == cell => range.end = index + 1,
+                _ => cells.push((cell, index..index + 1)),
+            }
+        }
+        Self { cells }
+    }
+
+    fn range(&self, key: CellKey) -> Option<Range<u32>> {
+        let slot = self.cells.binary_search_by_key(&key, |cell| cell.0).ok()?;
+        Some(self.cells[slot].1.clone())
+    }
+
+    /// Indexes within `reach` of `at` in the 27 cells around it, in a fixed order.
+    fn near(
+        &self,
+        positions: &[Vec3],
+        at: Vec3,
+        (cx, cy, cz): CellKey,
+        reach: f32,
+        out: &mut Vec<u32>,
+    ) {
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let Some(range) = self.range((cx + dx, cy + dy, cz + dz)) else {
+                        continue;
+                    };
+                    for other in range {
+                        if (positions[other as usize] - at).length_squared() < reach {
+                            out.push(other);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Neighbor lists of every particle, one after another.
+#[derive(Debug, Clone, Default)]
+struct Lists {
+    start: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl Lists {
+    fn of(&self, index: usize) -> &[u32] {
+        let (Some(&start), Some(&end)) = (self.start.get(index), self.start.get(index + 1)) else {
+            return &[];
+        };
+        &self.items[start as usize..end as usize]
+    }
+
+    fn join(parts: impl Iterator<Item = (Vec<u32>, Vec<u32>)>) -> Self {
+        let mut lists = Self {
+            start: vec![0],
+            items: Vec::new(),
+        };
+        for (counts, found) in parts {
+            for count in counts {
+                let last = lists.start.last().copied().unwrap_or(0);
+                lists.start.push(last + count);
+            }
+            lists.items.extend(found);
+        }
+        lists
+    }
+}
+
 /// Particles as arrays per field, kept sorted by grid cell so neighbors sit close in memory.
 #[derive(Debug, Clone)]
 pub struct FluidWorld {
@@ -111,9 +224,11 @@ pub struct FluidWorld {
     velocities: Vec<Vec3>,
     densities: Vec<f32>,
     next_id: u32,
-    cells: Vec<(CellKey, Range<u32>)>,
-    neighbor_start: Vec<u32>,
-    neighbors: Vec<u32>,
+    grid: Grid,
+    neighbors: Lists,
+    /// Walls near each particle, indexes into `walls`.
+    wall_neighbors: Lists,
+    walls: Walls,
 }
 
 impl FluidWorld {
@@ -130,9 +245,10 @@ impl FluidWorld {
             velocities: Vec::new(),
             densities: Vec::new(),
             next_id: 0,
-            cells: Vec::new(),
-            neighbor_start: Vec::new(),
-            neighbors: Vec::new(),
+            grid: Grid::default(),
+            neighbors: Lists::default(),
+            wall_neighbors: Lists::default(),
+            walls: Walls::default(),
         })
     }
 
@@ -270,75 +386,49 @@ impl FluidWorld {
             .map(|item| self.densities[pick(item)])
             .collect();
 
-        self.cells.clear();
-        for (index, (cell, _, _)) in order.iter().enumerate() {
-            match self.cells.last_mut() {
-                Some((last, range)) if last == cell => range.end = index as u32 + 1,
-                _ => self.cells.push((*cell, index as u32..index as u32 + 1)),
-            }
-        }
+        self.grid = Grid::build(order.iter().map(|item| item.0));
 
         let reach = self.settings.radius().powi(2);
         let world = &*self;
         let lists = in_chunks(dispatch, self.len(), |range| {
-            let mut counts = Vec::with_capacity(range.len());
-            let mut found = Vec::new();
+            let mut fluid = (Vec::with_capacity(range.len()), Vec::new());
+            let mut walls = (Vec::with_capacity(range.len()), Vec::new());
             for index in range {
                 let at = world.positions[index];
-                let (cx, cy, cz) = world.cell_of(at);
-                let before = found.len();
-                for dz in -1..=1 {
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            let key = (cx + dx, cy + dy, cz + dz);
-                            let Ok(slot) = world.cells.binary_search_by_key(&key, |cell| cell.0)
-                            else {
-                                continue;
-                            };
-                            for other in world.cells[slot].1.clone() {
-                                let offset = world.positions[other as usize] - at;
-                                if offset.length_squared() < reach {
-                                    found.push(other);
-                                }
-                            }
-                        }
-                    }
-                }
-                counts.push((found.len() - before) as u32);
+                let cell = world.cell_of(at);
+                let before = (fluid.1.len(), walls.1.len());
+                world
+                    .grid
+                    .near(&world.positions, at, cell, reach, &mut fluid.1);
+                let wall_at = &world.walls.positions;
+                world
+                    .walls
+                    .grid
+                    .near(wall_at, at, cell, reach, &mut walls.1);
+                fluid.0.push((fluid.1.len() - before.0) as u32);
+                walls.0.push((walls.1.len() - before.1) as u32);
             }
-            (counts, found)
+            (fluid, walls)
         })?;
-        self.neighbor_start.clear();
-        self.neighbors.clear();
-        self.neighbor_start.push(0);
-        for (counts, found) in lists {
-            for count in counts {
-                let last = self.neighbor_start.last().copied().unwrap_or(0);
-                self.neighbor_start.push(last + count);
-            }
-            self.neighbors.extend(found);
-        }
+        let (fluid, walls): (Vec<_>, Vec<_>) = lists.into_iter().unzip();
+        self.neighbors = Lists::join(fluid.into_iter());
+        self.wall_neighbors = Lists::join(walls.into_iter());
         Ok(())
     }
 
     /// Indexes into the arrays, from the last [`Self::update_neighbors`]. Empty when it has not
     /// run since particles were added.
     pub fn neighbors_of(&self, index: usize) -> &[u32] {
-        let (Some(&start), Some(&end)) = (
-            self.neighbor_start.get(index),
-            self.neighbor_start.get(index + 1),
-        ) else {
-            return &[];
-        };
-        &self.neighbors[start as usize..end as usize]
+        self.neighbors.of(index)
     }
 
-    /// Mass weighted by the kernel over each particle's neighbors.
+    /// Mass weighted by the kernel over each particle's neighbors, walls taking the place of the
+    /// water that is not there.
     ///
     /// # Errors
     /// Fails if the dispatcher skipped a job, or neighbors are stale.
     pub fn compute_densities(&mut self, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
-        if self.neighbor_start.len() != self.len() + 1 {
+        if self.neighbors.start.len() != self.len() + 1 {
             return Err(PhysicsError::OutOfRange);
         }
         let mass = self.mass;
@@ -355,7 +445,16 @@ impl FluidWorld {
                             world.kernel.value(distance)
                         })
                         .sum();
-                    mass * sum
+                    let walls: f32 = world
+                        .wall_neighbors
+                        .of(index)
+                        .iter()
+                        .map(|&wall| {
+                            let distance = (world.walls.positions[wall as usize] - at).length();
+                            world.kernel.value(distance)
+                        })
+                        .sum();
+                    mass * (sum + walls)
                 })
                 .collect::<Vec<f32>>()
         })?;
@@ -537,7 +636,7 @@ mod tests {
             fluid.compute_densities(dispatch).unwrap();
             let bits: Vec<u32> = fluid.densities.iter().map(|d| d.to_bits()).collect();
             (
-                fluid.neighbors.clone(),
+                fluid.neighbors.items.clone(),
                 bits,
                 fluid.ids.clone(),
                 fluid.state_hash(),
