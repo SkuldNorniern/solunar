@@ -30,6 +30,10 @@ impl FluidWorld {
         dispatch: &dyn JobDispatch,
         report: &mut FluidReport,
     ) -> Result<(), PhysicsError> {
+        // ground pushes through the weakly compressible solver's pressure only
+        if !self.terrains.is_empty() {
+            return Err(PhysicsError::InvalidSettings);
+        }
         // a particle may move this share of a spacing in a substep
         let spacing = self.settings.spacing;
         let courant = self.settings.courant;

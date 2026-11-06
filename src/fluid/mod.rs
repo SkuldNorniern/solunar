@@ -21,7 +21,7 @@ use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;
 pub use step::FluidReport;
-use terrain::TerrainField;
+use terrain::{GroundSites, TerrainField};
 
 /// Particles per job. Fixed, so the split of work and every sum in it never depend on how many
 /// threads run it.
@@ -317,6 +317,7 @@ pub struct FluidWorld {
     mover_neighbors: Lists,
     flows: Flows,
     terrains: Vec<TerrainField>,
+    ground_sites: GroundSites,
 }
 
 impl FluidWorld {
@@ -324,10 +325,13 @@ impl FluidWorld {
     /// Fails on settings out of range.
     pub fn new(settings: FluidSettings) -> Result<Self, PhysicsError> {
         settings.validate()?;
+        let kernel = Kernel::new(settings.radius());
+        let mass = rest_mass(&settings);
         Ok(Self {
             settings,
-            kernel: Kernel::new(settings.radius()),
-            mass: rest_mass(&settings),
+            kernel,
+            mass,
+            ground_sites: GroundSites::new(&kernel, mass, settings.spacing, settings.radius()),
             ids: Vec::new(),
             positions: Vec::new(),
             velocities: Vec::new(),
@@ -571,7 +575,8 @@ impl FluidWorld {
                             world.kernel.value(distance)
                         })
                         .sum();
-                    mass * (sum + walls + movers)
+                    let ground: f32 = world.ground_near(at).map(|ground| ground.density).sum();
+                    mass * (sum + walls + movers) + ground
                 })
                 .collect::<Vec<f32>>()
         })?;

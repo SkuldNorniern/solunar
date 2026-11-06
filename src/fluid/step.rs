@@ -148,6 +148,9 @@ impl FluidWorld {
                         let offset = at - world.walls.positions[wall as usize];
                         push -= world.kernel.gradient(offset) * (mass * mirrored);
                     }
+                    for ground in world.ground_near(at) {
+                        push -= ground.gradient * mirrored;
+                    }
                     world.mover_push(index, mirrored, damping, &mut push, &mut felt);
                     push + world.viscous(index, dt) + settings.gravity
                 })
@@ -208,6 +211,13 @@ impl FluidWorld {
         let into = normal * velocity.dot(normal).min(0.0);
         let wall_viscosity =
             (WALL_DAMPING * settings.sound_speed * radius).min(STABLE_WALL_DAMPING * stable);
+        for ground in self.ground_near(at) {
+            let into = velocity.dot(ground.normal);
+            if into < 0.0 {
+                let weight = self.ground_sites.damping(ground.distance);
+                push -= ground.normal * (wall_viscosity * into * weight / density);
+            }
+        }
         for &wall in walls {
             let offset = at - self.walls.positions[wall as usize];
             let toward = into.dot(offset);
