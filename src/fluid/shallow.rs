@@ -1,13 +1,21 @@
 use algebrix::Vec3;
 
+use super::couple::shape_points;
 use super::in_chunks;
+use crate::body::BodyHandle;
 use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
 use crate::sdf::SdfVolume;
+use crate::shape::Shape;
 use crate::snapshot::fnv1a;
+use crate::world::PhysicsWorld;
 
 /// Most cells one shallow water grid may hold.
 const MAX_CELLS: usize = 1 << 24;
+/// Most points one held body is sampled with.
+const MAX_BODY_POINTS: usize = 1 << 16;
+/// Drag of a body point against the flow, as for a blunt body.
+const DRAG: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShallowSettings {
@@ -21,6 +29,8 @@ pub struct ShallowSettings {
     pub max_substeps: u32,
     /// Shallower than this a cell counts as dry and holds no flow.
     pub dry: f32,
+    /// Of the water, for what it does to bodies.
+    pub density: f32,
 }
 
 impl Default for ShallowSettings {
@@ -31,6 +41,7 @@ impl Default for ShallowSettings {
             courant: 0.25,
             max_substeps: 64,
             dry: 1e-4,
+            density: 1000.0,
         }
     }
 }
@@ -45,7 +56,9 @@ impl ShallowSettings {
             && self.courant <= 0.25
             && self.max_substeps > 0
             && self.dry.is_finite()
-            && self.dry > 0.0;
+            && self.dry > 0.0
+            && self.density.is_finite()
+            && self.density > 0.0;
         if valid {
             Ok(())
         } else {
@@ -80,6 +93,16 @@ pub struct ShallowWater {
     /// Depth times velocity, along x and along z.
     flow_x: Vec<f32>,
     flow_z: Vec<f32>,
+    /// Cells a body stands in from the bed up, walls for the water this step.
+    blocked: Vec<bool>,
+    held: Vec<Held>,
+}
+
+/// A body the water pushes and is held back by, as points through its volume.
+#[derive(Debug, Clone)]
+struct Held {
+    body: BodyHandle,
+    points: Vec<Vec3>,
 }
 
 /// Depth, flow along the face's normal and across it, on one side of a face.
@@ -119,6 +142,8 @@ impl ShallowWater {
             depth: vec![0.0; count],
             flow_x: vec![0.0; count],
             flow_z: vec![0.0; count],
+            blocked: vec![false; count],
+            held: Vec::new(),
         })
     }
 
@@ -321,7 +346,10 @@ impl ShallowWater {
 
     /// Flux through the face between cells `a` and `b`, and the pressure each side adds back
     /// for its own bed: mass, momentum along, momentum across.
-    fn face(&self, a: usize, b: usize, along_x: bool) -> ([f32; 3], f32, f32) {
+    fn face(&self, a: usize, b: usize, along_x: bool) -> Option<([f32; 3], f32, f32)> {
+        if self.blocked[a] || self.blocked[b] {
+            return None;
+        }
         let bed = self.bed[a].max(self.bed[b]);
         let left = self.side(a, along_x, bed);
         let right = self.side(b, along_x, bed);
@@ -330,7 +358,7 @@ impl ShallowWater {
         let half = gravity * 0.5;
         let own =
             |index: usize, side: Side| half * (self.depth[index].powi(2) - side.depth.powi(2));
-        (flux, own(a, left), own(b, right))
+        Some((flux, own(a, left), own(b, right)))
     }
 
     fn substep(&mut self, dt: f32, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
@@ -366,12 +394,17 @@ impl ShallowWater {
                 for x in 0..nx {
                     let index = world.index(x, z);
                     let depth = world.depth[index];
+                    if world.blocked[index] {
+                        // water under a body waits there until it moves
+                        out.push((depth, 0.0, 0.0));
+                        continue;
+                    }
                     let wall = half * depth * depth;
                     let (mut mass, mut along_x, mut along_z) = (0.0, 0.0, 0.0);
                     // x faces: flux leaves through the right face, comes in through the left
                     let (right, left) = (
-                        (x + 1 < nx).then(|| faces_x[z * (nx - 1) + x]),
-                        (x > 0).then(|| faces_x[z * (nx - 1) + x - 1]),
+                        (x + 1 < nx).then(|| faces_x[z * (nx - 1) + x]).flatten(),
+                        (x > 0).then(|| faces_x[z * (nx - 1) + x - 1]).flatten(),
                     );
                     match right {
                         Some((flux, own, _)) => {
@@ -390,8 +423,8 @@ impl ShallowWater {
                         None => along_x += wall,
                     }
                     let (up, down) = (
-                        (z + 1 < nz).then(|| faces_z[z * nx + x]),
-                        (z > 0).then(|| faces_z[(z - 1) * nx + x]),
+                        (z + 1 < nz).then(|| faces_z[z * nx + x]).flatten(),
+                        (z > 0).then(|| faces_z[(z - 1) * nx + x]).flatten(),
                     );
                     match up {
                         Some((flux, own, _)) => {
@@ -432,6 +465,145 @@ impl ShallowWater {
             self.flow_z[index] = flow_z;
         }
         Ok(())
+    }
+
+    /// Lets `body` hold the water back where it stands on the bed, and be pushed by it: the
+    /// water's pressure on the faces it blocks, lift where it is under the surface, drag of the
+    /// flow. The water does not feel the drag back. Coupling a body again replaces it.
+    ///
+    /// # Errors
+    /// Fails on a shape that can not be sampled.
+    pub fn couple(&mut self, body: BodyHandle, shape: &Shape) -> Result<(), PhysicsError> {
+        let spacing = self.settings.cell / 2.0;
+        let points = shape_points(shape, spacing, f32::INFINITY, MAX_BODY_POINTS)?;
+        if points.is_empty() {
+            return Err(PhysicsError::InvalidShape);
+        }
+        self.held.retain(|held| held.body != body);
+        self.held.push(Held { body, points });
+        self.held.sort_by_key(|held| held.body);
+        Ok(())
+    }
+
+    /// Returns false for a body that was not coupled.
+    pub fn uncouple(&mut self, body: BodyHandle) -> bool {
+        let before = self.held.len();
+        self.held.retain(|held| held.body != body);
+        self.held.len() != before
+    }
+
+    /// Advances the water `dt` seconds held back by the coupled bodies where `world` has them,
+    /// then hands each dynamic body the water's push as force and torque for the world's next
+    /// step. Call it right before that step. Bodies gone from the world are dropped.
+    ///
+    /// # Errors
+    /// Fails like [`Self::step`].
+    pub fn step_with_bodies(
+        &mut self,
+        dt: f32,
+        world: &mut PhysicsWorld,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<ShallowReport, PhysicsError> {
+        self.held.retain(|held| world.body_state(held.body).is_ok());
+        let spacing = self.settings.cell / 2.0;
+        // each body's points in the world, with their velocity
+        let mut placed = Vec::with_capacity(self.held.len());
+        self.blocked.fill(false);
+        let mut owners = vec![u32::MAX; self.depth.len()];
+        for (owner, held) in self.held.iter().enumerate() {
+            let state = world.body_state(held.body)?;
+            let center = state.position.to_dvec3().as_vec3();
+            let mut points = Vec::with_capacity(held.points.len());
+            for local in &held.points {
+                let arm = state.rotation.rotate_vec3(*local);
+                let at = center + arm;
+                let velocity = state.linear_velocity + state.angular_velocity.cross(arm);
+                if let Some(cell) = self.cell_at(at) {
+                    let index = self.index(cell.0, cell.1);
+                    // standing on the bed: nothing gets under it
+                    if at.y <= self.bed[index] + spacing && owners[index] == u32::MAX {
+                        self.blocked[index] = true;
+                        owners[index] = owner as u32;
+                    }
+                }
+                points.push((at, velocity));
+            }
+            placed.push((center, points));
+        }
+        let report = self.step(dt, dispatch)?;
+        if dt <= 0.0 {
+            return Ok(report);
+        }
+        let settings = self.settings;
+        let weight = settings.density * settings.gravity;
+        let mut pushes = vec![(Vec3::ZERO, Vec3::ZERO); self.held.len()];
+        // pressure on each face a body blocks, from the water beside it
+        let (nx, nz) = self.size;
+        for z in 0..nz {
+            for x in 0..nx {
+                let index = self.index(x, z);
+                let depth = self.depth[index];
+                if self.blocked[index] || depth < settings.dry {
+                    continue;
+                }
+                let sides = [
+                    (x + 1 < nx, (x + 1, z), Vec3::X),
+                    (x > 0, (x.wrapping_sub(1), z), -Vec3::X),
+                    (z + 1 < nz, (x, z + 1), Vec3::Z),
+                    (z > 0, (x, z.wrapping_sub(1)), -Vec3::Z),
+                ];
+                for (inside, (bx, bz), toward) in sides {
+                    if !inside {
+                        continue;
+                    }
+                    let owner = owners[self.index(bx, bz)];
+                    if owner == u32::MAX {
+                        continue;
+                    }
+                    let force = toward * (weight * 0.5 * depth * depth * settings.cell);
+                    let face = self.origin
+                        + Vec3::new(x as f32 + 0.5, 0.0, z as f32 + 0.5) * settings.cell
+                        + toward * (settings.cell / 2.0);
+                    let at = Vec3::new(face.x, self.bed[index] + depth / 3.0, face.z);
+                    let (center, _) = &placed[owner as usize];
+                    let push = &mut pushes[owner as usize];
+                    push.0 += force;
+                    push.1 += (at - *center).cross(force);
+                }
+            }
+        }
+        // lift and drag on each point under the surface
+        let volume = spacing.powi(3);
+        let area = spacing * spacing;
+        for (owner, (center, points)) in placed.iter().enumerate() {
+            for (at, velocity) in points {
+                let Some(cell) = self.cell_at(*at) else {
+                    continue;
+                };
+                let index = self.index(cell.0, cell.1);
+                if at.y >= self.bed[index] + self.depth[index] {
+                    continue;
+                }
+                let flow = if self.blocked[index] {
+                    Vec3::ZERO
+                } else {
+                    self.velocity(cell)
+                };
+                let past = flow - *velocity;
+                let force = Vec3::Y * (weight * volume)
+                    + past * (0.5 * DRAG * settings.density * area * past.length());
+                let push = &mut pushes[owner];
+                push.0 += force;
+                push.1 += (*at - *center).cross(force);
+            }
+        }
+        for (held, (force, torque)) in self.held.iter().zip(pushes) {
+            // a fixed or kinematic body holds the water but is not pushed
+            if world.apply_force(held.body, force).is_ok() {
+                world.apply_torque(held.body, torque)?;
+            }
+        }
+        Ok(report)
     }
 
     /// Bits of every cell's state, x fastest.
@@ -529,7 +701,9 @@ fn surface_below(distance: impl Fn(f32) -> f32, top: f32, bottom: f32, close: f3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::body::RigidBodyDesc;
     use crate::dispatch::Sequential;
+    use crate::world::PhysicsSettings;
 
     struct Threads(usize);
 
@@ -650,6 +824,90 @@ mod tests {
         assert!(water.step(f32::NAN, &Sequential).is_err());
         assert!(water.fill((0, 0), (2, 0), 1.0).is_err());
         assert!(water.fill((0, 0), (1, 1), f32::INFINITY).is_err());
+    }
+
+    fn channel() -> (ShallowWater, PhysicsWorld) {
+        // 30 by 8 cells of 0.25 m on a flat bed at y = 0
+        let water = ShallowWater::new(
+            ShallowSettings::default(),
+            Vec3::ZERO,
+            (30, 8),
+            vec![0.0; 240],
+        )
+        .unwrap();
+        (
+            water,
+            PhysicsWorld::new(PhysicsSettings::default()).unwrap(),
+        )
+    }
+
+    /// A box across the channel at x = 3.75 m, standing on the bed.
+    fn wall(world: &mut PhysicsWorld, desc: fn(Shape) -> RigidBodyDesc) -> (BodyHandle, Shape) {
+        let shape = Shape::cuboid(Vec3::new(0.25, 0.75, 1.0));
+        let body = world
+            .spawn(desc(shape).local_position(Vec3::new(3.75, 0.75, 1.0)))
+            .unwrap();
+        (body, shape)
+    }
+
+    #[test]
+    fn a_fixed_wall_holds_the_water_back() {
+        let (mut water, mut world) = channel();
+        let (body, shape) = wall(&mut world, RigidBodyDesc::fixed);
+        water.couple(body, &shape).unwrap();
+        let start = water.fill((0, 0), (13, 7), 1.0).unwrap();
+        for _ in 0..120 {
+            water
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+        }
+        for z in 0..8 {
+            for x in 16..30 {
+                assert!(water.depths()[water.index(x, z)] < 1e-3, "{x} {z}");
+            }
+        }
+        assert!((water.volume() - start).abs() / start < 1e-4);
+    }
+
+    #[test]
+    fn water_pushes_a_dam_block_downstream() {
+        let (mut water, mut world) = channel();
+        let (body, shape) = wall(&mut world, |shape| {
+            RigidBodyDesc::dynamic(shape).density(2400.0)
+        });
+        water.couple(body, &shape).unwrap();
+        water.fill((0, 0), (13, 7), 1.2).unwrap();
+        water
+            .step_with_bodies(TICK, &mut world, &Sequential)
+            .unwrap();
+        world.step_fixed().unwrap();
+        let velocity = world.body_state(body).unwrap().linear_velocity;
+        // 1.2 m of water on a 2 m wide face pushes about 14 kN, the block weighs 18 kN
+        assert!(velocity.x > 0.01, "{velocity:?}");
+        assert!(velocity.z.abs() < velocity.x * 0.01, "{velocity:?}");
+    }
+
+    #[test]
+    fn a_light_box_floats_half_under() {
+        let (mut water, mut world) = channel();
+        water.fill((0, 0), (29, 7), 2.0).unwrap();
+        let shape = Shape::cuboid(Vec3::splat(0.4));
+        let desc = RigidBodyDesc::dynamic(shape)
+            .density(500.0)
+            .local_position(Vec3::new(3.75, 2.6, 1.0));
+        let body = world.spawn(desc).unwrap();
+        water.couple(body, &shape).unwrap();
+        for _ in 0..300 {
+            water
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+        }
+        let state = world.body_state(body).unwrap();
+        let height = state.position.local.y;
+        assert!((height - 2.0).abs() < 0.1, "{height}");
+        assert!(state.linear_velocity.length() < 0.2, "{state:?}");
     }
 
     #[test]
