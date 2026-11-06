@@ -541,7 +541,7 @@ impl ShallowWater {
         stacked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         for (index, y) in stacked {
             let floor = &mut self.floor[index];
-            if y - spacing <= *floor {
+            if y - 2.0 * spacing <= *floor {
                 *floor = floor.max(y + spacing / 2.0);
             }
         }
