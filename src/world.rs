@@ -6,6 +6,7 @@ use algebrix::{DQuat, DVec3, Quat, Vec3};
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::joint::JointKind;
 use crate::profile::{PhaseTimes, StepTimes};
+use crate::sensor::Sensors;
 use crate::sleep::{SleepScratch, is_slow, plan_wakes, update_sleep};
 use crate::solver::{
     CachedManifold, ContactScratch, add_woken_pairs, find_broad_pairs, finish_contacts,
@@ -103,6 +104,7 @@ pub struct PhysicsWorld {
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
     contact_events: Vec<ContactEvent>,
+    pub(crate) sensors: Sensors,
     failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
@@ -144,6 +146,7 @@ impl PhysicsWorld {
             accumulator,
             contact_cache: Vec::new(),
             contact_events: Vec::new(),
+            sensors: Sensors::default(),
             failed_body: None,
             recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
@@ -772,6 +775,7 @@ impl PhysicsWorld {
         );
         self.recheck_sleepers = false;
         self.tick += 1;
+        self.update_sensors()?;
         lap(&mut phases.finish);
         self.phases = phases;
         self.times.record(started.elapsed());

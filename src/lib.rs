@@ -13,6 +13,7 @@ mod material;
 mod position;
 mod profile;
 mod sdf;
+mod sensor;
 mod shape;
 mod sleep;
 mod snapshot;
@@ -42,6 +43,7 @@ pub use sdf::{
     Base, BrickJob, BrickKey, BrickMesh, BuiltBricks, Edit, EditId, EditOp, EditReport, EditShape,
     GROUND_LAYER, SdfDesc, SdfTerrain, SdfVolume,
 };
+pub use sensor::{SensorDesc, SensorEvent, SensorHandle};
 pub use shape::{MassProperties, Shape};
 pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};
 pub use vehicle::{Controls, Vehicle, WheelContact, WheelDesc, WheelState};
