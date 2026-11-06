@@ -252,11 +252,10 @@ impl PhysicsWorld {
             if center.length_squared() > reach * reach {
                 continue;
             }
-            let touching = assets.any_contact(
+            let touching = assets.overlapping(
                 (shape, rotation),
                 (&self.bodies.shape[dense], self.bodies.rotation[dense]),
                 center.as_vec3(),
-                0.0,
             );
             if touching {
                 out.push(self.bodies.handle_at(dense));
@@ -1105,6 +1104,38 @@ mod tests {
             }
         }
         assert!(hits > 500, "{hits}");
+    }
+
+    #[test]
+    fn a_near_miss_is_not_an_overlap() {
+        let mut world = world();
+        let floor = Shape::cuboid(Vec3::new(5.0, 0.5, 5.0));
+        let body = RigidBodyDesc::fixed(floor).local_position(Vec3::new(0.0, -0.5, 0.0));
+        world.spawn(body).unwrap();
+        let shape = Shape::cuboid(Vec3::splat(1.0));
+        let mut out = Vec::new();
+        let filter = QueryFilter::default();
+        // a centimeter up is inside the narrowphase's look ahead margin, still not touching
+        world
+            .overlap(
+                &shape,
+                at(0.0, 1.01, 0.0),
+                Quat::IDENTITY,
+                &filter,
+                &mut out,
+            )
+            .unwrap();
+        assert!(out.is_empty());
+        world
+            .overlap(
+                &shape,
+                at(0.0, 0.99, 0.0),
+                Quat::IDENTITY,
+                &filter,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

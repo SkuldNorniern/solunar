@@ -504,6 +504,20 @@ impl ShapeAssets {
     }
 }
 
+impl ShapeAssets {
+    /// Whether the shapes really overlap. Contacts the narrowphase finds a little apart, to catch
+    /// bodies about to touch, do not count.
+    pub(crate) fn overlapping(&self, a: (&Shape, Quat), b: (&Shape, Quat), center_b: Vec3) -> bool {
+        let mut found = false;
+        self.for_each_contact(a, b, center_b, 0.0, None, |_, _, raw, _| {
+            found |= raw.points[..raw.count]
+                .iter()
+                .any(|point| point.depth >= 0.0);
+        });
+        found
+    }
+}
+
 /// A far contact only stays when the sweep really reaches the other shape. A flat contact
 /// plane reaches past a corner, so a body flying by would hit nothing and still get stopped.
 fn will_meet_hulls(
