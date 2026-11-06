@@ -124,23 +124,37 @@ impl FluidWorld {
         let radius = settings.radius();
         let damping = (WALL_DAMPING * settings.sound_speed * radius)
             .min(STABLE_WALL_DAMPING * radius * radius / dt);
+        let soften = 0.01 * radius * radius;
+        let viscosity = self.viscosity(dt);
+        // pressure over density squared, once per particle rather than once per pair
+        let scaled: Vec<f32> = pressures
+            .iter()
+            .zip(&self.densities)
+            .map(|(pressure, density)| pressure / (density * density))
+            .collect();
         let parts = in_chunks(dispatch, self.len(), |range| {
             let mut felt = vec![(Vec3::ZERO, Vec3::ZERO); bodies];
             let pushes = range
                 .map(|index| {
                     let at = world.positions[index];
+                    let velocity = world.velocities[index];
                     let density = world.densities[index];
-                    let own = pressures[index] / (density * density);
+                    let own = scaled[index];
                     let mut push = Vec3::ZERO;
+                    // pressure and viscosity share each pair's distance and kernel slope
                     for &other in world.neighbors.of(index) {
                         let other = other as usize;
-                        if other == index {
+                        let offset = at - world.positions[other];
+                        let squared = offset.length_squared();
+                        if squared <= 0.0 {
                             continue;
                         }
-                        let their = world.densities[other];
-                        let pressure = own + pressures[other] / (their * their);
-                        push -=
-                            world.kernel.gradient(at - world.positions[other]) * (mass * pressure);
+                        let distance = squared.sqrt();
+                        let gradient = offset * (world.kernel.slope(distance) / distance);
+                        let toward = (velocity - world.velocities[other]).dot(offset).min(0.0);
+                        let damp = -viscosity * toward / (squared + soften) * 2.0
+                            / (density + world.densities[other]);
+                        push -= gradient * (mass * (own + scaled[other] + damp));
                     }
                     // a wall pushes back with this particle's own pressure, as water would
                     let mirrored = own + pressures[index] / (rest * rest);
@@ -152,7 +166,7 @@ impl FluidWorld {
                         push -= *slope * mirrored;
                     }
                     world.mover_push(index, mirrored, damping, &mut push, &mut felt);
-                    push + world.viscous(index, dt) + settings.gravity
+                    push + world.wall_viscous(index, dt) + settings.gravity
                 })
                 .collect::<Vec<Vec3>>();
             (pushes, felt)
@@ -175,12 +189,9 @@ impl FluidWorld {
     /// walls on all motion it was friction that held the dam break front 40% back, with none the
     /// front of a wave got through.
     pub(super) fn viscous(&self, index: usize, dt: f32) -> Vec3 {
-        let settings = &self.settings;
-        let radius = settings.radius();
+        let radius = self.settings.radius();
         let soften = 0.01 * radius * radius;
-        let stable = radius * radius / dt;
-        let viscosity =
-            (settings.viscosity * settings.sound_speed * radius).min(STABLE_VISCOSITY * stable);
+        let viscosity = self.viscosity(dt);
         let at = self.positions[index];
         let velocity = self.velocities[index];
         let density = self.densities[index];
@@ -198,6 +209,27 @@ impl FluidWorld {
                 push -= self.kernel.gradient(offset) * (self.mass * damp);
             }
         }
+        push + self.wall_viscous(index, dt)
+    }
+
+    /// Viscosity among particles, as strong as stays stable at `dt`.
+    fn viscosity(&self, dt: f32) -> f32 {
+        let settings = &self.settings;
+        let radius = settings.radius();
+        (settings.viscosity * settings.sound_speed * radius)
+            .min(STABLE_VISCOSITY * radius * radius / dt)
+    }
+
+    /// The walls' and ground's part of [`Self::viscous`].
+    fn wall_viscous(&self, index: usize, dt: f32) -> Vec3 {
+        let settings = &self.settings;
+        let radius = settings.radius();
+        let soften = 0.01 * radius * radius;
+        let stable = radius * radius / dt;
+        let at = self.positions[index];
+        let velocity = self.velocities[index];
+        let density = self.densities[index];
+        let mut push = Vec3::ZERO;
         let walls = self.wall_neighbors.of(index);
         let away = walls
             .iter()
