@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use solunar::{
-    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, FluidSettings, FluidWorld,
+    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, FluidSettings, FluidSolver, FluidWorld,
     GridPosition, JobDispatch, JointDesc, JointHandle, Material, PhaseTimes, PhysicsError,
     PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain,
     Sequential, Shape, ShapeCast, Vec3,
@@ -21,7 +21,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 13] = [
+const SUITES: [(&str, Suite); 14] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -35,6 +35,7 @@ const SUITES: [(&str, Suite); 13] = [
     ("moving", moving_tunnel),
     ("dam", dam_small),
     ("dam-fine", dam_medium),
+    ("dam-dfsph", dam_dfsph),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -133,11 +134,20 @@ fn dam_medium() -> Result<Outcome> {
     dam(0.03)
 }
 
+fn dam_dfsph() -> Result<Outcome> {
+    dam_with(0.03, FluidSolver::Dfsph)
+}
+
 /// A water column 0.6 m tall and wide in a 2.4 m tank, let go at once. Timed per 60 hz tick, which
 /// holds as many fluid substeps as the flow needs.
 fn dam(spacing: f32) -> Result<Outcome> {
+    dam_with(spacing, FluidSolver::Wcsph)
+}
+
+fn dam_with(spacing: f32, solver: FluidSolver) -> Result<Outcome> {
     let mut fluid = FluidWorld::new(FluidSettings {
         spacing,
+        solver,
         ..FluidSettings::default()
     })?;
     fluid.add_box_container(Vec3::ZERO, Vec3::new(2.4, 1.0, 0.3))?;
