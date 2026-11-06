@@ -532,7 +532,7 @@ impl ShallowWater {
         in_cells.sort_by_key(|item| (item.0, item.1));
         // the floor rises through body points stacked up from the bed with no gap, a body in the
         // air over the cell lifted the water up to it
-        self.floor.copy_from_slice(&self.bed);
+        let before = std::mem::replace(&mut self.floor, self.bed.clone());
         let mut stacked: Vec<(usize, f32)> = in_cells
             .iter()
             .filter(|item| standing[item.0])
@@ -545,6 +545,7 @@ impl ShallowWater {
                 *floor = floor.max(y + spacing / 2.0);
             }
         }
+        self.displace(&before);
         let report = self.step(dt, dispatch)?;
         if dt <= 0.0 {
             return Ok(report);
@@ -663,6 +664,50 @@ impl ShallowWater {
             }
         }
         Ok(report)
+    }
+
+    /// Where a floor rose under water, the water it took the place of goes to the lower cells
+    /// around, kept. Carried up on the floor instead, it was lifted over the top of a dam whose
+    /// blocks shifted a little and ran down its back.
+    fn displace(&mut self, before: &[f32]) {
+        let (nx, nz) = self.size;
+        let mut added = vec![0.0_f32; self.depth.len()];
+        for z in 0..nz {
+            for x in 0..nx {
+                let index = self.index(x, z);
+                let rise = self.floor[index] - before[index];
+                let depth = self.depth[index];
+                if rise <= 0.0 || depth <= 0.0 {
+                    continue;
+                }
+                let lower: Vec<usize> = [
+                    (x + 1 < nx).then(|| index + 1),
+                    (x > 0).then(|| index - 1),
+                    (z + 1 < nz).then(|| index + nx),
+                    (z > 0).then(|| index - nx),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&near| self.floor[near] < self.floor[index])
+                .collect();
+                if lower.is_empty() {
+                    continue;
+                }
+                let moved = rise.min(depth);
+                let kept = depth - moved;
+                let scale = kept / depth;
+                self.depth[index] = kept;
+                self.flow_x[index] *= scale;
+                self.flow_z[index] *= scale;
+                let share = moved / lower.len() as f32;
+                for near in lower {
+                    added[near] += share;
+                }
+            }
+        }
+        for (depth, more) in self.depth.iter_mut().zip(added) {
+            *depth += more;
+        }
     }
 
     /// Bits of every cell's state, x fastest.
@@ -952,6 +997,24 @@ mod tests {
             "{}",
             water.floors()[sill]
         );
+    }
+
+    #[test]
+    fn a_block_set_in_still_water_pushes_it_aside() {
+        let (mut water, mut world) = channel();
+        let start = water.fill((0, 0), (29, 7), 1.0).unwrap();
+        let shape = Shape::cuboid(Vec3::new(0.25, 0.25, 1.0));
+        let desc = RigidBodyDesc::fixed(shape).local_position(Vec3::new(3.75, 0.25, 1.0));
+        let body = world.spawn(desc).unwrap();
+        water.couple(body, &shape).unwrap();
+        water
+            .step_with_bodies(TICK, &mut world, &Sequential)
+            .unwrap();
+        // the surface over the block stays near where it was, not half a meter up
+        let sill = water.index(15, 4);
+        assert!(water.surface((15, 4)) < 1.1, "{}", water.surface((15, 4)));
+        assert!(water.depths()[sill] < 0.6);
+        assert!((water.volume() - start).abs() / start < 1e-4);
     }
 
     #[test]
