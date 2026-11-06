@@ -93,8 +93,9 @@ pub struct ShallowWater {
     /// Depth times velocity, along x and along z.
     flow_x: Vec<f32>,
     flow_z: Vec<f32>,
-    /// Cells a body stands in from the bed up, walls for the water this step.
-    blocked: Vec<bool>,
+    /// The bed raised to the top of any body standing on it, this step. Water over a low body
+    /// runs over it, a tall one holds it back, one that falls in lifts the water.
+    floor: Vec<f32>,
     held: Vec<Held>,
 }
 
@@ -138,11 +139,11 @@ impl ShallowWater {
             settings,
             origin,
             size,
+            floor: bed.clone(),
             bed,
             depth: vec![0.0; count],
             flow_x: vec![0.0; count],
             flow_z: vec![0.0; count],
-            blocked: vec![false; count],
             held: Vec::new(),
         })
     }
@@ -199,6 +200,11 @@ impl ShallowWater {
         &self.bed
     }
 
+    /// The bed with bodies standing on it, x fastest. The water sits on this.
+    pub fn floors(&self) -> &[f32] {
+        &self.floor
+    }
+
     /// Water depths, x fastest.
     pub fn depths(&self) -> &[f32] {
         &self.depth
@@ -219,7 +225,7 @@ impl ShallowWater {
     /// Water surface height at a cell, the bed where it is dry.
     pub fn surface(&self, (x, z): (usize, usize)) -> f32 {
         let index = self.index(x, z);
-        self.bed[index] + self.depth[index]
+        self.floor[index] + self.depth[index]
     }
 
     /// Water velocity in a cell, zero where it is dry.
@@ -254,7 +260,7 @@ impl ShallowWater {
         for z in low.1..=high.1 {
             for x in low.0..=high.0 {
                 let index = self.index(x, z);
-                let wanted = (level - self.bed[index]).max(0.0);
+                let wanted = (level - self.floor[index]).max(0.0);
                 if wanted > self.depth[index] {
                     added += f64::from(wanted - self.depth[index]) * area;
                     self.depth[index] = wanted;
@@ -338,7 +344,7 @@ impl ShallowWater {
         };
         // hydrostatic reconstruction: depth over the higher of the two beds
         Side {
-            depth: (depth + self.bed[index] - bed).max(0.0),
+            depth: (depth + self.floor[index] - bed).max(0.0),
             along,
             across,
         }
@@ -346,11 +352,8 @@ impl ShallowWater {
 
     /// Flux through the face between cells `a` and `b`, and the pressure each side adds back
     /// for its own bed: mass, momentum along, momentum across.
-    fn face(&self, a: usize, b: usize, along_x: bool) -> Option<([f32; 3], f32, f32)> {
-        if self.blocked[a] || self.blocked[b] {
-            return None;
-        }
-        let bed = self.bed[a].max(self.bed[b]);
+    fn face(&self, a: usize, b: usize, along_x: bool) -> ([f32; 3], f32, f32) {
+        let bed = self.floor[a].max(self.floor[b]);
         let left = self.side(a, along_x, bed);
         let right = self.side(b, along_x, bed);
         let gravity = self.settings.gravity;
@@ -358,7 +361,7 @@ impl ShallowWater {
         let half = gravity * 0.5;
         let own =
             |index: usize, side: Side| half * (self.depth[index].powi(2) - side.depth.powi(2));
-        Some((flux, own(a, left), own(b, right)))
+        (flux, own(a, left), own(b, right))
     }
 
     fn substep(&mut self, dt: f32, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
@@ -394,17 +397,12 @@ impl ShallowWater {
                 for x in 0..nx {
                     let index = world.index(x, z);
                     let depth = world.depth[index];
-                    if world.blocked[index] {
-                        // water under a body waits there until it moves
-                        out.push((depth, 0.0, 0.0));
-                        continue;
-                    }
                     let wall = half * depth * depth;
                     let (mut mass, mut along_x, mut along_z) = (0.0, 0.0, 0.0);
                     // x faces: flux leaves through the right face, comes in through the left
                     let (right, left) = (
-                        (x + 1 < nx).then(|| faces_x[z * (nx - 1) + x]).flatten(),
-                        (x > 0).then(|| faces_x[z * (nx - 1) + x - 1]).flatten(),
+                        (x + 1 < nx).then(|| faces_x[z * (nx - 1) + x]),
+                        (x > 0).then(|| faces_x[z * (nx - 1) + x - 1]),
                     );
                     match right {
                         Some((flux, own, _)) => {
@@ -423,8 +421,8 @@ impl ShallowWater {
                         None => along_x += wall,
                     }
                     let (up, down) = (
-                        (z + 1 < nz).then(|| faces_z[z * nx + x]).flatten(),
-                        (z > 0).then(|| faces_z[(z - 1) * nx + x]).flatten(),
+                        (z + 1 < nz).then(|| faces_z[z * nx + x]),
+                        (z > 0).then(|| faces_z[(z - 1) * nx + x]),
                     );
                     match up {
                         Some((flux, own, _)) => {
@@ -508,7 +506,7 @@ impl ShallowWater {
         let spacing = self.settings.cell / 2.0;
         // each body's points in the world, with their velocity
         let mut placed = Vec::with_capacity(self.held.len());
-        self.blocked.fill(false);
+        let mut standing = vec![false; self.depth.len()];
         // body points by the cell they are in, cell then owner then order
         let mut in_cells: Vec<(usize, u32, Vec3)> = Vec::new();
         for (owner, held) in self.held.iter().enumerate() {
@@ -523,7 +521,7 @@ impl ShallowWater {
                     let index = self.index(cell.0, cell.1);
                     // standing on the bed: nothing gets under it
                     if at.y <= self.bed[index] + spacing {
-                        self.blocked[index] = true;
+                        standing[index] = true;
                     }
                     in_cells.push((index, owner as u32, at));
                 }
@@ -532,6 +530,12 @@ impl ShallowWater {
             placed.push((center, points));
         }
         in_cells.sort_by_key(|item| (item.0, item.1));
+        self.floor.copy_from_slice(&self.bed);
+        for &(index, _, at) in &in_cells {
+            if standing[index] {
+                self.floor[index] = self.floor[index].max(at.y + spacing / 2.0);
+            }
+        }
         let report = self.step(dt, dispatch)?;
         if dt <= 0.0 {
             return Ok(report);
@@ -540,7 +544,7 @@ impl ShallowWater {
         let weight = settings.density * settings.gravity;
         let mut pushes = vec![(Vec3::ZERO, Vec3::ZERO); self.held.len()];
         // pressure on each face a body blocks, from the water beside it, shared by the points in
-        // the blocked cell at their own depth: a dam's bottom block takes the bottom's push, not
+        // the cell beside at their own depth: a dam's bottom block takes the bottom's push, not
         // the whole column's
         let layer = (settings.cell / spacing).powi(2);
         let (nx, nz) = self.size;
@@ -548,10 +552,11 @@ impl ShallowWater {
             for x in 0..nx {
                 let index = self.index(x, z);
                 let depth = self.depth[index];
-                if self.blocked[index] || depth < settings.dry {
+                if depth < settings.dry {
                     continue;
                 }
-                let surface = self.bed[index] + depth;
+                let floor = self.floor[index];
+                let surface = floor + depth;
                 let sides = [
                     (x + 1 < nx, (x + 1, z), Vec3::X),
                     (x > 0, (x.wrapping_sub(1), z), -Vec3::X),
@@ -562,14 +567,14 @@ impl ShallowWater {
                     if !inside {
                         continue;
                     }
-                    let blocked = self.index(bx, bz);
-                    if !self.blocked[blocked] {
+                    let beside = self.index(bx, bz);
+                    if !standing[beside] {
                         continue;
                     }
-                    let start = in_cells.partition_point(|item| item.0 < blocked);
-                    let end = in_cells.partition_point(|item| item.0 <= blocked);
+                    let start = in_cells.partition_point(|item| item.0 < beside);
+                    let end = in_cells.partition_point(|item| item.0 <= beside);
                     for &(_, owner, at) in &in_cells[start..end] {
-                        if at.y >= surface {
+                        if at.y >= surface || at.y < floor {
                             continue;
                         }
                         let pressure = weight * (surface - at.y);
@@ -582,6 +587,27 @@ impl ShallowWater {
                 }
             }
         }
+        // water over a body standing on the bed weighs on its highest point there
+        let mut start = 0;
+        while start < in_cells.len() {
+            let index = in_cells[start].0;
+            let end = start + in_cells[start..].partition_point(|item| item.0 == index);
+            let depth = self.depth[index];
+            if standing[index] && depth >= settings.dry {
+                let top = in_cells[start..end]
+                    .iter()
+                    .copied()
+                    .reduce(|best, item| if item.2.y > best.2.y { item } else { best });
+                if let Some((_, owner, at)) = top {
+                    let force = Vec3::Y * -(weight * depth * settings.cell * settings.cell);
+                    let (center, _) = &placed[owner as usize];
+                    let push = &mut pushes[owner as usize];
+                    push.0 += force;
+                    push.1 += (at - *center).cross(force);
+                }
+            }
+            start = end;
+        }
         // lift and drag on each point under the surface
         let volume = spacing.powi(3);
         let area = spacing * spacing;
@@ -591,14 +617,12 @@ impl ShallowWater {
                     continue;
                 };
                 let index = self.index(cell.0, cell.1);
-                if at.y >= self.bed[index] + self.depth[index] {
+                // inside a raised floor is inside the body, not in water
+                let floor = self.floor[index];
+                if at.y >= floor + self.depth[index] || at.y < floor {
                     continue;
                 }
-                let flow = if self.blocked[index] {
-                    Vec3::ZERO
-                } else {
-                    self.velocity(cell)
-                };
+                let flow = self.velocity(cell);
                 let past = flow - *velocity;
                 let force = Vec3::Y * (weight * volume)
                     + past * (0.5 * DRAG * settings.density * area * past.length());
@@ -878,6 +902,31 @@ mod tests {
             }
         }
         assert!((water.volume() - start).abs() / start < 1e-4);
+    }
+
+    #[test]
+    fn water_runs_over_a_low_sill() {
+        let (mut water, mut world) = channel();
+        let shape = Shape::cuboid(Vec3::new(0.25, 0.25, 1.0));
+        let desc = RigidBodyDesc::fixed(shape).local_position(Vec3::new(3.75, 0.25, 1.0));
+        let body = world.spawn(desc).unwrap();
+        water.couple(body, &shape).unwrap();
+        let start = water.fill((0, 0), (13, 7), 1.0).unwrap();
+        for _ in 0..120 {
+            water
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+        }
+        // over the sill and on down the channel, the water on it counted
+        assert!(water.depths()[water.index(25, 4)] > 0.05);
+        assert!((water.volume() - start).abs() / start < 1e-4);
+        let sill = water.index(15, 4);
+        assert!(
+            (water.floors()[sill] - 0.5).abs() < 0.07,
+            "{}",
+            water.floors()[sill]
+        );
     }
 
     #[test]
