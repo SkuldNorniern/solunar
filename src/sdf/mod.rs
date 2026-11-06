@@ -2297,6 +2297,35 @@ mod tests {
     }
 
     #[test]
+    fn a_fine_voxel_edit_meshes() {
+        let mut world = world();
+        let desc = SdfDesc {
+            origin: GridPosition::from_local(Vec3::new(-1.0, -1.0, -2.0)).unwrap(),
+            voxel: 0.05,
+            brick_cells: 16,
+            bricks: [14, 4, 6],
+            base: Base::Hills {
+                seed: 7,
+                height: 2.0,
+                amplitude: 0.2,
+                wavelength: 5.0,
+                octaves: 3,
+            },
+            material: Material::default(),
+        };
+        let mut terrain = SdfTerrain::new(&mut world, desc).unwrap();
+        let channel = Edit {
+            shape: EditShape::Box {
+                center: Vec3::new(2.8, 1.9, 2.0),
+                half_extents: Vec3::new(1.8, 0.7, 0.35),
+                rotation: Quat::IDENTITY,
+            },
+            op: EditOp::Excavate,
+        };
+        terrain.edit(&mut world, channel).unwrap();
+    }
+
+    #[test]
     fn bad_input_changes_nothing() {
         let mut world = world();
         let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();

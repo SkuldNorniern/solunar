@@ -1,5 +1,7 @@
 use algebrix::Vec3;
 
+use crate::collision::trimesh::MIN_TRIANGLE_CROSS;
+
 /// Triangles for one brick, in its own space: the brick's low corner is the origin. Front
 /// faces point out of the material.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -133,7 +135,9 @@ pub(crate) fn surface_nets(values: &[f32], side: usize, voxel: f32) -> BrickMesh
                     };
                     for triangle in pair {
                         let [a, b, c] = triangle.map(p);
-                        if (b - a).cross(c - a).length() * 0.5 > min_area {
+                        // under the mesh's own floor at a fine voxel, a sliver failed the edit
+                        let cross = (b - a).cross(c - a).length();
+                        if cross * 0.5 > min_area && cross > MIN_TRIANGLE_CROSS {
                             mesh.triangles.push(triangle);
                         }
                     }

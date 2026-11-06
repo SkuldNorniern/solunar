@@ -247,6 +247,9 @@ impl TriMesh {
     }
 }
 
+/// Smallest edge cross product a mesh triangle may have, twice its area.
+pub(crate) const MIN_TRIANGLE_CROSS: f32 = 1e-8;
+
 fn validate_mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Result<(), PhysicsError> {
     if triangles.is_empty()
         || triangles.len() > MAX_TRIANGLES
@@ -262,7 +265,7 @@ fn validate_mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Result<(), Physic
                 .ok_or(PhysicsError::InvalidShape)?;
         }
         let area = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
-        if area.length_squared() <= 1e-16 {
+        if area.length_squared() <= MIN_TRIANGLE_CROSS * MIN_TRIANGLE_CROSS {
             return Err(PhysicsError::InvalidShape);
         }
     }
