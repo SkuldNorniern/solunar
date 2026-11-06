@@ -47,7 +47,13 @@ impl FluidWorld {
     /// Fails on a shape other than a box, ball or capsule, one too small to hold a point, or too
     /// many points.
     pub fn couple(&mut self, body: BodyHandle, shape: &Shape) -> Result<(), PhysicsError> {
-        let points = self.sample(shape)?;
+        let settings = &self.settings;
+        let points = shape_points(
+            shape,
+            settings.spacing,
+            settings.radius(),
+            settings.max_particles,
+        )?;
         if points.is_empty() {
             return Err(PhysicsError::InvalidShape);
         }
@@ -80,60 +86,6 @@ impl FluidWorld {
 
     fn coupled_points(&self) -> usize {
         self.coupled.iter().map(|known| known.points.len()).sum()
-    }
-
-    /// Lattice points inside the shape, no deeper than the kernel reaches, centered on it.
-    fn sample(&self, shape: &Shape) -> Result<Vec<Vec3>, PhysicsError> {
-        let spacing = self.settings.spacing;
-        let reach = self.settings.radius();
-        let (half, depth): (Vec3, Box<dyn Fn(Vec3) -> f32>) = match *shape {
-            Shape::Cuboid { half_extents } => (
-                half_extents,
-                Box::new(move |at: Vec3| {
-                    let room = half_extents - at.abs();
-                    room.x.min(room.y).min(room.z)
-                }),
-            ),
-            Shape::Sphere { radius } => (
-                Vec3::splat(radius),
-                Box::new(move |at: Vec3| radius - at.length()),
-            ),
-            Shape::Capsule {
-                radius,
-                half_height,
-            } => (
-                Vec3::new(radius, half_height + radius, radius),
-                Box::new(move |at: Vec3| {
-                    let y = at.y.clamp(-half_height, half_height);
-                    radius - (at - Vec3::new(0.0, y, 0.0)).length()
-                }),
-            ),
-            _ => return Err(PhysicsError::InvalidShape),
-        };
-        if !half.is_finite() || half.min_element() <= 0.0 {
-            return Err(PhysicsError::InvalidShape);
-        }
-        let count = |extent: f32| ((2.0 * extent / spacing).floor() as i64).clamp(0, 1 << 12);
-        let cells = (count(half.x), count(half.y), count(half.z));
-        let total = cells.0 * cells.1 * cells.2;
-        if total > self.settings.max_particles as i64 {
-            return Err(PhysicsError::FluidFull);
-        }
-        let start = |cells: i64| -(cells as f32 - 1.0) * spacing / 2.0;
-        let origin = Vec3::new(start(cells.0), start(cells.1), start(cells.2));
-        let mut points = Vec::new();
-        for y in 0..cells.1 {
-            for z in 0..cells.2 {
-                for x in 0..cells.0 {
-                    let at = origin + Vec3::new(x as f32, y as f32, z as f32) * spacing;
-                    let inside = depth(at);
-                    if inside >= 0.0 && inside <= reach {
-                        points.push(at);
-                    }
-                }
-            }
-        }
-        Ok(points)
     }
 
     /// Advances the water `dt` seconds with the coupled bodies standing where `world` has them,
@@ -281,6 +233,64 @@ impl FluidWorld {
             bodies[owner].1 += arm.cross(force);
         }
     }
+}
+
+/// Lattice points `spacing` apart inside the shape, no deeper than `reach`, centered on it. Fails
+/// past `limit` points or on a shape it can not fill.
+pub(super) fn shape_points(
+    shape: &Shape,
+    spacing: f32,
+    reach: f32,
+    limit: usize,
+) -> Result<Vec<Vec3>, PhysicsError> {
+    let (half, depth): (Vec3, Box<dyn Fn(Vec3) -> f32>) = match *shape {
+        Shape::Cuboid { half_extents } => (
+            half_extents,
+            Box::new(move |at: Vec3| {
+                let room = half_extents - at.abs();
+                room.x.min(room.y).min(room.z)
+            }),
+        ),
+        Shape::Sphere { radius } => (
+            Vec3::splat(radius),
+            Box::new(move |at: Vec3| radius - at.length()),
+        ),
+        Shape::Capsule {
+            radius,
+            half_height,
+        } => (
+            Vec3::new(radius, half_height + radius, radius),
+            Box::new(move |at: Vec3| {
+                let y = at.y.clamp(-half_height, half_height);
+                radius - (at - Vec3::new(0.0, y, 0.0)).length()
+            }),
+        ),
+        _ => return Err(PhysicsError::InvalidShape),
+    };
+    if !half.is_finite() || half.min_element() <= 0.0 {
+        return Err(PhysicsError::InvalidShape);
+    }
+    let count = |extent: f32| ((2.0 * extent / spacing).floor() as i64).clamp(0, 1 << 12);
+    let cells = (count(half.x), count(half.y), count(half.z));
+    let total = cells.0 * cells.1 * cells.2;
+    if total > limit as i64 {
+        return Err(PhysicsError::FluidFull);
+    }
+    let start = |cells: i64| -(cells as f32 - 1.0) * spacing / 2.0;
+    let origin = Vec3::new(start(cells.0), start(cells.1), start(cells.2));
+    let mut points = Vec::new();
+    for y in 0..cells.1 {
+        for z in 0..cells.2 {
+            for x in 0..cells.0 {
+                let at = origin + Vec3::new(x as f32, y as f32, z as f32) * spacing;
+                let inside = depth(at);
+                if inside >= 0.0 && inside <= reach {
+                    points.push(at);
+                }
+            }
+        }
+    }
+    Ok(points)
 }
 
 #[cfg(test)]
