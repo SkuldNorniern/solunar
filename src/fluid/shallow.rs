@@ -69,6 +69,33 @@ impl ShallowSettings {
     }
 }
 
+/// How a loose bed washes away under flowing water: past a shear it can take it goes at a rate
+/// set by how much past, and a wet bank steeper than it can stand slumps. What washes off leaves
+/// the water, it is not carried and laid down again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Erosion {
+    /// Shear the bed takes before it starts to wash away, pascals.
+    pub critical: f32,
+    /// Meters a second it goes per pascal past `critical`.
+    pub rate: f32,
+    /// Share of the water's speed squared, times its density, that pulls on the bed.
+    pub friction: f32,
+    /// Steepest a bank beside water stands, rise over run.
+    pub repose: f32,
+}
+
+impl Default for Erosion {
+    /// Packed earth fill.
+    fn default() -> Self {
+        Self {
+            critical: 5.0,
+            rate: 2e-4,
+            friction: 0.003,
+            repose: 0.7,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ShallowReport {
     pub substeps: u32,
@@ -98,6 +125,8 @@ pub struct ShallowWater {
     /// The bed raised to the top of any body standing on it, this step. Water over a low body
     /// runs over it, a tall one holds it back, one that falls in lifts the water.
     floor: Vec<f32>,
+    /// Lowest the bed washes down to, the bed itself where it does not wash at all.
+    hard: Vec<f32>,
     held: Vec<Held>,
 }
 
@@ -142,6 +171,7 @@ impl ShallowWater {
             origin,
             size,
             floor: bed.clone(),
+            hard: bed.clone(),
             bed,
             depth: vec![0.0; count],
             flow_x: vec![0.0; count],
@@ -482,6 +512,120 @@ impl ShallowWater {
             at = end;
         }
         Ok(())
+    }
+
+    /// Sets the bed of a cell, the water on it keeps its depth.
+    ///
+    /// # Errors
+    /// Fails on a non finite height.
+    pub fn set_bed(&mut self, (x, z): (usize, usize), height: f32) -> Result<(), PhysicsError> {
+        if !height.is_finite() {
+            return Err(PhysicsError::NonFinite("shallow water bed"));
+        }
+        let index = self.index(x, z);
+        let loose = self.hard[index] < self.bed[index];
+        self.bed[index] = height;
+        self.floor[index] = height;
+        self.hard[index] = if loose {
+            self.hard[index].min(height)
+        } else {
+            height
+        };
+        Ok(())
+    }
+
+    /// Lets the bed of a cell wash down as far as `lowest`.
+    ///
+    /// # Errors
+    /// Fails on a non finite height.
+    pub fn make_loose(&mut self, (x, z): (usize, usize), lowest: f32) -> Result<(), PhysicsError> {
+        if !lowest.is_finite() {
+            return Err(PhysicsError::NonFinite("shallow water bed"));
+        }
+        let index = self.index(x, z);
+        self.hard[index] = lowest.min(self.bed[index]);
+        Ok(())
+    }
+
+    /// Washes the loose bed away for `dt` seconds of the flow as it is. Returns the volume of
+    /// bed taken, cubic meters. Bodies standing on the bed shield it.
+    ///
+    /// # Errors
+    /// Fails on a non finite or negative `dt` or bad settings.
+    pub fn erode(&mut self, dt: f32, erosion: &Erosion) -> Result<f64, PhysicsError> {
+        let valid = [
+            erosion.critical,
+            erosion.rate,
+            erosion.friction,
+            erosion.repose,
+        ]
+        .iter()
+        .all(|value| value.is_finite() && *value >= 0.0)
+            && erosion.repose > 0.0;
+        if !valid {
+            return Err(PhysicsError::InvalidSettings);
+        }
+        if !dt.is_finite() || dt < 0.0 {
+            return Err(PhysicsError::NonFinite("erosion step"));
+        }
+        let (nx, nz) = self.size;
+        let cell = self.settings.cell;
+        let dry = self.settings.dry;
+        let before = self.bed.clone();
+        let loose = |index: usize| self.hard[index] < before[index];
+        let mut bed = before.clone();
+        // scour under fast water
+        for index in 0..bed.len() {
+            let depth = self.depth[index];
+            if depth < dry || !loose(index) || self.floor[index] > before[index] {
+                continue;
+            }
+            let speed_squared =
+                (self.flow_x[index].powi(2) + self.flow_z[index].powi(2)) / (depth * depth);
+            let shear = self.settings.density * erosion.friction * speed_squared;
+            if shear > erosion.critical {
+                let cut = erosion.rate * (shear - erosion.critical) * dt;
+                bed[index] = (bed[index] - cut).max(self.hard[index]);
+            }
+        }
+        // a loose bank over wet ground steeper than it stands slumps to that slope, the high
+        // side only, so a breach opens wider
+        let drop = erosion.repose * cell;
+        for z in 0..nz {
+            for x in 0..nx {
+                let index = self.index(x, z);
+                if !loose(index) || self.floor[index] > before[index] {
+                    continue;
+                }
+                let around = [
+                    (x + 1 < nx).then(|| index + 1),
+                    (x > 0).then(|| index - 1),
+                    (z + 1 < nz).then(|| index + nx),
+                    (z > 0).then(|| index - nx),
+                ];
+                for near in around.into_iter().flatten() {
+                    if self.depth[near] < dry {
+                        continue;
+                    }
+                    let lowest = before[near] + drop;
+                    if bed[index] > lowest {
+                        bed[index] = lowest.max(self.hard[index]);
+                    }
+                }
+            }
+        }
+        let mut taken = 0.0;
+        for (index, height) in bed.into_iter().enumerate() {
+            let cut = before[index] - height;
+            if cut > 0.0 {
+                taken += f64::from(cut);
+                self.bed[index] = height;
+                if self.floor[index] <= before[index] {
+                    self.floor[index] = height;
+                }
+            }
+        }
+        Ok(taken * f64::from(cell * cell))
     }
 
     /// Lets `body` hold the water back where it stands on the bed, and be pushed by it: the
@@ -971,6 +1115,72 @@ mod tests {
             .spawn(desc(shape).local_position(Vec3::new(3.75, 0.75, 1.0)))
             .unwrap();
         (body, shape)
+    }
+
+    /// A loose ridge across the channel at x = 3.75 m, its top at 1.2 m, rock at 0.2 m, with a
+    /// notch 0.2 m deep in its middle and a lake behind it to 1.3 m.
+    fn ridge() -> ShallowWater {
+        let (mut water, _) = channel();
+        for z in 0..8 {
+            for x in 13..18 {
+                let notch = if (3..5).contains(&z) { 0.2 } else { 0.0 };
+                water.set_bed((x, z), 1.2 - notch).unwrap();
+                water.make_loose((x, z), 0.2).unwrap();
+            }
+        }
+        water.fill((0, 0), (12, 7), 1.3).unwrap();
+        water
+    }
+
+    #[test]
+    fn still_water_does_not_wash_a_bank_away() {
+        let (mut water, _) = channel();
+        for z in 0..8 {
+            water.set_bed((15, z), 1.0).unwrap();
+            water.make_loose((15, z), 0.0).unwrap();
+        }
+        water.fill((0, 0), (14, 7), 0.5).unwrap();
+        let mut taken = 0.0;
+        for _ in 0..120 {
+            water.step(TICK, &Sequential).unwrap();
+            taken += water.erode(TICK, &Erosion::default()).unwrap();
+        }
+        // only the slump of the bank to its slope, then nothing
+        let slope = Erosion::default().repose * water.settings.cell;
+        assert!(
+            taken < f64::from(8.0 * (1.0 - slope) * 0.0625) + 1e-3,
+            "{taken}"
+        );
+    }
+
+    #[test]
+    fn water_through_a_notch_cuts_it_deeper_and_wider() {
+        let mut water = ridge();
+        let start = water.volume();
+        let erosion = Erosion {
+            rate: 1e-3,
+            ..Erosion::default()
+        };
+        for _ in 0..600 {
+            water.step(TICK, &Sequential).unwrap();
+            water.erode(TICK, &erosion).unwrap();
+        }
+        let crest = |water: &ShallowWater, z: usize| {
+            (13..18)
+                .map(|x| water.bed()[water.index(x, z)])
+                .fold(f32::MAX, f32::min)
+        };
+        // the notch went down, and the ridge beside it too
+        assert!(crest(&water, 3) < 0.9, "{}", crest(&water, 3));
+        assert!(crest(&water, 2) < 1.1, "{}", crest(&water, 2));
+        assert!(water.bed().iter().all(|height| *height >= 0.0));
+        for z in 0..8 {
+            for x in 13..18 {
+                assert!(water.bed()[water.index(x, z)] >= 0.2 - 1e-6);
+            }
+        }
+        // water is not lost to the bed going
+        assert!((water.volume() - start).abs() / start < 1e-4);
     }
 
     #[test]

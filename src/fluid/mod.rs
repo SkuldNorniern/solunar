@@ -21,7 +21,7 @@ use boundary::Walls;
 use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;
-pub use shallow::{ShallowReport, ShallowSettings, ShallowWater};
+pub use shallow::{Erosion, ShallowReport, ShallowSettings, ShallowWater};
 pub use step::FluidReport;
 use terrain::{GroundSites, TerrainField};
 

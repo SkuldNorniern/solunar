@@ -30,8 +30,8 @@ pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
 pub use fluid::{
-    BoundaryId, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel, ShallowReport,
-    ShallowSettings, ShallowWater,
+    BoundaryId, Erosion, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel,
+    ShallowReport, ShallowSettings, ShallowWater,
 };
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
 pub use inspect::{ContactEvent, ContactView, IslandStats};
