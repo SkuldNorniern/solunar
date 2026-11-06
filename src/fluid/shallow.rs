@@ -608,10 +608,13 @@ impl ShallowWater {
             }
             start = end;
         }
-        // lift and drag on each point under the surface
+        // lift on each point under the surface, drag on the body as a whole: its points summed
+        // one by one made a body's drag area grow as its volume over the point spacing, and a
+        // block thrown through the water stopped dead
         let volume = spacing.powi(3);
-        let area = spacing * spacing;
         for (owner, (center, points)) in placed.iter().enumerate() {
+            let (mut under, mut middle, mut past) = (0_u32, Vec3::ZERO, Vec3::ZERO);
+            let mut waterline = 0_u32;
             for (at, velocity) in points {
                 let Some(cell) = self.cell_at(*at) else {
                     continue;
@@ -619,17 +622,30 @@ impl ShallowWater {
                 let index = self.index(cell.0, cell.1);
                 // inside a raised floor is inside the body, not in water
                 let floor = self.floor[index];
-                if at.y >= floor + self.depth[index] || at.y < floor {
+                let surface = floor + self.depth[index];
+                if at.y >= surface || at.y < floor {
                     continue;
                 }
-                let flow = self.velocity(cell);
-                let past = flow - *velocity;
-                let force = Vec3::Y * (weight * volume)
-                    + past * (0.5 * DRAG * settings.density * area * past.length());
-                let push = &mut pushes[owner];
-                push.0 += force;
-                push.1 += (*at - *center).cross(force);
+                under += 1;
+                waterline += u32::from(at.y >= surface - spacing);
+                middle += *at;
+                past += self.velocity(cell) - *velocity;
             }
+            if under == 0 {
+                continue;
+            }
+            let share = 1.0 / under as f32;
+            let (middle, past) = (middle * share, past * share);
+            let wetted = (under as f32 * volume).powf(2.0 / 3.0);
+            // a body bobbing in water sends waves off, the columns do not get them from it, so
+            // this stands in: damping on its waterplane at the speed of such waves
+            let plane = waterline as f32 * spacing * spacing;
+            let waves = settings.density * plane * (settings.gravity * plane.sqrt()).sqrt();
+            let force = Vec3::Y * (weight * volume * under as f32 + waves * past.y)
+                + past * (0.5 * DRAG * settings.density * wetted * past.length());
+            let push = &mut pushes[owner];
+            push.0 += force;
+            push.1 += (middle - *center).cross(force);
         }
         for (held, (force, torque)) in self.held.iter().zip(pushes) {
             // a fixed or kinematic body holds the water but is not pushed
@@ -950,6 +966,28 @@ mod tests {
             "{velocity:?} {ideal}"
         );
         assert!(velocity.z.abs() < velocity.x * 0.01, "{velocity:?}");
+    }
+
+    #[test]
+    fn a_block_thrown_through_water_is_slowed_by_its_front_only() {
+        let (mut water, mut world) = channel();
+        water.fill((0, 0), (29, 7), 3.0).unwrap();
+        let shape = Shape::cuboid(Vec3::splat(0.5));
+        let desc = RigidBodyDesc::dynamic(shape)
+            .density(2400.0)
+            .local_position(Vec3::new(1.0, 1.5, 1.0))
+            .linear_velocity(Vec3::new(10.0, 0.0, 0.0));
+        let body = world.spawn(desc).unwrap();
+        water.couple(body, &shape).unwrap();
+        for _ in 0..15 {
+            water
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+        }
+        // half of 1000 * 1 m2 * v^2 on 2400 kg: 10 m/s falls to about 6.5 in a quarter second
+        let speed = world.body_state(body).unwrap().linear_velocity.x;
+        assert!(speed > 5.5 && speed < 8.0, "{speed}");
     }
 
     #[test]
