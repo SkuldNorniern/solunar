@@ -76,6 +76,11 @@ impl PlanetGround {
         self.tiles.len()
     }
 
+    /// The bodies of the tiles standing now.
+    pub fn bodies(&self) -> impl Iterator<Item = BodyHandle> + '_ {
+        self.tiles.values().map(|(body, _)| *body)
+    }
+
     /// Makes the tiles within `reach` of each point of `near`, in the world's frame, and drops
     /// the rest.
     ///
