@@ -530,10 +530,19 @@ impl ShallowWater {
             placed.push((center, points));
         }
         in_cells.sort_by_key(|item| (item.0, item.1));
+        // the floor rises through body points stacked up from the bed with no gap, a body in the
+        // air over the cell lifted the water up to it
         self.floor.copy_from_slice(&self.bed);
-        for &(index, _, at) in &in_cells {
-            if standing[index] {
-                self.floor[index] = self.floor[index].max(at.y + spacing / 2.0);
+        let mut stacked: Vec<(usize, f32)> = in_cells
+            .iter()
+            .filter(|item| standing[item.0])
+            .map(|item| (item.0, item.2.y))
+            .collect();
+        stacked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        for (index, y) in stacked {
+            let floor = &mut self.floor[index];
+            if y - spacing <= *floor {
+                *floor = floor.max(y + spacing / 2.0);
             }
         }
         let report = self.step(dt, dispatch)?;
