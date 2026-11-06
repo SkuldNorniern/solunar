@@ -2297,6 +2297,48 @@ mod tests {
     }
 
     #[test]
+    fn a_tall_stack_of_heavy_blocks_stands_still_on_flat_ground() {
+        let mut world = world();
+        let desc = SdfDesc {
+            origin: GridPosition::from_local(Vec3::new(-8.0, -4.0, -8.0)).unwrap(),
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [2, 1, 2],
+            base: Base::Plane { height: 4.0 },
+            material: Material::default(),
+        };
+        SdfTerrain::new(&mut world, desc).unwrap();
+        // concrete blocks 2 by 1 by 3 m, eight high, about 115 t on one footprint over many
+        // triangles
+        let half = Vec3::new(1.0, 0.5, 1.5);
+        let concrete = Material {
+            density: 2400.0,
+            friction: 1.0,
+            restitution: 0.0,
+        };
+        let placed: Vec<(BodyHandle, Vec3)> = (0..8)
+            .map(|row| {
+                let at = Vec3::new(4.0, 0.5 + row as f32, 4.0);
+                let desc = RigidBodyDesc::dynamic(Shape::cuboid(half))
+                    .material(concrete)
+                    .local_position(at);
+                (world.spawn(desc).unwrap(), at)
+            })
+            .collect();
+        for _ in 0..180 {
+            world.step_fixed().unwrap();
+        }
+        for (body, at) in placed {
+            let moved = world.body_state(body).unwrap().position.local - at;
+            assert!(
+                Vec3::new(moved.x, 0.0, moved.z).length() < 0.01,
+                "{moved:?}"
+            );
+            assert!(moved.y > -0.01, "{moved:?}");
+        }
+    }
+
+    #[test]
     fn a_fine_voxel_edit_meshes() {
         let mut world = world();
         let desc = SdfDesc {

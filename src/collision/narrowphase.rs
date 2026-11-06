@@ -45,6 +45,11 @@ impl RawManifold {
         (self.count > 0).then_some(self)
     }
 
+    /// Keeps at most four of `points`: the deepest and the widest spread around it.
+    pub(crate) fn reduce_points(&mut self, points: &[RawPoint]) {
+        reduce(points, self);
+    }
+
     pub(crate) fn reduce_from(&mut self, kept: &[(Vec3, f32)]) {
         let mut points = [RawPoint {
             position: Vec3::ZERO,

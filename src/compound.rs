@@ -2,7 +2,7 @@ use algebrix::{DQuat, DVec3, Mat3, Quat, Vec3};
 
 use crate::collision::convex::{ConvexHull, Poly, poly_poly, poly_rounded};
 use crate::collision::trimesh::{Aabb, TriMesh, poly_triangle, triangle_contact};
-use crate::collision::{Bounds, Hull, RawManifold, contacts, sweep};
+use crate::collision::{Bounds, Hull, RawManifold, RawPoint, contacts, sweep};
 use crate::solver::CONTACT_MARGIN;
 use crate::{GridPosition, MassProperties, PhysicsError, PhysicsWorld, Shape};
 
@@ -384,6 +384,7 @@ impl ShapeAssets {
                 let turn = inverse * turn_b;
                 let area = Aabb::around(center, self.bounding_radius(part) + margin);
                 let local_motion = motion.map(|travel| inverse.rotate_vec3(travel));
+                let mut found = Vec::new();
                 mesh.for_each_near(area, |triangle| {
                     if let Some(raw) =
                         self.triangle_part_contact(mesh, triangle, part, turn, center, margin)
@@ -402,8 +403,11 @@ impl ShapeAssets {
                         for point in &raw.points[..raw.count] {
                             world.push(rotation_a.rotate_vec3(point.position), point.depth);
                         }
-                        visit(triangle, part_b, &world, Vec3::ZERO);
+                        found.push((triangle, world));
                     }
+                });
+                merge_flat(found, has_faces(part), |triangle, world| {
+                    visit(triangle, part_b, world, Vec3::ZERO);
                 });
             });
             return;
@@ -416,6 +420,7 @@ impl ShapeAssets {
                 let area = Aabb::around(center, self.bounding_radius(part) + margin);
                 // the part moves against the mesh, so its travel is the opposite of B's
                 let local_motion = motion.map(|travel| inverse.rotate_vec3(-travel));
+                let mut found = Vec::new();
                 mesh.for_each_near(area, |triangle| {
                     if let Some(raw) =
                         self.triangle_part_contact(mesh, triangle, part, turn, center, margin)
@@ -435,8 +440,11 @@ impl ShapeAssets {
                             let position = rotation_b.rotate_vec3(point.position) + center_b - at_a;
                             world.push(position, point.depth);
                         }
-                        visit(part_a, triangle, &world, at_a);
+                        found.push((triangle, world));
                     }
+                });
+                merge_flat(found, has_faces(part), |triangle, world| {
+                    visit(part_a, triangle, world, at_a);
                 });
             });
             return;
@@ -786,6 +794,68 @@ impl PhysicsWorld {
             center,
             axes,
         })
+    }
+}
+
+/// Only a part with flat faces rests on several triangles at once, a round one meets them at
+/// a point.
+fn has_faces(part: &Shape) -> bool {
+    matches!(part, Shape::Cuboid { .. } | Shape::Convex(_))
+}
+
+/// Normals at least this close count as facing the same way.
+const FLAT_COS: f32 = 0.995;
+
+/// Triangles of a mesh facing the same way under one part become one manifold, its points
+/// picked from all of theirs, named after the lowest triangle. One small manifold per triangle
+/// let a heavy block on flat ground sink and walk off sideways ten times as far as on a box.
+fn merge_flat(
+    found: Vec<(u32, RawManifold)>,
+    merge: bool,
+    mut visit: impl FnMut(u32, &RawManifold),
+) {
+    if !merge {
+        for (triangle, manifold) in &found {
+            visit(*triangle, manifold);
+        }
+        return;
+    }
+    // (lowest triangle, normal, points, has a face patch)
+    let mut groups: Vec<(u32, Vec3, Vec<RawPoint>, bool)> = Vec::new();
+    let mut lone = Vec::new();
+    for (triangle, manifold) in found {
+        let points = &manifold.points[..manifold.count];
+        let patch = manifold.count >= 2;
+        match groups
+            .iter_mut()
+            .find(|group| group.1.dot(manifold.normal) >= FLAT_COS)
+        {
+            Some(group) => {
+                group.0 = group.0.min(triangle);
+                group.2.extend_from_slice(points);
+                group.3 |= patch;
+            }
+            None => groups.push((triangle, manifold.normal, points.to_vec(), patch)),
+        }
+        lone.push((triangle, manifold));
+    }
+    // edges and corners touching alone stay apart: merged into one patch they held a box up on
+    // its edge
+    for (triangle, normal, points, patch) in &groups {
+        if *patch {
+            let mut merged = RawManifold::new(*normal);
+            merged.reduce_points(points);
+            visit(*triangle, &merged);
+        }
+    }
+    for (triangle, manifold) in lone {
+        let face = groups
+            .iter()
+            .find(|group| group.1.dot(manifold.normal) >= FLAT_COS)
+            .is_some_and(|group| group.3);
+        if !face {
+            visit(triangle, &manifold);
+        }
     }
 }
 

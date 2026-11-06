@@ -7,7 +7,7 @@ pub(crate) mod trimesh;
 
 pub(crate) use broadphase::{Bounds, MovingPairs, find_pairs};
 pub(crate) use gjk::Hull;
-pub(crate) use narrowphase::{MAX_CONTACTS, RawManifold, contacts};
+pub(crate) use narrowphase::{MAX_CONTACTS, RawManifold, RawPoint, contacts};
 pub(crate) use query::sweep;
 pub use query::{CastHit, PointHit, QueryFilter, Ray, ShapeCast};
 
