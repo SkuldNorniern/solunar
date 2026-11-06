@@ -13,6 +13,7 @@ mod couple;
 mod dfsph;
 mod flow;
 mod step;
+mod terrain;
 
 pub use boundary::BoundaryId;
 use boundary::Walls;
@@ -20,6 +21,7 @@ use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;
 pub use step::FluidReport;
+use terrain::TerrainField;
 
 /// Particles per job. Fixed, so the split of work and every sum in it never depend on how many
 /// threads run it.
@@ -314,6 +316,7 @@ pub struct FluidWorld {
     /// Body points near each particle, indexes into `movers`.
     mover_neighbors: Lists,
     flows: Flows,
+    terrains: Vec<TerrainField>,
 }
 
 impl FluidWorld {
@@ -338,6 +341,7 @@ impl FluidWorld {
             movers: Movers::default(),
             mover_neighbors: Lists::default(),
             flows: Flows::default(),
+            terrains: Vec::new(),
         })
     }
 

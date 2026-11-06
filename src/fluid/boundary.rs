@@ -10,6 +10,12 @@ type WallKey = (CellKey, u32, (u32, u32, u32), usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BoundaryId(u32);
 
+impl BoundaryId {
+    pub(super) fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// Solid walls as frozen water: particles on the fluid's lattice with its particle mass, as deep
 /// as the kernel reaches. Still water next to a wall then sums to rest density, corners too. Walls
 /// that overlap count twice.
@@ -96,7 +102,11 @@ impl FluidWorld {
         let had_container = self.walls.containers.iter().any(|item| item.0 == id.0);
         self.walls.containers.retain(|item| item.0 != id.0);
         self.walls.bounds = union(&self.walls.containers);
-        let gone = self.walls.positions.len() != before || had_container;
+        let terrains = self.terrains.len();
+        self.terrains.retain(|field| field.owner != id.0);
+        let gone = self.walls.positions.len() != before
+            || had_container
+            || self.terrains.len() != terrains;
         if gone {
             self.settle_walls();
         }
@@ -125,7 +135,10 @@ impl FluidWorld {
         Ok(())
     }
 
-    fn add_wall_points(&mut self, points: Vec<Vec3>) -> Result<BoundaryId, PhysicsError> {
+    pub(super) fn add_wall_points(
+        &mut self,
+        points: Vec<Vec3>,
+    ) -> Result<BoundaryId, PhysicsError> {
         let id = self.walls.next;
         self.walls.next += 1;
         self.walls

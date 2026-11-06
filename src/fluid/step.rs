@@ -1,5 +1,6 @@
 use algebrix::Vec3;
 
+use super::terrain::terrain_contact;
 use super::{FluidSolver, FluidWorld, in_chunks};
 use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
@@ -245,6 +246,9 @@ impl FluidWorld {
                     }
                     next = inside;
                 }
+            }
+            if terrain_contact(&self.terrains, rest.x, &mut next, velocity) {
+                held += 1;
             }
             if !next.is_finite() || !velocity.is_finite() {
                 return Err(PhysicsError::NonFinite("fluid particle"));
