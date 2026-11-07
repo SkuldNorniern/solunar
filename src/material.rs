@@ -59,17 +59,7 @@ pub struct Material {
 
 impl Default for Material {
     fn default() -> Self {
-        Self {
-            density: 1000.0,
-            friction: 0.5,
-            static_friction: 0.0,
-            restitution: 0.0,
-            bounce_threshold: 1.0,
-            friction_combine: Combine::GeometricMean,
-            restitution_combine: Combine::Max,
-            rolling_resistance: 0.0,
-            spin_resistance: 0.0,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -104,6 +94,19 @@ impl Contact {
 }
 
 impl Material {
+    /// The default, usable in a `const`: `Material { density: 2400.0, ..Material::DEFAULT }`.
+    pub const DEFAULT: Self = Self {
+        density: 1000.0,
+        friction: 0.5,
+        static_friction: 0.0,
+        restitution: 0.0,
+        bounce_threshold: 1.0,
+        friction_combine: Combine::GeometricMean,
+        restitution_combine: Combine::Max,
+        rolling_resistance: 0.0,
+        spin_resistance: 0.0,
+    };
+
     /// # Errors
     /// Fails on non positive density, negative friction, restitution outside 0 to 1, or a
     /// negative bounce threshold.
