@@ -51,6 +51,10 @@ pub struct Material {
     pub bounce_threshold: f32,
     pub friction_combine: Combine,
     pub restitution_combine: Combine,
+    /// Lever, meters: the turning a contact resists while rolling is this times its load.
+    pub rolling_resistance: f32,
+    /// Lever, meters: the same for spinning about the contact normal.
+    pub spin_resistance: f32,
 }
 
 impl Default for Material {
@@ -63,6 +67,8 @@ impl Default for Material {
             bounce_threshold: 1.0,
             friction_combine: Combine::GeometricMean,
             restitution_combine: Combine::Max,
+            rolling_resistance: 0.0,
+            spin_resistance: 0.0,
         }
     }
 }
@@ -74,6 +80,8 @@ pub(crate) struct Contact {
     pub(crate) static_friction: f32,
     pub(crate) restitution: f32,
     pub(crate) bounce_threshold: f32,
+    pub(crate) rolling: f32,
+    pub(crate) spin: f32,
 }
 
 impl Contact {
@@ -88,6 +96,9 @@ impl Contact {
             ),
             restitution: restitution.apply(a.restitution, b.restitution),
             bounce_threshold: a.bounce_threshold.max(b.bounce_threshold),
+            // they resist like friction does, so they combine by its rule
+            rolling: friction.apply(a.rolling_resistance, b.rolling_resistance),
+            spin: friction.apply(a.spin_resistance, b.spin_resistance),
         }
     }
 }
@@ -103,6 +114,8 @@ impl Material {
             && positive(self.friction)
             && positive(self.static_friction)
             && positive(self.bounce_threshold)
+            && positive(self.rolling_resistance)
+            && positive(self.spin_resistance)
             && (0.0..=1.0).contains(&self.restitution);
         if valid {
             Ok(())
@@ -344,5 +357,72 @@ mod tests {
                 .set_surface_velocity(belt, Vec3::new(f32::NAN, 0.0, 0.0))
                 .is_err()
         );
+    }
+
+    /// A ball rolled at 2 m/s on a floor of `material`: how far it gets in 4 s.
+    fn roll(material: Material) -> f32 {
+        use crate::{PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape, Vec3};
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 0.5, 5.0)))
+                    .local_position(Vec3::new(0.0, -0.5, 0.0))
+                    .material(material),
+            )
+            .unwrap();
+        let mut desc = RigidBodyDesc::dynamic(Shape::sphere(0.25))
+            .local_position(Vec3::new(-40.0, 0.25, 0.0))
+            .material(material);
+        desc.linear_velocity = Vec3::new(2.0, 0.0, 0.0);
+        desc.angular_velocity = Vec3::new(0.0, 0.0, -8.0);
+        let ball = world.spawn(desc).unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        world.body_state(ball).unwrap().position.local.x + 40.0
+    }
+
+    /// A ball spun about y at 10 rad/s resting on a floor: its spin after 2 s.
+    fn spin(material: Material) -> f32 {
+        use crate::{PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape, Vec3};
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)))
+                    .local_position(Vec3::new(0.0, -0.5, 0.0))
+                    .material(material),
+            )
+            .unwrap();
+        let mut desc = RigidBodyDesc::dynamic(Shape::sphere(0.25))
+            .local_position(Vec3::new(0.0, 0.25, 0.0))
+            .material(material);
+        desc.angular_velocity = Vec3::new(0.0, 10.0, 0.0);
+        desc.can_sleep = false;
+        let ball = world.spawn(desc).unwrap();
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        world.body_state(ball).unwrap().angular_velocity.y
+    }
+
+    #[test]
+    fn rolling_and_spin_resistance_slow_a_ball_and_nothing_else_does() {
+        let free = Material::default();
+        let rolling = Material {
+            rolling_resistance: 0.02,
+            ..free
+        };
+        let spinning = Material {
+            spin_resistance: 0.02,
+            ..free
+        };
+        let (far, near) = (roll(free), roll(rolling));
+        // free it keeps rolling, 2 m/s for 4 s. a lever l on a rolling ball of radius r slows it
+        // by l g / (1.4 r), 0.56 m/s^2 here, so it stops after v^2 / 2a = 3.57 m
+        assert!(far > 7.5, "{far}");
+        assert!((near - 3.57).abs() < 0.4, "{near}");
+        let (kept, lost) = (spin(free), spin(spinning));
+        assert!(kept > 9.0, "{kept}");
+        assert!(lost.abs() < 0.5, "{lost}");
     }
 }

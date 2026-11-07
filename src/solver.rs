@@ -230,6 +230,13 @@ struct SolverManifold {
     static_friction: f32,
     /// B's surface speed over A's, world, from belts. Friction carries the bodies to it.
     surface: Vec3,
+    /// Spin about the normal and rolling about the two tangents, resisted up to these levers
+    /// times the manifold's load. Zero skips the row.
+    resist: [f32; 3],
+    /// Per angular row: spin of A and of B per unit impulse, its mass and what it took so far.
+    resist_turn: [[Vec3; 2]; 3],
+    resist_mass: [f32; 3],
+    resist_impulse: [f32; 3],
     /// Zero for bodies that are not dynamic, they are never pushed.
     inverse_mass: [f32; 2],
     /// Its points are `first..first + count` in the scratch point lists.
@@ -642,7 +649,7 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    for manifold in &scratch.manifolds {
+    for manifold in &mut scratch.manifolds {
         let range = manifold.first..manifold.first + manifold.count;
         let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
         refresh_manifold(bodies, state, manifold, points, last, dt);
@@ -1279,7 +1286,7 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
 fn refresh_manifold(
     bodies: &Bodies,
     state: &[Integrated],
-    manifold: &SolverManifold,
+    manifold: &mut SolverManifold,
     (points, frames): (&mut [SolverPoint], &[PointFrame]),
     last: bool,
     dt: f32,
@@ -1295,6 +1302,23 @@ fn refresh_manifold(
             Vec3::ZERO
         }
     };
+    for k in 0..3 {
+        if manifold.resist[k] <= 0.0 {
+            continue;
+        }
+        let axis = manifold.axes[k];
+        let (turn_a, turn_b) = (
+            response(manifold.a, a.rotation, axis),
+            response(manifold.b, b.rotation, axis),
+        );
+        let inverse = axis.dot(turn_a) + axis.dot(turn_b);
+        manifold.resist_turn[k] = [turn_a, turn_b];
+        manifold.resist_mass[k] = if inverse > 1e-12 {
+            inverse.recip()
+        } else {
+            0.0
+        };
+    }
     for (point, frame) in points.iter_mut().zip(frames) {
         let offset_a = a.rotation.rotate_vec3(frame.local_a);
         let offset_b = b.rotation.rotate_vec3(frame.local_b);
@@ -1527,6 +1551,10 @@ fn contact_manifold(
         static_friction: contact.static_friction,
         surface: bodies.rotation[b].rotate_vec3(bodies.surface[b])
             - bodies.rotation[a].rotate_vec3(bodies.surface[a]),
+        resist: [contact.spin, contact.rolling, contact.rolling],
+        resist_turn: [[Vec3::ZERO; 2]; 3],
+        resist_mass: [0.0; 3],
+        resist_impulse: [0.0; 3],
         inverse_mass: [
             dynamic_inverse_mass(bodies, a),
             dynamic_inverse_mass(bodies, b),
@@ -1590,6 +1618,9 @@ fn matching_impulse(
 }
 
 fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
+    for k in 0..3 {
+        turn(pair, manifold, k, manifold.resist_impulse[k]);
+    }
     for point in points.iter() {
         for k in 0..3 {
             push(
@@ -1612,15 +1643,47 @@ fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPo
     }
 }
 
+/// Angular impulse `amount` about the manifold's axis `k`, A one way and B the other.
+fn turn(pair: &mut Pair, manifold: &SolverManifold, k: usize, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    let [turn_a, turn_b] = manifold.resist_turn[k];
+    pair.a.angular -= turn_a * amount;
+    pair.b.angular += turn_b * amount;
+    pair.a.touched = true;
+    pair.b.touched = true;
+}
+
+/// Spin and rolling held back up to their levers times the load the points carry now.
+fn resist(pair: &mut Pair, manifold: &mut SolverManifold, load: f32) {
+    for k in 0..3 {
+        let lever = manifold.resist[k];
+        if lever <= 0.0 {
+            continue;
+        }
+        let axis = manifold.axes[k];
+        let speed = (pair.b.angular - pair.a.angular).dot(axis);
+        let limit = (lever * load).max(0.0);
+        let accumulated = manifold.resist_impulse[k];
+        // not `clamp`, it panics on a nan limit
+        let next = (accumulated - speed * manifold.resist_mass[k])
+            .min(limit)
+            .max(-limit);
+        manifold.resist_impulse[k] = next;
+        turn(pair, manifold, k, next - accumulated);
+    }
+}
+
 /// How fast the surfaces slide over each other along tangent `k`, belts counted.
 fn slip_along(pair: &Pair, manifold: &SolverManifold, point: &SolverPoint, k: usize) -> f32 {
     speed_along(pair, &manifold.axes, point, k) + manifold.surface.dot(manifold.axes[k])
 }
 
-fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
+fn solve_manifold(pair: &mut Pair, manifold: &mut SolverManifold, points: &mut [SolverPoint]) {
     let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
     let (friction, held) = (manifold.friction, manifold.static_friction);
-    for point in points {
+    for point in points.iter_mut() {
         // friction first, so the normal impulse has the last word on penetration
         let (limit, hold) = (
             (friction * point.impulse.x).max(0.0),
@@ -1641,6 +1704,8 @@ fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [Solv
         point.impulse.x = next;
         push(pair, (axes, inverse), point, 0, change);
     }
+    let load: f32 = points.iter().map(|point| point.impulse.x).sum();
+    resist(pair, manifold, load);
 }
 
 /// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.

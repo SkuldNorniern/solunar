@@ -171,6 +171,8 @@ impl PhysicsWorld {
             out.f32(material.bounce_threshold);
             out.u8(material.friction_combine.tag());
             out.u8(material.restitution_combine.tag());
+            out.f32(material.rolling_resistance);
+            out.f32(material.spin_resistance);
             out.vec3(bodies.surface[dense]);
             out.u32(bodies.filter[dense].layers);
             out.u32(bodies.filter[dense].mask);
@@ -446,6 +448,8 @@ fn read_body(
             |tag| crate::Combine::from_tag(tag).ok_or(SnapshotError::Invalid("material combine"));
         material.friction_combine = combine(reader.u8()?)?;
         material.restitution_combine = combine(reader.u8()?)?;
+        material.rolling_resistance = reader.f32()?;
+        material.spin_resistance = reader.f32()?;
         surface = reader.vec3()?;
     }
     let filter = CollisionFilter {
@@ -1179,7 +1183,7 @@ mod tests {
             .windows(marker.len())
             .position(|window| window == marker.as_slice())
             .unwrap();
-        bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 3);
+        bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 2 + 4 * 3);
         bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
         let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
         let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];
