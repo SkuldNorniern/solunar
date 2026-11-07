@@ -55,7 +55,13 @@ pub(crate) struct Sensors {
     slots: Vec<Option<Sensor>>,
     generations: Vec<u32>,
     events: Vec<SensorEvent>,
-    found: Vec<BodyHandle>,
+    /// What each slot holds after this step, beside `slots`.
+    found: Vec<Vec<BodyHandle>>,
+    /// Sweep entries: min x, max x, sensor slot or body dense index, whether it is a sensor.
+    entries: Vec<(f64, f64, u32, bool)>,
+    /// Entries still open in the sweep: where each ends, and its index.
+    active_sensors: Vec<(f64, u32)>,
+    active_bodies: Vec<(f64, u32)>,
 }
 
 impl Sensors {
@@ -158,11 +164,105 @@ impl PhysicsWorld {
         &self.sensors.events
     }
 
+    /// What every sensor overlaps now, one sweep along x for all of them: a body is tried only
+    /// against sensors its bounds reach, bodies are never tried against each other. The exact
+    /// test is the overlap query's.
+    fn sweep_sensors(&self, sensors: &mut Sensors) -> Result<(), PhysicsError> {
+        let count = sensors.slots.len();
+        sensors.found.resize_with(count, Vec::new);
+        sensors.found.iter_mut().for_each(Vec::clear);
+        let Some(origin) = sensors
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| s.desc.position)
+            .next()
+        else {
+            return Ok(());
+        };
+        for sensor in sensors.slots.iter().flatten() {
+            self.check_frame(&sensor.desc.filter)?;
+        }
+        let assets = &self.bodies.assets;
+        let entries = &mut sensors.entries;
+        entries.clear();
+        for (slot, sensor) in sensors.slots.iter().enumerate() {
+            if let Some(sensor) = sensor {
+                let x = sensor.desc.position.offset_from(origin).x;
+                let reach = f64::from(assets.bounding_radius(&sensor.desc.shape));
+                entries.push((x - reach, x + reach, slot as u32, true));
+            }
+        }
+        for dense in 0..self.bodies.len() {
+            let x = self.bodies.position(dense).offset_from(origin).x;
+            let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
+            entries.push((x - reach, x + reach, dense as u32, false));
+        }
+        entries
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.3.cmp(&b.3)).then(a.2.cmp(&b.2)));
+        let (active_sensors, active_bodies) =
+            (&mut sensors.active_sensors, &mut sensors.active_bodies);
+        active_sensors.clear();
+        active_bodies.clear();
+        for &(start, end, index, is_sensor) in entries.iter() {
+            // what ended before this starts has met all its partners
+            if is_sensor {
+                active_bodies.retain(|(until, _)| *until >= start);
+                let sensor = sensors.slots[index as usize].as_ref();
+                for &(_, dense) in active_bodies.iter() {
+                    self.try_pair(sensor, dense as usize, &mut sensors.found[index as usize]);
+                }
+                active_sensors.push((end, index));
+            } else {
+                active_sensors.retain(|(until, _)| *until >= start);
+                for &(_, slot) in active_sensors.iter() {
+                    let sensor = sensors.slots[slot as usize].as_ref();
+                    self.try_pair(sensor, index as usize, &mut sensors.found[slot as usize]);
+                }
+                active_bodies.push((end, index));
+            }
+        }
+        sensors
+            .found
+            .iter_mut()
+            .for_each(|found| found.sort_unstable());
+        Ok(())
+    }
+
+    /// The overlap query's own test of one sensor against one body.
+    fn try_pair(&self, sensor: Option<&Sensor>, dense: usize, found: &mut Vec<BodyHandle>) {
+        let Some(sensor) = sensor else {
+            return;
+        };
+        let desc = &sensor.desc;
+        if !self.visible(dense, &desc.filter) {
+            return;
+        }
+        let assets = &self.bodies.assets;
+        let center = self.bodies.position(dense).offset_from(desc.position);
+        let reach = f64::from(assets.bounding_radius(&desc.shape))
+            + f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
+        if center.length_squared() > reach * reach {
+            return;
+        }
+        if assets.overlapping(
+            (&desc.shape, desc.rotation),
+            (&self.bodies.shape[dense], self.bodies.rotation[dense]),
+            center.as_vec3(),
+        ) {
+            found.push(self.bodies.handle_at(dense));
+        }
+    }
+
     /// Runs after each step, on the bodies where the step left them.
     pub(crate) fn update_sensors(&mut self) -> Result<(), PhysicsError> {
         let mut sensors = std::mem::take(&mut self.sensors);
         sensors.events.clear();
-        let mut result = Ok(());
+        let result = self.sweep_sensors(&mut sensors);
+        if result.is_err() {
+            self.sensors = sensors;
+            return result;
+        }
         for index in 0..sensors.slots.len() {
             let Some(sensor) = sensors.slots[index].as_mut() else {
                 continue;
@@ -171,18 +271,7 @@ impl PhysicsWorld {
                 index: index as u32,
                 generation: sensors.generations[index],
             };
-            let desc = &sensor.desc;
-            if let Err(error) = self.overlap(
-                &desc.shape,
-                desc.position,
-                desc.rotation,
-                &desc.filter,
-                &mut sensors.found,
-            ) {
-                result = Err(error);
-                break;
-            }
-            let (before, now) = (&sensor.inside, &sensors.found);
+            let (before, now) = (&sensor.inside, &sensors.found[index]);
             let (mut a, mut b) = (0, 0);
             while a < before.len() || b < now.len() {
                 let event = match (before.get(a), now.get(b)) {
@@ -211,11 +300,11 @@ impl PhysicsWorld {
                     entered: event.1,
                 });
             }
-            sensor.inside.clone_from(&sensors.found);
+            sensor.inside.clone_from(&sensors.found[index]);
         }
         sensors.events.sort_unstable();
         self.sensors = sensors;
-        result
+        Ok(())
     }
 }
 
@@ -354,5 +443,57 @@ mod tests {
         world.step_fixed().unwrap();
         assert!(world.sensor_bodies(sensor).is_empty());
         assert!(world.sensor_events().is_empty());
+    }
+
+    #[test]
+    fn the_one_sweep_finds_what_an_overlap_query_per_sensor_finds() {
+        let mut world = world();
+        // a scatter of shapes, some well apart, some piled, some outside every sensor
+        let mut seed = 7_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        for _ in 0..300 {
+            let at = Vec3::new(next() * 80.0 - 40.0, next() * 6.0 + 0.3, next() * 20.0 - 10.0);
+            let shape = match (next() * 3.0) as u32 {
+                0 => Shape::sphere(0.2 + next() * 0.6),
+                1 => Shape::cuboid(Vec3::splat(0.2 + next() * 0.5)),
+                _ => Shape::capsule(0.2, 0.4),
+            };
+            world
+                .spawn(RigidBodyDesc::dynamic(shape).local_position(at))
+                .unwrap();
+        }
+        let mut sensors = Vec::new();
+        for _ in 0..40 {
+            let at = GridPosition::from_local(Vec3::new(
+                next() * 90.0 - 45.0,
+                next() * 4.0,
+                next() * 20.0 - 10.0,
+            ))
+            .unwrap();
+            let shape = if next() < 0.5 {
+                Shape::sphere(1.0 + next() * 3.0)
+            } else {
+                Shape::cuboid(Vec3::new(1.0 + next() * 4.0, 1.0, 1.0 + next()))
+            };
+            let mut desc = SensorDesc::new(shape, at);
+            desc.rotation = Quat::from_rotation_y(next() * 3.0);
+            sensors.push(world.add_sensor(desc).unwrap());
+        }
+        let mut queried = Vec::new();
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+            for sensor in &sensors {
+                let desc = world.sensors.get(*sensor).unwrap().desc.clone();
+                world
+                    .overlap(&desc.shape, desc.position, desc.rotation, &desc.filter, &mut queried)
+                    .unwrap();
+                assert_eq!(world.sensor_bodies(*sensor), queried.as_slice());
+            }
+        }
+        let held: usize = sensors.iter().map(|sensor| world.sensor_bodies(*sensor).len()).sum();
+        assert!(held > 20, "{held}");
     }
 }

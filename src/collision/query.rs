@@ -375,13 +375,13 @@ impl PhysicsWorld {
         Ok(deepest)
     }
 
-    fn visible(&self, dense: usize, filter: &QueryFilter) -> bool {
+    pub(crate) fn visible(&self, dense: usize, filter: &QueryFilter) -> bool {
         self.bodies.frame[dense] == filter.frame
             && self.bodies.filter[dense].layers & filter.mask != 0
             && filter.exclude != Some(self.bodies.handle_at(dense))
     }
 
-    fn check_frame(&self, filter: &QueryFilter) -> Result<(), PhysicsError> {
+    pub(crate) fn check_frame(&self, filter: &QueryFilter) -> Result<(), PhysicsError> {
         if self.frames.contains(filter.frame) {
             Ok(())
         } else {
