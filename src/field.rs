@@ -72,7 +72,7 @@ impl FieldDesc {
         self
     }
 
-    fn validate(&self) -> Result<(), PhysicsError> {
+    pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
         let finite = |value: f32| value.is_finite();
         let positive = |value: f32| value.is_finite() && value >= 0.0;
         let field = match self.field {
@@ -119,8 +119,8 @@ impl FieldDesc {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Fields {
-    slots: Vec<Option<FieldDesc>>,
-    generations: Vec<u32>,
+    pub(crate) slots: Vec<Option<FieldDesc>>,
+    pub(crate) generations: Vec<u32>,
 }
 
 impl Fields {

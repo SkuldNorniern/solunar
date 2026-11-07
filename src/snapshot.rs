@@ -231,6 +231,42 @@ impl PhysicsWorld {
             out.u32(*index);
         }
 
+        // version 3: sensors with what they hold, so loading starts no false enter events
+        out.len(self.sensors.slots.len());
+        for (slot, generation) in self.sensors.slots.iter().zip(&self.sensors.generations) {
+            out.u32(*generation);
+            let Some(sensor) = slot else {
+                out.u8(0);
+                continue;
+            };
+            out.u8(1);
+            let desc = &sensor.desc;
+            out.shape(&desc.shape);
+            out.position(desc.position);
+            out.quat(desc.rotation);
+            out.u32(desc.filter.frame.index());
+            out.u32(desc.filter.mask);
+            out.u8(u8::from(desc.filter.exclude.is_some()));
+            out.body(desc.filter.exclude.unwrap_or(BodyHandle {
+                index: 0,
+                generation: 0,
+            }));
+            out.len(sensor.inside.len());
+            for body in &sensor.inside {
+                out.body(*body);
+            }
+        }
+        out.len(self.fields.slots.len());
+        for (slot, generation) in self.fields.slots.iter().zip(&self.fields.generations) {
+            out.u32(*generation);
+            let Some(desc) = slot else {
+                out.u8(0);
+                continue;
+            };
+            out.u8(1);
+            out.field(desc);
+        }
+
         let checksum = fnv1a(&out.data);
         out.u64(checksum);
         out.data
@@ -308,6 +344,14 @@ impl PhysicsWorld {
         let bodies = read_bodies(&mut reader, &frames, limits)?;
         let contact_cache = read_contacts(&mut reader, limits)?;
         let joints = read_joints(&mut reader, &bodies, limits)?;
+        let (sensors, fields) = if reader.version >= 3 {
+            (
+                read_sensors(&mut reader, limits)?,
+                read_fields(&mut reader, limits)?,
+            )
+        } else {
+            Default::default()
+        };
         if reader.at != reader.data.len() {
             return Err(SnapshotError::Invalid("trailing data"));
         }
@@ -315,8 +359,98 @@ impl PhysicsWorld {
         world.contact_cache = contact_cache;
         world.joints = joints;
         world.recheck_sleepers = recheck_sleepers;
+        world.sensors = sensors;
+        world.fields = fields;
+        // shapes and frames are the loaded world's, check the sensors against them
+        for sensor in world.sensors.slots.iter().flatten() {
+            let desc = &sensor.desc;
+            if world.bodies.assets.validate(&desc.shape).is_err()
+                || !world.frames.contains(desc.filter.frame)
+            {
+                return Err(SnapshotError::Invalid("sensor"));
+            }
+        }
         Ok(world)
     }
+}
+
+fn read_sensors(
+    reader: &mut Reader<'_>,
+    limits: &SnapshotLimits,
+) -> Result<crate::sensor::Sensors, SnapshotError> {
+    let mut sensors = crate::sensor::Sensors::default();
+    let count = reader.count(5, limits.max_slots)?;
+    for _ in 0..count {
+        sensors.generations.push(reader.u32()?);
+        let slot = match reader.u8()? {
+            0 => None,
+            1 => {
+                let shape = reader.shape()?;
+                let position = reader.position()?;
+                let rotation = reader.quat()?;
+                let error = (rotation.length_squared() - 1.0).abs();
+                if !error.is_finite() || error > 1e-3 {
+                    return Err(SnapshotError::Invalid("sensor rotation"));
+                }
+                let frame = FrameId(reader.u32()?);
+                let mask = reader.u32()?;
+                let excluded = reader.u8()?;
+                let excluded_body = reader.handle()?;
+                let exclude = match excluded {
+                    0 => None,
+                    1 => Some(excluded_body),
+                    _ => return Err(SnapshotError::Invalid("sensor filter")),
+                };
+                let held = reader.count(8, limits.max_slots)?;
+                let mut inside = Vec::with_capacity(held);
+                for _ in 0..held {
+                    inside.push(reader.handle()?);
+                }
+                if !inside.windows(2).all(|pair| pair[0] < pair[1]) {
+                    return Err(SnapshotError::Invalid("sensor bodies"));
+                }
+                Some(crate::sensor::Sensor {
+                    desc: crate::sensor::SensorDesc {
+                        shape,
+                        position,
+                        rotation,
+                        filter: crate::QueryFilter {
+                            frame,
+                            mask,
+                            exclude,
+                        },
+                    },
+                    inside,
+                })
+            }
+            _ => return Err(SnapshotError::Invalid("sensor slot")),
+        };
+        sensors.slots.push(slot);
+    }
+    Ok(sensors)
+}
+
+fn read_fields(
+    reader: &mut Reader<'_>,
+    limits: &SnapshotLimits,
+) -> Result<crate::field::Fields, SnapshotError> {
+    let mut fields = crate::field::Fields::default();
+    let count = reader.count(5, limits.max_slots)?;
+    for _ in 0..count {
+        fields.generations.push(reader.u32()?);
+        let slot = match reader.u8()? {
+            0 => None,
+            1 => {
+                let desc = reader.field()?;
+                desc.validate()
+                    .map_err(|_| SnapshotError::Invalid("field"))?;
+                Some(desc)
+            }
+            _ => return Err(SnapshotError::Invalid("field slot")),
+        };
+        fields.slots.push(slot);
+    }
+    Ok(fields)
 }
 
 fn read_frames(reader: &mut Reader<'_>, limits: &SnapshotLimits) -> Result<Frames, SnapshotError> {
@@ -835,6 +969,74 @@ impl Writer {
         self.f64(value.z);
     }
 
+    fn position(&mut self, value: GridPosition) {
+        self.i32(value.cell.x);
+        self.i32(value.cell.y);
+        self.i32(value.cell.z);
+        self.vec3(value.local);
+    }
+
+    fn body(&mut self, handle: BodyHandle) {
+        self.u32(handle.index);
+        self.u32(handle.generation);
+    }
+
+    fn field(&mut self, desc: &crate::field::FieldDesc) {
+        use crate::field::{FieldRegion, ForceField};
+        match desc.field {
+            ForceField::Wind { velocity, drag } => {
+                self.u8(0);
+                self.vec3(velocity);
+                self.f32(drag);
+            }
+            ForceField::Drag { linear, angular } => {
+                self.u8(1);
+                self.f32(linear);
+                self.f32(angular);
+            }
+            ForceField::Fluid {
+                level,
+                density,
+                drag,
+            } => {
+                self.u8(2);
+                self.f32(level);
+                self.f32(density);
+                self.f32(drag);
+            }
+            ForceField::Attractor {
+                at,
+                strength,
+                min_distance,
+            } => {
+                self.u8(3);
+                self.position(at);
+                self.f32(strength);
+                self.f32(min_distance);
+            }
+        }
+        match desc.region {
+            FieldRegion::Everywhere => self.u8(0),
+            FieldRegion::Sphere { center, radius } => {
+                self.u8(1);
+                self.position(center);
+                self.f32(radius);
+            }
+            FieldRegion::Box {
+                center,
+                half_extents,
+                rotation,
+            } => {
+                self.u8(2);
+                self.position(center);
+                self.vec3(half_extents);
+                self.quat(rotation);
+            }
+        }
+        self.u32(desc.filter.layers);
+        self.u32(desc.filter.mask);
+    }
+
     fn quat(&mut self, value: Quat) {
         for part in value.to_array() {
             self.f32(part);
@@ -1008,6 +1210,65 @@ impl Reader<'_> {
 
     fn dvec3(&mut self) -> Result<DVec3, SnapshotError> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
+    }
+
+    fn position(&mut self) -> Result<GridPosition, SnapshotError> {
+        let cell = IVec3::new(self.i32()?, self.i32()?, self.i32()?);
+        let position = GridPosition {
+            cell,
+            local: self.vec3()?,
+        };
+        if position.rebased() != Some(position) {
+            return Err(SnapshotError::Invalid("position"));
+        }
+        Ok(position)
+    }
+
+    fn field(&mut self) -> Result<crate::field::FieldDesc, SnapshotError> {
+        use crate::field::{FieldDesc, FieldRegion, ForceField};
+        let field = match self.u8()? {
+            0 => ForceField::Wind {
+                velocity: self.vec3()?,
+                drag: self.f32()?,
+            },
+            1 => ForceField::Drag {
+                linear: self.f32()?,
+                angular: self.f32()?,
+            },
+            2 => ForceField::Fluid {
+                level: self.f32()?,
+                density: self.f32()?,
+                drag: self.f32()?,
+            },
+            3 => ForceField::Attractor {
+                at: self.position()?,
+                strength: self.f32()?,
+                min_distance: self.f32()?,
+            },
+            _ => return Err(SnapshotError::Invalid("field kind")),
+        };
+        let region = match self.u8()? {
+            0 => FieldRegion::Everywhere,
+            1 => FieldRegion::Sphere {
+                center: self.position()?,
+                radius: self.f32()?,
+            },
+            2 => FieldRegion::Box {
+                center: self.position()?,
+                half_extents: self.vec3()?,
+                rotation: self.quat()?,
+            },
+            _ => return Err(SnapshotError::Invalid("field region")),
+        };
+        let filter = CollisionFilter {
+            layers: self.u32()?,
+            mask: self.u32()?,
+        };
+        Ok(FieldDesc {
+            field,
+            region,
+            filter,
+        })
     }
 
     fn handle(&mut self) -> Result<BodyHandle, SnapshotError> {
@@ -1184,6 +1445,9 @@ mod tests {
             .position(|window| window == marker.as_slice())
             .unwrap();
         bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 2 + 4 * 3);
+        // and the sensor and field counts at the end, both empty
+        let end = bytes.len() - CHECKSUM_BYTES;
+        bytes.drain(end - 2 * 4..end);
         bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
         let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
         let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];
@@ -1842,5 +2106,57 @@ mod tests {
             let empty_error: Result<(), PhysicsError> = world.step_fixed();
             assert!(empty_error.is_ok());
         }
+    }
+
+    #[test]
+    fn sensors_and_fields_come_back_from_a_snapshot_and_run_the_same() {
+        use crate::{FieldDesc, FieldRegion, ForceField, SensorDesc};
+        let (mut world, _, _) = sample();
+        let zone = world
+            .add_sensor(SensorDesc::new(
+                Shape::cuboid(Vec3::splat(3.0)),
+                GridPosition::from_local(Vec3::new(0.0, 1.0, 0.0)).unwrap(),
+            ))
+            .unwrap();
+        let wind = world
+            .add_field(
+                FieldDesc::new(ForceField::Wind {
+                    velocity: Vec3::new(3.0, 0.0, 0.0),
+                    drag: 2.0,
+                })
+                .region(FieldRegion::Box {
+                    center: GridPosition::from_local(Vec3::new(0.0, 2.0, 0.0)).unwrap(),
+                    half_extents: Vec3::splat(4.0),
+                    rotation: Quat::from_rotation_y(0.3),
+                }),
+            )
+            .unwrap();
+        for _ in 0..20 {
+            world.step_fixed().unwrap();
+        }
+        let bytes = world.save_snapshot();
+        let mut loaded = PhysicsWorld::load_snapshot(&bytes).unwrap();
+        assert_eq!(loaded.save_snapshot(), bytes);
+        assert_eq!(loaded.sensor_bodies(zone), world.sensor_bodies(zone));
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+            loaded.step_fixed().unwrap();
+            assert_eq!(loaded.sensor_events(), world.sensor_events());
+        }
+        assert_eq!(loaded.state_hash(), world.state_hash());
+        // the handles still work on the loaded world
+        assert!(loaded.remove_field(wind));
+        // a field slot with a bad kind is refused, not a panic
+        let mut wind_bytes = Vec::new();
+        for number in [3.0_f32, 0.0, 0.0, 2.0] {
+            wind_bytes.extend(number.to_le_bytes());
+        }
+        let at = bytes
+            .windows(wind_bytes.len())
+            .rposition(|window| window == wind_bytes.as_slice())
+            .unwrap();
+        let mut bad = bytes.clone();
+        bad[at - 1] = 9;
+        assert!(PhysicsWorld::load_snapshot(&resealed(bad)).is_err());
     }
 }

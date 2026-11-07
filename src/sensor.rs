@@ -44,16 +44,16 @@ pub struct SensorEvent {
 }
 
 #[derive(Debug, Clone)]
-struct Sensor {
-    desc: SensorDesc,
+pub(crate) struct Sensor {
+    pub(crate) desc: SensorDesc,
     /// Sorted by handle.
-    inside: Vec<BodyHandle>,
+    pub(crate) inside: Vec<BodyHandle>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Sensors {
-    slots: Vec<Option<Sensor>>,
-    generations: Vec<u32>,
+    pub(crate) slots: Vec<Option<Sensor>>,
+    pub(crate) generations: Vec<u32>,
     events: Vec<SensorEvent>,
     /// What each slot holds after this step, beside `slots`.
     found: Vec<Vec<BodyHandle>>,
