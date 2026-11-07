@@ -215,6 +215,53 @@ impl ShallowWater {
         Self::new(settings, origin, size, bed)
     }
 
+    /// Reads the bed again from terrain that changed, where `region` (smallest and largest
+    /// corner, world) covers a cell's center. Water keeps its depth, as in [`Self::set_bed`], so
+    /// none is made or lost: a dug hole is dry until water flows in. Returns the cells read.
+    ///
+    /// # Errors
+    /// As [`Self::over_terrain`], and on a non finite region.
+    pub fn rebed_over_terrain(
+        &mut self,
+        volume: &SdfVolume,
+        volume_origin: Vec3,
+        (top, bottom): (f32, f32),
+        (low, high): (Vec3, Vec3),
+    ) -> Result<usize, PhysicsError> {
+        if !(top.is_finite() && bottom.is_finite() && volume_origin.is_finite()) || top <= bottom {
+            return Err(PhysicsError::OutOfRange);
+        }
+        if !(low.is_finite() && high.is_finite()) {
+            return Err(PhysicsError::NonFinite("shallow water region"));
+        }
+        let cell = self.settings.cell;
+        // cells whose centers fall inside, clamped to the grid
+        let span = |low: f32, high: f32, origin: f32, count: usize| {
+            let first = ((low - origin) / cell - 0.5).ceil().max(0.0) as usize;
+            let last = ((high - origin) / cell - 0.5).floor();
+            if last < 0.0 {
+                return 0..0;
+            }
+            first..(last as usize + 1).min(count)
+        };
+        let (xs, zs) = (
+            span(low.x, high.x, self.origin.x, self.size.0),
+            span(low.z, high.z, self.origin.z, self.size.1),
+        );
+        let mut read = 0;
+        for z in zs {
+            for x in xs.clone() {
+                let center = self.origin + Vec3::new(x as f32 + 0.5, 0.0, z as f32 + 0.5) * cell;
+                let distance =
+                    |y: f32| volume.distance(Vec3::new(center.x, y, center.z) - volume_origin);
+                let height = surface_below(distance, top, bottom, cell * 1e-3);
+                self.set_bed((x, z), height)?;
+                read += 1;
+            }
+        }
+        Ok(read)
+    }
+
     pub fn settings(&self) -> &ShallowSettings {
         &self.settings
     }
@@ -1339,5 +1386,60 @@ mod tests {
         for height in water.bed() {
             assert!((height - 1.3).abs() < 1e-2, "{height}");
         }
+    }
+
+    #[test]
+    fn a_dug_bed_is_read_again_where_the_edit_was_and_the_water_stays() {
+        use crate::material::Material;
+        use crate::position::GridPosition;
+        use crate::sdf::{Base, Edit, EditOp, EditShape, SdfDesc, SdfTerrain};
+        let mut world = crate::PhysicsWorld::new(crate::PhysicsSettings::default()).unwrap();
+        let desc = SdfDesc {
+            origin: GridPosition::from_local(Vec3::ZERO).unwrap(),
+            voxel: 0.5,
+            brick_cells: 8,
+            bricks: [2, 2, 2],
+            base: Base::Plane { height: 4.0 },
+            material: Material::default(),
+        };
+        let mut ground = SdfTerrain::new(&mut world, desc).unwrap();
+        let mut water = ShallowWater::over_terrain(
+            ShallowSettings::default(),
+            Vec3::ZERO,
+            (24, 24),
+            ground.volume(),
+            Vec3::ZERO,
+            (7.0, 0.0),
+        )
+        .unwrap();
+        water.fill((0, 0), (23, 23), 5.0).unwrap();
+        let before = water.volume();
+        let pit = Edit {
+            shape: EditShape::Sphere {
+                center: Vec3::new(2.0, 4.0, 2.0),
+                radius: 1.5,
+            },
+            op: EditOp::Excavate,
+        };
+        ground.edit(&mut world, pit).unwrap();
+        let (low, high) = pit.bounds();
+        let read = water
+            .rebed_over_terrain(ground.volume(), Vec3::ZERO, (7.0, 0.0), (low, high))
+            .unwrap();
+        assert!(read > 0 && read < 24 * 24, "{read}");
+        let (x, z) = water.cell_at(Vec3::new(2.0, 0.0, 2.0)).unwrap();
+        let middle = water.bed()[water.index(x, z)];
+        assert!(middle < 3.0, "{middle}");
+        let far = water.bed()[water.index(23, 23)];
+        assert!((far - 4.0).abs() < 1e-2, "{far}");
+        assert!((water.volume() - before).abs() < 1e-6);
+        // a region off the grid reads nothing
+        let away = (Vec3::splat(100.0), Vec3::splat(101.0));
+        assert_eq!(
+            water
+                .rebed_over_terrain(ground.volume(), Vec3::ZERO, (7.0, 0.0), away)
+                .unwrap(),
+            0
+        );
     }
 }

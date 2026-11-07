@@ -178,6 +178,13 @@ pub struct Edit {
     pub op: EditOp,
 }
 
+impl Edit {
+    /// Smallest and largest corner of a box around what it touches, in the volume's own space.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        self.shape.bounds()
+    }
+}
+
 impl EditShape {
     pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
         let valid = match *self {
