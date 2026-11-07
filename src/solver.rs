@@ -8,6 +8,7 @@ use algebrix::Vec3;
 
 use crate::body::{Bodies, apply_diagonal};
 use crate::collision::{Bounds, MAX_CONTACTS, MovingPairs, RawManifold, find_pairs};
+use crate::direct::{DirectNode, Factor, Symbolic};
 use crate::joint::{
     JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
@@ -83,6 +84,9 @@ struct Colors {
     /// Small islands, each solved in order by one job.
     serial: Vec<Item>,
     serial_ends: Vec<u32>,
+    /// Their equality joint rows, solved directly, ends beside `serial_ends`.
+    direct: Vec<Item>,
+    direct_ends: Vec<u32>,
     /// Islands grouped into blocks of about a chunk of constraints.
     runs: Vec<u32>,
     stages: Vec<Stage>,
@@ -240,6 +244,11 @@ pub(crate) struct ContactScratch {
     islands: Islands,
     colors: Colors,
     motions: Vec<Motion>,
+    /// One factor per serial island, its nodes beside `colors.direct`. Shapes are kept between
+    /// substeps and steps while an island joins the same bodies.
+    factors: Vec<Factor>,
+    shapes: Vec<Symbolic>,
+    direct_nodes: Vec<DirectNode>,
 }
 
 /// Awake dynamic bodies joined by contacts and joints. Static, kinematic and sleeping bodies
@@ -621,6 +630,7 @@ pub(crate) fn solve_substep(
         refresh_manifold(bodies, state, manifold, points, last, dt);
     }
     color_constraints(bodies, scratch);
+    factor_islands(bodies, scratch);
     scratch.motions.clear();
     scratch.motions.extend(state.iter().map(|body| Motion {
         linear: body.linear,
@@ -638,8 +648,13 @@ pub(crate) fn solve_substep(
     );
     plan_stages(&mut scratch.colors, substep);
     let colors = &scratch.colors;
+    let direct = (
+        scratch.factors.as_slice(),
+        scratch.shapes.as_slice(),
+        scratch.direct_nodes.as_slice(),
+    );
     run_stages(&colors.stages, dispatch, &|stage, block| {
-        solve_block(bodies, colors, &shared, stage, block, substep);
+        solve_block(bodies, colors, direct, &shared, stage, block, substep);
     });
     for (body, motion) in state.iter_mut().zip(&scratch.motions) {
         body.linear = motion.linear;
@@ -678,23 +693,38 @@ fn color_constraints(bodies: &Bodies, scratch: &mut ContactScratch) {
     colors.order.clear();
     colors.serial.clear();
     colors.serial_ends.clear();
+    colors.direct.clear();
+    colors.direct_ends.clear();
     let islands = &scratch.islands;
     for island in 0..islands.count() {
         let points = Islands::range(&islands.point_ends, island);
         let rows = Islands::range(&islands.row_ends, island);
         let manifolds = Islands::range(&islands.manifold_ends, island);
         let size = points.len() + rows.len() + manifolds.len();
-        let out = if size < COLORED_ISLAND {
-            &mut colors.serial
-        } else {
-            &mut colors.order
-        };
+        if size < COLORED_ISLAND {
+            // equality joint rows go to the direct solve, the rest stay in order
+            colors
+                .direct
+                .extend(points.map(|index| Item::Point(index as u32)));
+            for index in rows {
+                let item = Item::Row(index as u32);
+                if scratch.joint_rows[index].is_equality() {
+                    colors.direct.push(item);
+                } else {
+                    colors.serial.push(item);
+                }
+            }
+            colors
+                .serial
+                .extend(manifolds.map(|index| Item::Manifold(index as u32)));
+            colors.serial_ends.push(colors.serial.len() as u32);
+            colors.direct_ends.push(colors.direct.len() as u32);
+            continue;
+        }
+        let out = &mut colors.order;
         out.extend(points.map(|index| Item::Point(index as u32)));
         out.extend(rows.map(|index| Item::Row(index as u32)));
         out.extend(manifolds.map(|index| Item::Manifold(index as u32)));
-        if size < COLORED_ISLAND {
-            colors.serial_ends.push(colors.serial.len() as u32);
-        }
     }
     colors.runs.clear();
     colors.runs.push(0);
@@ -763,6 +793,118 @@ fn color_constraints(bodies: &Bodies, scratch: &mut ContactScratch) {
     colors.order = order;
 }
 
+/// The direct solve's nodes and factor for each serial island's equality rows.
+fn factor_islands(bodies: &Bodies, scratch: &mut ContactScratch) {
+    let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
+    let colors = &scratch.colors;
+    scratch.direct_nodes.clear();
+    for item in &colors.direct {
+        scratch.direct_nodes.push(match *item {
+            Item::Point(index) => scratch.joint_points[index as usize].direct_node(),
+            Item::Row(index) => scratch.joint_rows[index as usize].direct_node(),
+            Item::Manifold(_) => continue,
+        });
+    }
+    let islands = colors.direct_ends.len();
+    scratch.factors.resize_with(islands, Factor::default);
+    scratch.shapes.resize_with(islands, Symbolic::default);
+    let mut start = 0;
+    for (island, end) in colors.direct_ends.iter().enumerate() {
+        let nodes = &scratch.direct_nodes[start..*end as usize];
+        start = *end as usize;
+        if nodes.is_empty() {
+            continue;
+        }
+        let shape = &mut scratch.shapes[island];
+        if !shape.fits(nodes, &dynamic) {
+            *shape = Symbolic::new(nodes, &dynamic);
+        }
+        scratch.factors[island].refactor(shape, nodes);
+    }
+}
+
+/// One direct solve of an island's equality rows: the impulses that make every row's speed
+/// what it asks, given every other impulse so far.
+///
+/// # Safety
+/// The caller owns the island's constraints and dynamic bodies for this call.
+unsafe fn solve_direct(
+    bodies: &Bodies,
+    items: &[Item],
+    nodes: &[DirectNode],
+    (factor, shape): (&Factor, &Symbolic),
+    shared: &SharedParts<'_>,
+    recovery: bool,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+    let (states, points, rows, _, _) = shared;
+    let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
+    let speeds = |motion: &Motion| {
+        if recovery {
+            (motion.recovery_linear, motion.recovery_angular)
+        } else {
+            (motion.linear, motion.angular)
+        }
+    };
+    let mut x = Vec::with_capacity(shape.rows());
+    for node in nodes {
+        // SAFETY: the island's bodies are this job's, others are only read.
+        let (a, b) = unsafe { (states.read(node.a), states.read(node.b)) };
+        let ((va, wa), (vb, wb)) = (speeds(&a), speeds(&b));
+        for row in &node.rows[..node.count] {
+            let speed =
+                row.lin_a.dot(va) + row.ang_a.dot(wa) + row.lin_b.dot(vb) + row.ang_b.dot(wb);
+            let goal = if recovery { row.recovery } else { row.target };
+            x.push(f64::from(goal) - f64::from(speed));
+        }
+    }
+    factor.solve(shape, &mut x);
+    let mut at = 0;
+    for (node, item) in nodes.iter().zip(items) {
+        let impulse = &x[at..at + node.count];
+        at += node.count;
+        for (dense, side_a) in [(node.a, true), (node.b, false)] {
+            if !dynamic(dense) {
+                continue;
+            }
+            // SAFETY: as above, a dynamic body of the island.
+            let motion = unsafe { states.get(dense) };
+            let (mut linear, mut angular) = (Vec3::ZERO, Vec3::ZERO);
+            for (row, value) in node.rows.iter().zip(impulse) {
+                let value = *value as f32;
+                let (move_linear, move_angular) = if side_a {
+                    (row.move_lin_a, row.move_ang_a)
+                } else {
+                    (row.move_lin_b, row.move_ang_b)
+                };
+                linear += move_linear * value;
+                angular += move_angular * value;
+            }
+            if recovery {
+                motion.recovery_linear += linear;
+                motion.recovery_angular += angular;
+            } else {
+                motion.linear += linear;
+                motion.angular += angular;
+                motion.touched = true;
+            }
+        }
+        match *item {
+            // SAFETY: the island's constraints are this job's.
+            Item::Point(index) => unsafe { points.get(index as usize) }.add_direct(
+                Vec3::new(impulse[0] as f32, impulse[1] as f32, impulse[2] as f32),
+                recovery,
+            ),
+            Item::Row(index) => {
+                unsafe { rows.get(index as usize) }.add_direct(impulse[0] as f32, recovery);
+            }
+            Item::Manifold(_) => {}
+        }
+    }
+}
+
 /// Small islands in one stage, then each pass of the colored solve, color by color.
 fn plan_stages(colors: &mut Colors, substep: u32) {
     let mut stages = std::mem::take(&mut colors.stages);
@@ -822,6 +964,7 @@ fn plan_stages(colors: &mut Colors, substep: u32) {
 fn solve_block(
     bodies: &Bodies,
     colors: &Colors,
+    (factors, shapes, nodes): (&[Factor], &[Symbolic], &[DirectNode]),
     shared: &SharedParts<'_>,
     stage: Stage,
     block: usize,
@@ -841,16 +984,34 @@ fn solve_block(
                     colors.serial_ends[index - 1]
                 };
                 let items = &colors.serial[start as usize..colors.serial_ends[index] as usize];
+                let from = if index == 0 {
+                    0
+                } else {
+                    colors.direct_ends[index - 1] as usize
+                };
+                let to = colors.direct_ends[index] as usize;
+                let exact = &colors.direct[from..to];
+                let factor = (&factors[index], &shapes[index]);
+                // SAFETY: as above, the island is this block's.
+                let direct = |recovery| unsafe {
+                    solve_direct(bodies, exact, &nodes[from..to], factor, shared, recovery);
+                };
+                exact.iter().for_each(|item| go(item, Pass::WarmStart));
                 items.iter().for_each(|item| go(item, Pass::WarmStart));
+                // the rest by sweeps, then the joints exactly, so they have the last word
+                // repeated direct solves refine each other, the factor drops redundant
+                // directions and so is not quite exact
                 for iteration in 0..VELOCITY_ITERATIONS {
                     if (substep as usize + iteration).is_multiple_of(2) {
                         items.iter().for_each(|item| go(item, Pass::Velocity));
                     } else {
                         items.iter().rev().for_each(|item| go(item, Pass::Velocity));
                     }
+                    direct(false);
                 }
                 for _ in 0..RECOVERY_ITERATIONS {
                     items.iter().for_each(|item| go(item, Pass::Recovery));
+                    direct(true);
                 }
             }
         }

@@ -1,6 +1,7 @@
 use algebrix::{Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal};
+use crate::direct::{DirectNode, DirectRow};
 use crate::solver::Pair;
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind, PhysicsError};
@@ -461,6 +462,83 @@ impl JointPoint {
 impl JointRow {
     pub(crate) fn bodies(&self) -> (usize, usize) {
         (self.a, self.b)
+    }
+
+    /// A lock with no bound either way, for the direct solve.
+    pub(crate) fn is_equality(&self) -> bool {
+        self.low == f32::NEG_INFINITY
+            && self.high == f32::INFINITY
+            && self.recovery_low == f32::NEG_INFINITY
+            && self.recovery_high == f32::INFINITY
+    }
+
+    pub(crate) fn direct_node(&self) -> DirectNode {
+        let row = DirectRow {
+            lin_a: -self.linear,
+            ang_a: -self.ang_a,
+            lin_b: self.linear,
+            ang_b: self.ang_b,
+            move_lin_a: -self.linear * self.inverse_a,
+            move_ang_a: -self.turn_a,
+            move_lin_b: self.linear * self.inverse_b,
+            move_ang_b: self.turn_b,
+            target: self.target,
+            recovery: self.recovery,
+        };
+        DirectNode {
+            a: self.a,
+            b: self.b,
+            count: 1,
+            rows: [row, DirectRow::default(), DirectRow::default()],
+        }
+    }
+
+    pub(crate) fn add_direct(&mut self, impulse: f32, recovery: bool) {
+        if recovery {
+            self.recovery_impulse += impulse;
+        } else {
+            self.impulse += impulse;
+        }
+    }
+}
+
+impl JointPoint {
+    /// Its three world axis rows, for the direct solve.
+    pub(crate) fn direct_node(&self) -> DirectNode {
+        let mut rows = [DirectRow::default(); 3];
+        for ((row, axis), recovery) in rows
+            .iter_mut()
+            .zip([Vec3::X, Vec3::Y, Vec3::Z])
+            .zip(self.recovery.to_array())
+        {
+            let (turn_a, turn_b) = (self.arm_a.cross(axis), self.arm_b.cross(axis));
+            *row = DirectRow {
+                lin_a: -axis,
+                ang_a: -turn_a,
+                lin_b: axis,
+                ang_b: turn_b,
+                move_lin_a: -axis * self.inverse_a,
+                move_ang_a: -matrix_times(&self.inertia_a, turn_a),
+                move_lin_b: axis * self.inverse_b,
+                move_ang_b: matrix_times(&self.inertia_b, turn_b),
+                target: 0.0,
+                recovery,
+            };
+        }
+        DirectNode {
+            a: self.a,
+            b: self.b,
+            count: 3,
+            rows,
+        }
+    }
+
+    pub(crate) fn add_direct(&mut self, impulse: Vec3, recovery: bool) {
+        if recovery {
+            self.recovery_impulse += impulse;
+        } else {
+            self.impulse += impulse;
+        }
     }
 }
 
@@ -1424,18 +1502,73 @@ mod tests {
         (worst, -8.5 - position(&world, load).y)
     }
 
+    // the direct solve holds a straight hang exactly, sweeps alone let it sag
     #[test]
     fn light_chain_holds_a_load_of_a_hundred_links() {
         let (worst, sag) = hang_load(100.0);
-        assert!(worst < 0.03, "{worst}");
-        assert!(sag < 0.05, "{sag}");
+        assert!(worst < 1e-3, "{worst}");
+        assert!(sag < 1e-3, "{sag}");
     }
 
     #[test]
-    fn light_chain_with_a_thousand_times_load_sags_but_holds() {
+    fn light_chain_holds_a_thousand_times_load() {
         let (worst, sag) = hang_load(1000.0);
-        assert!(worst < 0.3, "{worst}");
-        assert!(sag < 0.5, "{sag}");
+        assert!(worst < 1e-3, "{worst}");
+        assert!(sag < 1e-3, "{sag}");
+    }
+
+    /// A net of balls held at two corners falls and swings. Its weight goes through the links
+    /// beside the corners, hundreds to one, where sweeps alone stretched them 70 cm.
+    #[test]
+    fn swinging_net_held_at_two_corners_keeps_its_links() {
+        let mut world = world();
+        let side = 8;
+        let at = |x: usize, z: usize| Vec3::new(x as f32 * 0.5, 10.0, z as f32 * 0.5);
+        let mut grid = Vec::new();
+        for z in 0..side {
+            for x in 0..side {
+                grid.push(
+                    world
+                        .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.1)).local_position(at(x, z)))
+                        .unwrap(),
+                );
+            }
+        }
+        let mut joints = Vec::new();
+        let mut ball = |world: &mut PhysicsWorld, a, b, point: Vec3| {
+            let anchor = GridPosition::from_local(point).unwrap();
+            let desc = world
+                .joint_at(JointDesc::ball(a, b), anchor, Quat::IDENTITY)
+                .unwrap();
+            joints.push(world.add_joint(desc).unwrap());
+        };
+        for z in 0..side {
+            for x in 0..side {
+                let here = grid[z * side + x];
+                if x + 1 < side {
+                    let mid = (at(x, z) + at(x + 1, z)) * 0.5;
+                    ball(&mut world, here, grid[z * side + x + 1], mid);
+                }
+                if z + 1 < side {
+                    let mid = (at(x, z) + at(x, z + 1)) * 0.5;
+                    ball(&mut world, here, grid[(z + 1) * side + x], mid);
+                }
+            }
+        }
+        for x in [0, side - 1] {
+            let post = world
+                .spawn(RigidBodyDesc::fixed(Shape::sphere(0.05)).local_position(at(x, 0)))
+                .unwrap();
+            ball(&mut world, post, grid[x], at(x, 0));
+        }
+        let mut worst = 0.0_f32;
+        for _ in 0..180 {
+            world.step_fixed().unwrap();
+            for joint in &joints {
+                worst = worst.max(anchor_gap(&world, *joint));
+            }
+        }
+        assert!(worst < 0.02, "{worst}");
     }
 
     #[test]

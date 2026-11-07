@@ -3,6 +3,7 @@ mod character;
 mod collision;
 mod command;
 mod compound;
+mod direct;
 mod dispatch;
 mod error;
 mod fluid;
