@@ -21,7 +21,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 15] = [
+const SUITES: [(&str, Suite); 16] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -37,6 +37,7 @@ const SUITES: [(&str, Suite); 15] = [
     ("dam-fine", dam_medium),
     ("dam-dfsph", dam_dfsph),
     ("shallow", shallow),
+    ("sensors", sensors),
 ];
 
 /// A rayon pool as the host's job runner, standing in for a game engine's.
@@ -339,6 +340,33 @@ fn pile() -> Result<Outcome> {
             world.island_stats().count,
             world.island_stats().largest_bodies
         ),
+    })
+}
+
+/// 10,000 boxes resting apart and asleep, so the step is mostly the sensors: 400 spheres of
+/// 2 m over the field, each reporting what is inside.
+fn sensors() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 200.0)?;
+    for i in 0..10_000 {
+        let (x, z) = ((i % 100) as f32, (i / 100) as f32);
+        let at = Vec3::new(x * 1.5 - 75.0, 0.41, z * 1.5 - 75.0);
+        world.spawn(RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.4))).local_position(at))?;
+    }
+    let mut sensors = Vec::new();
+    for i in 0..400 {
+        let (x, z) = ((i % 20) as f32, (i / 20) as f32);
+        let at = GridPosition::from_local(Vec3::new(x * 7.5 - 72.0, 0.5, z * 7.5 - 72.0))
+            .ok_or(PhysicsError::OutOfRange)?;
+        sensors.push(world.add_sensor(solunar::SensorDesc::new(Shape::sphere(2.0), at))?);
+    }
+    let times = steps(&mut world, 120)?;
+    let held: usize = sensors.iter().map(|sensor| world.sensor_bodies(*sensor).len()).sum();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("400 sensors, {held} held"),
     })
 }
 
