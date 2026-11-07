@@ -87,6 +87,9 @@ struct Colors {
     /// Their equality joint rows, solved directly, ends beside `serial_ends`.
     direct: Vec<Item>,
     direct_ends: Vec<u32>,
+    /// Equality joint rows of colored islands that have any, one direct solve each.
+    colored_direct: Vec<Item>,
+    colored_direct_ends: Vec<u32>,
     /// Islands grouped into blocks of about a chunk of constraints.
     runs: Vec<u32>,
     stages: Vec<Stage>,
@@ -96,6 +99,11 @@ struct Colors {
 #[derive(Debug, Clone, Copy)]
 enum Stage {
     Islands {
+        blocks: u32,
+    },
+    /// The direct solve of each colored island with equality joints, one island a block.
+    Direct {
+        pass: Pass,
         blocks: u32,
     },
     /// Colors `first` to `last`. More than one is a single block.
@@ -111,7 +119,9 @@ enum Stage {
 impl Stage {
     fn blocks(self) -> usize {
         match self {
-            Self::Islands { blocks } | Self::Colors { blocks, .. } => blocks as usize,
+            Self::Islands { blocks }
+            | Self::Direct { blocks, .. }
+            | Self::Colors { blocks, .. } => blocks as usize,
         }
     }
 }
@@ -695,6 +705,8 @@ fn color_constraints(bodies: &Bodies, scratch: &mut ContactScratch) {
     colors.serial_ends.clear();
     colors.direct.clear();
     colors.direct_ends.clear();
+    colors.colored_direct.clear();
+    colors.colored_direct_ends.clear();
     let islands = &scratch.islands;
     for island in 0..islands.count() {
         let points = Islands::range(&islands.point_ends, island);
@@ -721,10 +733,27 @@ fn color_constraints(bodies: &Bodies, scratch: &mut ContactScratch) {
             colors.direct_ends.push(colors.direct.len() as u32);
             continue;
         }
-        let out = &mut colors.order;
-        out.extend(points.map(|index| Item::Point(index as u32)));
-        out.extend(rows.map(|index| Item::Row(index as u32)));
-        out.extend(manifolds.map(|index| Item::Manifold(index as u32)));
+        // the same split for a colored island, its joints get a direct stage of their own
+        let held = colors.colored_direct.len();
+        colors
+            .colored_direct
+            .extend(points.map(|index| Item::Point(index as u32)));
+        for index in rows {
+            let item = Item::Row(index as u32);
+            if scratch.joint_rows[index].is_equality() {
+                colors.colored_direct.push(item);
+            } else {
+                colors.order.push(item);
+            }
+        }
+        if colors.colored_direct.len() > held {
+            colors
+                .colored_direct_ends
+                .push(colors.colored_direct.len() as u32);
+        }
+        colors
+            .order
+            .extend(manifolds.map(|index| Item::Manifold(index as u32)));
     }
     colors.runs.clear();
     colors.runs.push(0);
@@ -798,18 +827,26 @@ fn factor_islands(bodies: &Bodies, scratch: &mut ContactScratch) {
     let dynamic = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic;
     let colors = &scratch.colors;
     scratch.direct_nodes.clear();
-    for item in &colors.direct {
+    for item in colors.direct.iter().chain(&colors.colored_direct) {
         scratch.direct_nodes.push(match *item {
             Item::Point(index) => scratch.joint_points[index as usize].direct_node(),
             Item::Row(index) => scratch.joint_rows[index as usize].direct_node(),
             Item::Manifold(_) => continue,
         });
     }
-    let islands = colors.direct_ends.len();
+    // serial islands first, then colored ones, their nodes after the serial ones
+    let serial = colors.direct.len() as u32;
+    let ends: Vec<u32> = colors
+        .direct_ends
+        .iter()
+        .copied()
+        .chain(colors.colored_direct_ends.iter().map(|end| end + serial))
+        .collect();
+    let islands = ends.len();
     scratch.factors.resize_with(islands, Factor::default);
     scratch.shapes.resize_with(islands, Symbolic::default);
     let mut start = 0;
-    for (island, end) in colors.direct_ends.iter().enumerate() {
+    for (island, end) in ends.iter().enumerate() {
         let nodes = &scratch.direct_nodes[start..*end as usize];
         start = *end as usize;
         if nodes.is_empty() {
@@ -930,6 +967,7 @@ fn plan_stages(colors: &mut Colors, substep: u32) {
             }
         }
     }
+    let direct = colors.colored_direct_ends.len() as u32;
     let mut sweep = |pass, reverse: bool| {
         let mut push = |&(first, last, blocks): &(usize, usize, usize)| {
             stages.push(Stage::Colors {
@@ -944,6 +982,13 @@ fn plan_stages(colors: &mut Colors, substep: u32) {
             groups.iter().rev().for_each(&mut push);
         } else {
             groups.iter().for_each(&mut push);
+        }
+        // the joints after the rest, so they have the last word
+        if direct > 0 {
+            stages.push(Stage::Direct {
+                pass,
+                blocks: direct,
+            });
         }
     };
     sweep(Pass::WarmStart, false);
@@ -1013,6 +1058,30 @@ fn solve_block(
                     items.iter().for_each(|item| go(item, Pass::Recovery));
                     direct(true);
                 }
+            }
+        }
+        Stage::Direct { pass, .. } => {
+            let ends = &colors.colored_direct_ends;
+            let from = if block == 0 {
+                0
+            } else {
+                ends[block - 1] as usize
+            };
+            let to = ends[block] as usize;
+            let items = &colors.colored_direct[from..to];
+            // colored islands' nodes and factors come after the serial ones
+            let (offset, island) = (colors.direct.len(), colors.direct_ends.len() + block);
+            let nodes = &nodes[offset + from..offset + to];
+            let factor = (&factors[island], &shapes[island]);
+            match pass {
+                Pass::WarmStart => items.iter().for_each(|item| go(item, pass)),
+                // SAFETY: as above, a block owns its island.
+                Pass::Velocity => unsafe {
+                    solve_direct(bodies, items, nodes, factor, shared, false);
+                },
+                Pass::Recovery => unsafe {
+                    solve_direct(bodies, items, nodes, factor, shared, true);
+                },
             }
         }
         Stage::Colors {

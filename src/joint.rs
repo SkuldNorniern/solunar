@@ -1521,8 +1521,21 @@ mod tests {
     /// beside the corners, hundreds to one, where sweeps alone stretched them 70 cm.
     #[test]
     fn swinging_net_held_at_two_corners_keeps_its_links() {
+        let worst = swing_net(8, 180);
+        assert!(worst < 0.02, "{worst}");
+    }
+
+    /// Past the size where islands are colored, the joints still get their direct solve.
+    #[test]
+    fn a_net_too_big_for_one_job_keeps_its_links_too() {
+        // 0.19 measured, sweeps alone 0.54
+        let worst = swing_net(24, 60);
+        assert!(worst < 0.25, "{worst}");
+    }
+
+    /// The widest a joint of a `side` by `side` net opens over `steps`.
+    fn swing_net(side: usize, steps: usize) -> f32 {
         let mut world = world();
-        let side = 8;
         let at = |x: usize, z: usize| Vec3::new(x as f32 * 0.5, 10.0, z as f32 * 0.5);
         let mut grid = Vec::new();
         for z in 0..side {
@@ -1562,13 +1575,13 @@ mod tests {
             ball(&mut world, post, grid[x], at(x, 0));
         }
         let mut worst = 0.0_f32;
-        for _ in 0..180 {
+        for _ in 0..steps {
             world.step_fixed().unwrap();
             for joint in &joints {
                 worst = worst.max(anchor_gap(&world, *joint));
             }
         }
-        assert!(worst < 0.02, "{worst}");
+        worst
     }
 
     #[test]
