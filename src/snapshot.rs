@@ -2159,4 +2159,29 @@ mod tests {
         bad[at - 1] = 9;
         assert!(PhysicsWorld::load_snapshot(&resealed(bad)).is_err());
     }
+
+    #[test]
+    fn raw_handles_name_the_same_bodies_after_a_load_and_bad_ones_are_stale() {
+        let (world, _, _) = sample();
+        let handles: Vec<_> = world.body_handles().map(BodyHandle::to_raw).collect();
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        for raw in &handles {
+            let body = BodyHandle::from_raw(*raw);
+            assert_eq!(
+                loaded.body_state(body).unwrap().position,
+                world.body_state(body).unwrap().position
+            );
+        }
+        assert!(
+            loaded
+                .body_state(BodyHandle::from_raw((u32::MAX, 7)))
+                .is_err()
+        );
+        let (index, generation) = handles[0];
+        assert!(
+            loaded
+                .body_state(BodyHandle::from_raw((index, generation + 1)))
+                .is_err()
+        );
+    }
 }

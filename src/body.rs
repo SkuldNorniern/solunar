@@ -13,6 +13,20 @@ pub struct BodyHandle {
     pub(crate) generation: u32,
 }
 
+impl BodyHandle {
+    /// Slot and generation, for save data. Kept with a world's snapshot they mean the same thing
+    /// again after it loads.
+    pub fn to_raw(self) -> (u32, u32) {
+        (self.index, self.generation)
+    }
+
+    /// From [`Self::to_raw`]. One that names no live slot is only stale: every call that takes it
+    /// answers with an error.
+    pub fn from_raw((index, generation): (u32, u32)) -> Self {
+        Self { index, generation }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyKind {
     Static,

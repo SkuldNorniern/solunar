@@ -18,6 +18,20 @@ pub struct JointHandle {
     pub(crate) generation: u32,
 }
 
+impl JointHandle {
+    /// Slot and generation, for save data. Kept with a world's snapshot they mean the same thing
+    /// again after it loads.
+    pub fn to_raw(self) -> (u32, u32) {
+        (self.index, self.generation)
+    }
+
+    /// From [`Self::to_raw`]. One that names no live slot is only stale: every call that takes it
+    /// answers with an error.
+    pub fn from_raw((index, generation): (u32, u32)) -> Self {
+        Self { index, generation }
+    }
+}
+
 /// Axes are the joint frame of body A. Linear is in meters, angular in radians.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JointDof {
