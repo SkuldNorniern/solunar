@@ -6,6 +6,7 @@ mod compound;
 mod direct;
 mod dispatch;
 mod error;
+mod field;
 mod fluid;
 mod frame;
 mod inspect;
@@ -31,6 +32,7 @@ pub use command::{ApplyReport, Command, CommandBuffer};
 pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo, MeshId};
 pub use dispatch::{JobDispatch, Sequential};
 pub use error::PhysicsError;
+pub use field::{FieldDesc, FieldHandle, FieldRegion, ForceField};
 pub use fluid::{
     BoundaryId, Erosion, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel,
     ShallowReport, ShallowSettings, ShallowWater,

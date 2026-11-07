@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
+use crate::field::Fields;
 use crate::joint::JointKind;
 use crate::profile::{PhaseTimes, StepTimes};
 use crate::sensor::Sensors;
@@ -105,6 +106,7 @@ pub struct PhysicsWorld {
     pub(crate) contact_cache: Vec<CachedManifold>,
     contact_events: Vec<ContactEvent>,
     pub(crate) sensors: Sensors,
+    pub(crate) fields: Fields,
     failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
@@ -147,6 +149,7 @@ impl PhysicsWorld {
             contact_cache: Vec::new(),
             contact_events: Vec::new(),
             sensors: Sensors::default(),
+            fields: Fields::default(),
             failed_body: None,
             recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
@@ -693,6 +696,7 @@ impl PhysicsWorld {
         let started = Instant::now();
         self.failed_body = None;
         self.prepare_frame_gravity()?;
+        self.apply_fields();
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
         let mut phases = PhaseTimes::default();
