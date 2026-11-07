@@ -171,6 +171,7 @@ impl PhysicsWorld {
             out.f32(material.bounce_threshold);
             out.u8(material.friction_combine.tag());
             out.u8(material.restitution_combine.tag());
+            out.vec3(bodies.surface[dense]);
             out.u32(bodies.filter[dense].layers);
             out.u32(bodies.filter[dense].mask);
             out.u32(bodies.frame[dense].index());
@@ -431,6 +432,7 @@ fn read_body(
     let kind = kind_from_tag(reader.u8()?)?;
     let shape = reader.shape()?;
     let (density, friction, restitution) = (reader.f32()?, reader.f32()?, reader.f32()?);
+    let mut surface = Vec3::ZERO;
     let mut material = Material {
         density,
         friction,
@@ -444,6 +446,7 @@ fn read_body(
             |tag| crate::Combine::from_tag(tag).ok_or(SnapshotError::Invalid("material combine"));
         material.friction_combine = combine(reader.u8()?)?;
         material.restitution_combine = combine(reader.u8()?)?;
+        surface = reader.vec3()?;
     }
     let filter = CollisionFilter {
         layers: reader.u32()?,
@@ -501,6 +504,7 @@ fn read_body(
         linear_velocity: linear,
         angular_velocity: angular,
         can_sleep,
+        surface_velocity: surface,
     };
     validate_desc(&desc, &bodies.assets).map_err(|_| SnapshotError::Invalid("body"))?;
     let (inverse_mass, inverse_inertia) = inverse_mass_properties(kind, &desc, &bodies.assets);
@@ -520,6 +524,7 @@ fn read_body(
     bodies.frame.push(frame);
     bodies.shape.push(shape);
     bodies.material.push(material);
+    bodies.surface.push(surface);
     bodies.filter.push(filter);
     bodies.asleep.push(asleep);
     bodies.can_sleep.push(can_sleep);
@@ -1174,7 +1179,7 @@ mod tests {
             .windows(marker.len())
             .position(|window| window == marker.as_slice())
             .unwrap();
-        bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2);
+        bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 3);
         bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
         let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
         let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];

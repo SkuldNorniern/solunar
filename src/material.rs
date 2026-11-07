@@ -300,4 +300,49 @@ mod tests {
         assert!(up > 0.25, "{up}");
         assert!(still < 0.11, "{still}");
     }
+
+    #[test]
+    fn a_belt_carries_what_lands_on_it_along_its_own_axis() {
+        use crate::{PhysicsSettings, PhysicsWorld, Quat, RigidBodyDesc, Shape, Vec3};
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        // turned a quarter about y, the belt's own +x runs along world -z
+        let belt = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(10.0, 0.25, 10.0)))
+                    .rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2))
+                    .surface_velocity(Vec3::new(2.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        let crate_ = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.25)))
+                    .local_position(Vec3::new(0.0, 0.6, 0.0)),
+            )
+            .unwrap();
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        let speed = world.body_state(crate_).unwrap().linear_velocity;
+        assert!(
+            (speed.z + 2.0).abs() < 0.05 && speed.x.abs() < 0.05,
+            "{speed:?}"
+        );
+        // the belt itself never moved
+        assert_eq!(world.body_state(belt).unwrap().linear_velocity, Vec3::ZERO);
+        // a snapshot keeps it running, stopping it lets friction stop the crate
+        let mut loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        loaded.step_fixed().unwrap();
+        let carried = loaded.body_state(crate_).unwrap().linear_velocity;
+        assert!((carried.z + 2.0).abs() < 0.05, "{carried:?}");
+        loaded.set_surface_velocity(belt, Vec3::ZERO).unwrap();
+        for _ in 0..120 {
+            loaded.step_fixed().unwrap();
+        }
+        assert!(loaded.body_state(crate_).unwrap().linear_velocity.length() < 0.01);
+        assert!(
+            loaded
+                .set_surface_velocity(belt, Vec3::new(f32::NAN, 0.0, 0.0))
+                .is_err()
+        );
+    }
 }

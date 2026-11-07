@@ -228,6 +228,8 @@ struct SolverManifold {
     friction: f32,
     /// The most a point takes before it slides, then `friction` holds it.
     static_friction: f32,
+    /// B's surface speed over A's, world, from belts. Friction carries the bodies to it.
+    surface: Vec3,
     /// Zero for bodies that are not dynamic, they are never pushed.
     inverse_mass: [f32; 2],
     /// Its points are `first..first + count` in the scratch point lists.
@@ -1523,6 +1525,8 @@ fn contact_manifold(
         axes,
         friction: contact.friction,
         static_friction: contact.static_friction,
+        surface: bodies.rotation[b].rotate_vec3(bodies.surface[b])
+            - bodies.rotation[a].rotate_vec3(bodies.surface[a]),
         inverse_mass: [
             dynamic_inverse_mass(bodies, a),
             dynamic_inverse_mass(bodies, b),
@@ -1601,11 +1605,16 @@ fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPo
     // decided per point and not per row, a point's rows share the load of the whole body
     for point in points.iter_mut() {
         let (one, two) = (
-            speed_along(pair, &manifold.axes, point, 1),
-            speed_along(pair, &manifold.axes, point, 2),
+            slip_along(pair, manifold, point, 1),
+            slip_along(pair, manifold, point, 2),
         );
         point.sliding = one * one + two * two > SLIP_SPEED * SLIP_SPEED;
     }
+}
+
+/// How fast the surfaces slide over each other along tangent `k`, belts counted.
+fn slip_along(pair: &Pair, manifold: &SolverManifold, point: &SolverPoint, k: usize) -> f32 {
+    speed_along(pair, &manifold.axes, point, k) + manifold.surface.dot(manifold.axes[k])
 }
 
 fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
@@ -1618,7 +1627,7 @@ fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [Solv
             (held * point.impulse.x).max(0.0),
         );
         for k in 1..3 {
-            let speed = speed_along(pair, axes, point, k);
+            let speed = slip_along(pair, manifold, point, k);
             let accumulated = point.impulse[k];
             let bound = if point.sliding { limit } else { hold };
             // not `clamp`, it panics on a nan limit

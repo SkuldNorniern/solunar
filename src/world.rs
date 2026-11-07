@@ -339,6 +339,23 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Sets how a body's surface moves, in its own frame, as a belt. What touches it wakes.
+    ///
+    /// # Errors
+    /// Fails on a stale handle or a non finite velocity.
+    pub fn set_surface_velocity(
+        &mut self,
+        body: BodyHandle,
+        velocity: Vec3,
+    ) -> Result<(), PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        finite(velocity, "velocity")?;
+        self.bodies.surface[dense] = velocity;
+        self.bodies.wake(dense);
+        self.wake_contacts_of(body);
+        Ok(())
+    }
+
     /// Moves a body without any physics in between. It wakes, and so does what touched it.
     ///
     /// # Errors

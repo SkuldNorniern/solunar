@@ -32,6 +32,9 @@ pub struct RigidBodyDesc {
     pub linear_velocity: Vec3,
     pub angular_velocity: Vec3,
     pub can_sleep: bool,
+    /// How the surface moves over the body, in the body's own frame, as a belt does. Bodies on
+    /// it are carried by friction, the body itself does not move for it.
+    pub surface_velocity: Vec3,
 }
 
 impl RigidBodyDesc {
@@ -47,6 +50,7 @@ impl RigidBodyDesc {
             linear_velocity: Vec3::ZERO,
             angular_velocity: Vec3::ZERO,
             can_sleep: true,
+            surface_velocity: Vec3::ZERO,
         }
     }
 
@@ -60,6 +64,11 @@ impl RigidBodyDesc {
 
     pub fn fixed(shape: Shape) -> Self {
         Self::new(BodyKind::Static, shape)
+    }
+
+    pub fn surface_velocity(mut self, velocity: Vec3) -> Self {
+        self.surface_velocity = velocity;
+        self
     }
 
     pub fn material(mut self, material: Material) -> Self {
@@ -156,6 +165,8 @@ pub(crate) struct Bodies {
     pub(crate) frame: Vec<FrameId>,
     pub(crate) shape: Vec<Shape>,
     pub(crate) material: Vec<Material>,
+    /// In each body's own frame.
+    pub(crate) surface: Vec<Vec3>,
     pub(crate) filter: Vec<CollisionFilter>,
     pub(crate) asleep: Vec<bool>,
     pub(crate) can_sleep: Vec<bool>,
@@ -244,6 +255,7 @@ impl Bodies {
         self.frame.push(desc.frame);
         self.shape.push(desc.shape);
         self.material.push(desc.material);
+        self.surface.push(desc.surface_velocity);
         self.filter.push(desc.filter);
         self.asleep.push(false);
         self.can_sleep.push(desc.can_sleep);
@@ -268,6 +280,7 @@ impl Bodies {
         self.frame.swap_remove(dense);
         self.shape.swap_remove(dense);
         self.material.swap_remove(dense);
+        self.surface.swap_remove(dense);
         self.filter.swap_remove(dense);
         self.asleep.swap_remove(dense);
         self.can_sleep.swap_remove(dense);
@@ -346,7 +359,10 @@ pub(crate) fn validate_desc(
     if !desc.position.local.is_finite() {
         return Err(PhysicsError::NonFinite("position"));
     }
-    if !desc.linear_velocity.is_finite() || !desc.angular_velocity.is_finite() {
+    if !desc.linear_velocity.is_finite()
+        || !desc.angular_velocity.is_finite()
+        || !desc.surface_velocity.is_finite()
+    {
         return Err(PhysicsError::NonFinite("velocity"));
     }
     let length_squared = desc.rotation.length_squared();
