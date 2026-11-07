@@ -17,7 +17,9 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 2;
+pub const SNAPSHOT_VERSION: u32 = 3;
+/// Older versions still read, what they lack takes its default.
+const OLDEST_VERSION: u32 = 2;
 
 const HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 8;
@@ -165,6 +167,10 @@ impl PhysicsWorld {
             out.f32(material.density);
             out.f32(material.friction);
             out.f32(material.restitution);
+            out.f32(material.static_friction);
+            out.f32(material.bounce_threshold);
+            out.u8(material.friction_combine.tag());
+            out.u8(material.restitution_combine.tag());
             out.u32(bodies.filter[dense].layers);
             out.u32(bodies.filter[dense].mask);
             out.u32(bodies.frame[dense].index());
@@ -259,14 +265,17 @@ impl PhysicsWorld {
         let mut reader = Reader {
             data: body,
             at: MAGIC.len(),
+            version: 0,
         };
         let version = reader.u32()?;
-        if version != SNAPSHOT_VERSION {
+        if !(OLDEST_VERSION..=SNAPSHOT_VERSION).contains(&version) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
+        reader.version = version;
         let mut checksum = Reader {
             data: stored,
             at: 0,
+            version,
         };
         if checksum.u64()? != fnv1a(body) {
             return Err(SnapshotError::BadChecksum);
@@ -421,11 +430,21 @@ fn read_body(
     }
     let kind = kind_from_tag(reader.u8()?)?;
     let shape = reader.shape()?;
-    let material = Material {
-        density: reader.f32()?,
-        friction: reader.f32()?,
-        restitution: reader.f32()?,
+    let (density, friction, restitution) = (reader.f32()?, reader.f32()?, reader.f32()?);
+    let mut material = Material {
+        density,
+        friction,
+        restitution,
+        ..Material::default()
     };
+    if reader.version >= 3 {
+        material.static_friction = reader.f32()?;
+        material.bounce_threshold = reader.f32()?;
+        let combine =
+            |tag| crate::Combine::from_tag(tag).ok_or(SnapshotError::Invalid("material combine"));
+        material.friction_combine = combine(reader.u8()?)?;
+        material.restitution_combine = combine(reader.u8()?)?;
+    }
     let filter = CollisionFilter {
         layers: reader.u32()?,
         mask: reader.u32()?,
@@ -919,6 +938,8 @@ impl Writer {
 struct Reader<'a> {
     data: &'a [u8],
     at: usize,
+    /// The snapshot's format version, what it holds depends on it.
+    version: u32,
 }
 
 impl Reader<'_> {
@@ -1130,6 +1151,34 @@ mod tests {
         let checksum = fnv1a(&data);
         data.extend_from_slice(&checksum.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn a_version_2_snapshot_still_loads_with_material_defaults() {
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        let material = Material {
+            density: 1234.5,
+            friction: 0.375,
+            restitution: 0.25,
+            ..Material::default()
+        };
+        let body = world
+            .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.5)).material(material))
+            .unwrap();
+        let mut bytes = world.save_snapshot();
+        // version 2 had density, friction and restitution, then the filter: cut what 3 added
+        let mut marker = 1234.5_f32.to_le_bytes().to_vec();
+        marker.extend(0.375_f32.to_le_bytes());
+        marker.extend(0.25_f32.to_le_bytes());
+        let at = bytes
+            .windows(marker.len())
+            .position(|window| window == marker.as_slice())
+            .unwrap();
+        bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2);
+        bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
+        let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];
+        assert_eq!(read, material);
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub use joint::{
     JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,
     Joints,
 };
-pub use material::Material;
+pub use material::{Combine, Material};
 pub use planet::{
     MAX_LEVEL, Planet, PlanetDesc, PlanetGround, TileKey, direction, face_of, level_at, level_for,
 };

@@ -2315,6 +2315,7 @@ mod tests {
             density: 2400.0,
             friction: 1.0,
             restitution: 0.0,
+            ..Material::default()
         };
         let placed: Vec<(BodyHandle, Vec3)> = (0..8)
             .map(|row| {

@@ -455,7 +455,11 @@ mod tests {
             (seed >> 8) as f32 / (1 << 24) as f32
         };
         for _ in 0..300 {
-            let at = Vec3::new(next() * 80.0 - 40.0, next() * 6.0 + 0.3, next() * 20.0 - 10.0);
+            let at = Vec3::new(
+                next() * 80.0 - 40.0,
+                next() * 6.0 + 0.3,
+                next() * 20.0 - 10.0,
+            );
             let shape = match (next() * 3.0) as u32 {
                 0 => Shape::sphere(0.2 + next() * 0.6),
                 1 => Shape::cuboid(Vec3::splat(0.2 + next() * 0.5)),
@@ -488,12 +492,21 @@ mod tests {
             for sensor in &sensors {
                 let desc = world.sensors.get(*sensor).unwrap().desc.clone();
                 world
-                    .overlap(&desc.shape, desc.position, desc.rotation, &desc.filter, &mut queried)
+                    .overlap(
+                        &desc.shape,
+                        desc.position,
+                        desc.rotation,
+                        &desc.filter,
+                        &mut queried,
+                    )
                     .unwrap();
                 assert_eq!(world.sensor_bodies(*sensor), queried.as_slice());
             }
         }
-        let held: usize = sensors.iter().map(|sensor| world.sensor_bodies(*sensor).len()).sum();
+        let held: usize = sensors
+            .iter()
+            .map(|sensor| world.sensor_bodies(*sensor).len())
+            .sum();
         assert!(held > 20, "{held}");
     }
 }

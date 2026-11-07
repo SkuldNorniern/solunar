@@ -13,6 +13,7 @@ use crate::joint::{
     JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
+use crate::material::Contact;
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind, JobDispatch, PhysicsError, Shape};
 
@@ -26,8 +27,9 @@ const RECOVERY_ITERATIONS: usize = 1;
 const RECOVERY_RATE: f32 = 0.2;
 const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
-const RESTITUTION_THRESHOLD: f32 = 1.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
+/// A point slipping slower than this, m/s, counts as held still and gets static friction.
+const SLIP_SPEED: f32 = 0.05;
 /// Constraints in one block of work. A block is the smallest piece a thread takes.
 const COLOR_CHUNK: usize = if cfg!(miri) { 2 } else { 64 };
 /// Below this many blocks in a substep the solve stays on the calling thread.
@@ -202,6 +204,8 @@ struct SolverPoint {
     recovery: f32,
     recovery_impulse: f32,
     impulse: Vec3,
+    /// Slipping faster than `SLIP_SPEED` when the substep began, static friction no longer holds.
+    sliding: bool,
 }
 
 /// What a contact point keeps that the iterations never read, apart so a pass reads less.
@@ -222,6 +226,8 @@ struct SolverManifold {
     part_b: u32,
     axes: [Vec3; 3],
     friction: f32,
+    /// The most a point takes before it slides, then `friction` holds it.
+    static_friction: f32,
     /// Zero for bodies that are not dynamic, they are never pushed.
     inverse_mass: [f32; 2],
     /// Its points are `first..first + count` in the scratch point lists.
@@ -1506,8 +1512,7 @@ fn contact_manifold(
     let normal = raw.normal;
     let tangent = tangent_of(normal);
     let axes = [normal, tangent, normal.cross(tangent)];
-    let (material_a, material_b) = (&bodies.material[a], &bodies.material[b]);
-    let restitution = material_a.restitution.max(material_b.restitution);
+    let contact = Contact::of(&bodies.material[a], &bodies.material[b]);
     let manifold = SolverManifold {
         a,
         b,
@@ -1516,7 +1521,8 @@ fn contact_manifold(
         part_a,
         part_b,
         axes,
-        friction: (material_a.friction * material_b.friction).sqrt(),
+        friction: contact.friction,
+        static_friction: contact.static_friction,
         inverse_mass: [
             dynamic_inverse_mass(bodies, a),
             dynamic_inverse_mass(bodies, b),
@@ -1537,8 +1543,8 @@ fn contact_manifold(
         let local_b = inverse_rotation_b.rotate_vec3(offset_b);
         let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
         let reaches = -approach * dt >= -point.depth;
-        let bounce = if reaches && approach < -RESTITUTION_THRESHOLD {
-            -restitution * approach
+        let bounce = if reaches && approach < -contact.bounce_threshold {
+            -contact.restitution * approach
         } else {
             0.0
         };
@@ -1579,8 +1585,8 @@ fn matching_impulse(
     })
 }
 
-fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &[SolverPoint]) {
-    for point in points {
+fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
+    for point in points.iter() {
         for k in 0..3 {
             push(
                 pair,
@@ -1591,19 +1597,32 @@ fn warm_start(pair: &mut Pair, manifold: &SolverManifold, points: &[SolverPoint]
             );
         }
     }
+    // with last substep's impulses back in, a held point barely moves, a sliding one still does.
+    // decided per point and not per row, a point's rows share the load of the whole body
+    for point in points.iter_mut() {
+        let (one, two) = (
+            speed_along(pair, &manifold.axes, point, 1),
+            speed_along(pair, &manifold.axes, point, 2),
+        );
+        point.sliding = one * one + two * two > SLIP_SPEED * SLIP_SPEED;
+    }
 }
 
 fn solve_manifold(pair: &mut Pair, manifold: &SolverManifold, points: &mut [SolverPoint]) {
     let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
-    let friction = manifold.friction;
+    let (friction, held) = (manifold.friction, manifold.static_friction);
     for point in points {
         // friction first, so the normal impulse has the last word on penetration
-        let limit = (friction * point.impulse.x).max(0.0);
+        let (limit, hold) = (
+            (friction * point.impulse.x).max(0.0),
+            (held * point.impulse.x).max(0.0),
+        );
         for k in 1..3 {
             let speed = speed_along(pair, axes, point, k);
             let accumulated = point.impulse[k];
+            let bound = if point.sliding { limit } else { hold };
             // not `clamp`, it panics on a nan limit
-            let next = (accumulated - speed * point.mass[k]).min(limit).max(-limit);
+            let next = (accumulated - speed * point.mass[k]).min(bound).max(-bound);
             point.impulse[k] = next;
             push(pair, (axes, inverse), point, k, next - accumulated);
         }
