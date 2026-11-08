@@ -95,6 +95,9 @@ impl Default for Integrated {
     }
 }
 
+/// Body pairs, lower handle first.
+type Pairs = Vec<(BodyHandle, BodyHandle)>;
+
 #[derive(Debug, Clone)]
 pub struct PhysicsWorld {
     pub(crate) settings: PhysicsSettings,
@@ -104,6 +107,10 @@ pub struct PhysicsWorld {
     pub(crate) tick: u64,
     pub(crate) accumulator: f64,
     pub(crate) contact_cache: Vec<CachedManifold>,
+    /// Last step's cache, kept for its memory: the next one is built in it.
+    spare_cache: Vec<CachedManifold>,
+    /// Touching pairs before and after a step, for the contact events.
+    touched: (Pairs, Pairs),
     contact_events: Vec<ContactEvent>,
     pub(crate) sensors: Sensors,
     pub(crate) fields: Fields,
@@ -147,6 +154,8 @@ impl PhysicsWorld {
             tick,
             accumulator,
             contact_cache: Vec::new(),
+            spare_cache: Vec::new(),
+            touched: (Vec::new(), Vec::new()),
             contact_events: Vec::new(),
             sensors: Sensors::default(),
             fields: Fields::default(),
@@ -739,7 +748,9 @@ impl PhysicsWorld {
         let awake = self.sleep.awake();
         let substeps = self.settings.substeps;
         let part = dt / substeps as f32;
-        let mut next_cache = self.contact_cache.clone();
+        let mut next_cache = std::mem::take(&mut self.spare_cache);
+        next_cache.clear();
+        next_cache.extend_from_slice(&self.contact_cache);
         lap(&mut phases.broadphase);
         prepare_contacts(
             bodies,
@@ -785,8 +796,13 @@ impl PhysicsWorld {
         finish_contacts(bodies, awake, &mut next_cache, &self.contact_scratch);
 
         self.commit()?;
-        contact_changes(&self.contact_cache, &next_cache, &mut self.contact_events);
-        self.contact_cache = next_cache;
+        contact_changes(
+            &self.contact_cache,
+            &next_cache,
+            &mut self.touched,
+            &mut self.contact_events,
+        );
+        self.spare_cache = std::mem::replace(&mut self.contact_cache, next_cache);
         let (points, rows, impulses) = self.contact_scratch.joint_parts();
         self.joints.store(impulses, points, rows, part);
         update_sleep(
@@ -1012,10 +1028,14 @@ fn touching(cache: &[CachedManifold], out: &mut Vec<(BodyHandle, BodyHandle)>) {
     }
 }
 
-fn contact_changes(old: &[CachedManifold], new: &[CachedManifold], out: &mut Vec<ContactEvent>) {
-    let (mut before, mut after) = (Vec::new(), Vec::new());
-    touching(old, &mut before);
-    touching(new, &mut after);
+fn contact_changes(
+    old: &[CachedManifold],
+    new: &[CachedManifold],
+    (before, after): &mut (Pairs, Pairs),
+    out: &mut Vec<ContactEvent>,
+) {
+    touching(old, before);
+    touching(new, after);
     out.clear();
     let (mut i, mut j) = (0, 0);
     while i < before.len() || j < after.len() {

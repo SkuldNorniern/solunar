@@ -902,6 +902,7 @@ unsafe fn solve_direct(
     (factor, shape): (&Factor, &Symbolic),
     shared: &SharedParts<'_>,
     recovery: bool,
+    x: &mut Vec<[f64; 3]>,
 ) {
     if nodes.is_empty() {
         return;
@@ -915,7 +916,8 @@ unsafe fn solve_direct(
             (motion.linear, motion.angular)
         }
     };
-    let mut x = Vec::with_capacity(nodes.len());
+    x.clear();
+    x.reserve(nodes.len());
     for node in nodes {
         // SAFETY: the island's bodies are this job's, others are only read.
         let (a, b) = unsafe { (states.read(node.a), states.read(node.b)) };
@@ -929,8 +931,8 @@ unsafe fn solve_direct(
         }
         x.push(part);
     }
-    factor.solve(shape, &mut x);
-    for ((node, item), part) in nodes.iter().zip(items).zip(&x) {
+    factor.solve(shape, x);
+    for ((node, item), part) in nodes.iter().zip(items).zip(x.iter()) {
         let impulse = &part[..node.count];
         for (dense, side_a) in [(node.a, true), (node.b, false)] {
             if !dynamic(dense) {
@@ -1049,6 +1051,8 @@ fn solve_block(
     // no dynamic body, and inside one color no two constraints do. The overflow color is one
     // block. Static and kinematic bodies are only read, nobody writes them during the solve.
     let go = |item: &Item, pass| unsafe { solve_item(bodies, *item, shared, pass) };
+    // right hand sides of direct solves, one buffer for the block
+    let mut rhs = Vec::new();
     match stage {
         Stage::Islands { .. } => {
             let (first, last) = (colors.runs[block] as usize, colors.runs[block + 1] as usize);
@@ -1068,8 +1072,16 @@ fn solve_block(
                 let exact = &colors.direct[from..to];
                 let factor = (&factors[index], &shapes[index]);
                 // SAFETY: as above, the island is this block's.
-                let direct = |recovery| unsafe {
-                    solve_direct(bodies, exact, &nodes[from..to], factor, shared, recovery);
+                let mut direct = |recovery| unsafe {
+                    solve_direct(
+                        bodies,
+                        exact,
+                        &nodes[from..to],
+                        factor,
+                        shared,
+                        recovery,
+                        &mut rhs,
+                    );
                 };
                 exact.iter().for_each(|item| go(item, Pass::WarmStart));
                 items.iter().for_each(|item| go(item, Pass::WarmStart));
@@ -1107,10 +1119,10 @@ fn solve_block(
                 Pass::WarmStart => items.iter().for_each(|item| go(item, pass)),
                 // SAFETY: as above, a block owns its island.
                 Pass::Velocity => unsafe {
-                    solve_direct(bodies, items, nodes, factor, shared, false);
+                    solve_direct(bodies, items, nodes, factor, shared, false, &mut rhs);
                 },
                 Pass::Recovery => unsafe {
-                    solve_direct(bodies, items, nodes, factor, shared, true);
+                    solve_direct(bodies, items, nodes, factor, shared, true, &mut rhs);
                 },
             }
         }

@@ -182,9 +182,8 @@ pub(crate) fn update_sleep(
     scratch.flagged.resize(count, false);
     scratch.supported.clear();
     scratch.supported.resize(count, false);
-    let links: Vec<(usize, usize, bool)> = joints.links(bodies).collect();
     let contacts = touching.map(|(a, b)| (a, b, false));
-    for (a, b, running) in contacts.chain(links) {
+    for (a, b, running) in contacts.chain(joints.links(bodies)) {
         if running {
             let body = if bodies.kind[a] == BodyKind::Dynamic {
                 a
