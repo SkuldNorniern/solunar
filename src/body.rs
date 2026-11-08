@@ -1,5 +1,6 @@
 use algebrix::{IVec3, Quat, Vec3};
 
+use crate::collision::tree::TreeCache;
 use crate::compound::ShapeAssets;
 use crate::{
     CollisionFilter, FrameId, GridPosition, MassProperties, Material, PhysicsError, Shape,
@@ -186,6 +187,7 @@ pub(crate) struct Bodies {
     pub(crate) can_sleep: Vec<bool>,
     pub(crate) still_time: Vec<f32>,
     pub(crate) assets: ShapeAssets,
+    pub(crate) tree: TreeCache,
 }
 
 impl Bodies {
@@ -242,6 +244,7 @@ impl Bodies {
                 index
             }
         };
+        self.tree.clear();
         let slot = &mut self.slots[index as usize];
         slot.dense = dense;
         let generation = slot.generation;
@@ -279,6 +282,7 @@ impl Bodies {
 
     pub(crate) fn remove(&mut self, handle: BodyHandle) -> Result<(), PhysicsError> {
         let dense = self.dense_index(handle)?;
+        self.tree.clear();
         self.owner.swap_remove(dense);
         self.cell.swap_remove(dense);
         self.local.swap_remove(dense);

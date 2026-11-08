@@ -3,6 +3,7 @@ pub(crate) mod convex;
 mod gjk;
 mod narrowphase;
 mod query;
+pub(crate) mod tree;
 pub(crate) mod trimesh;
 
 pub(crate) use broadphase::{Bounds, MovingPairs, find_pairs};

@@ -370,6 +370,7 @@ impl PhysicsWorld {
     ) -> Result<(), PhysicsError> {
         let dense = self.bodies.dense_index(body)?;
         let position = position.rebased().ok_or(PhysicsError::OutOfRange)?;
+        self.bodies.tree.clear();
         self.bodies.cell[dense] = position.cell;
         self.bodies.local[dense] = position.local;
         self.bodies.wake(dense);
@@ -604,6 +605,7 @@ impl PhysicsWorld {
             angular,
         );
         finite(momentum, "momentum")?;
+        self.bodies.tree.clear();
         self.bodies.cell[dense] = next.cell;
         self.bodies.local[dense] = next.local;
         self.bodies.rotation[dense] = rotation;
@@ -830,6 +832,7 @@ impl PhysicsWorld {
                 return Err(error);
             }
         }
+        self.bodies.tree.clear();
         for (dense, result) in self.scratch.iter().enumerate() {
             self.bodies.cell[dense] = result.position.cell;
             self.bodies.local[dense] = result.position.local;

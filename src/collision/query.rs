@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use super::gjk::{Hull, distance};
@@ -75,16 +77,17 @@ impl PhysicsWorld {
         let direction = self.check_cast(ray.origin, ray.direction, ray.max_distance, filter)?;
         let max = f64::from(ray.max_distance);
         let mut best: Option<(f64, BodyHandle, DVec3)> = None;
-        for dense in 0..self.bodies.len() {
+        let shortest = Cell::new(max);
+        let mut visit = |dense: usize| {
             if !self.visible(dense, filter) {
-                continue;
+                return;
             }
             let offset = ray.origin.offset_from(self.bodies.position(dense));
             let limit = best.map_or(max, |found| found.0);
             let assets = &self.bodies.assets;
             let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if !sphere_near_path(offset, direction, limit, reach) {
-                continue;
+                return;
             }
             let handle = self.bodies.handle_at(dense);
             let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
@@ -104,7 +107,7 @@ impl PhysicsWorld {
                         best = Some((time, handle, rotation.mul_vec3(normal)));
                     }
                 });
-                continue;
+                return;
             }
             assets.for_each_part(body.0, body.1, |_, part, at, turn| {
                 let limit = best.map_or(max, |found| found.0);
@@ -124,7 +127,11 @@ impl PhysicsWorld {
                     best = Some((time, handle, normal));
                 }
             });
-        }
+            shortest.set(best.map_or(max, |found| found.0));
+        };
+        let tree = self.bodies.tree.get(&self.bodies);
+        let start = tree.local(ray.origin);
+        tree.along(start, direction, 0.0, &|| shortest.get(), &mut visit);
         best.map(|(time, body, normal)| {
             let point = shifted(ray.origin, direction * time)?;
             Ok(CastHit {
@@ -158,16 +165,17 @@ impl PhysicsWorld {
         let own_reach = f64::from(self.bodies.assets.bounding_radius(&cast.shape));
         let max = f64::from(cast.max_distance);
         let mut best: Option<(f64, BodyHandle, DVec3, DVec3)> = None;
-        for dense in 0..self.bodies.len() {
+        let shortest = Cell::new(max);
+        let mut visit = |dense: usize| {
             if !self.visible(dense, filter) {
-                continue;
+                return;
             }
             let center = self.bodies.position(dense).offset_from(cast.origin);
             let limit = best.map_or(max, |found| found.0);
             let assets = &self.bodies.assets;
             let reach = own_reach + f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
             if !sphere_near_path(-center, direction, limit, reach) {
-                continue;
+                return;
             }
             let handle = self.bodies.handle_at(dense);
             let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
@@ -197,7 +205,7 @@ impl PhysicsWorld {
                         best = Some((hit.0, handle, normal, point));
                     }
                 });
-                continue;
+                return;
             }
             assets.for_each_part(body.0, body.1, |_, part, at, turn| {
                 let limit = best.map_or(max, |found| found.0);
@@ -211,7 +219,11 @@ impl PhysicsWorld {
                     best = Some((hit.0, handle, hit.1, hit.2));
                 }
             });
-        }
+            shortest.set(best.map_or(max, |found| found.0));
+        };
+        let tree = self.bodies.tree.get(&self.bodies);
+        let start = tree.local(cast.origin);
+        tree.along(start, direction, own_reach, &|| shortest.get(), &mut visit);
         best.map(|(time, body, normal, point)| {
             Ok(CastHit {
                 body,
@@ -242,7 +254,7 @@ impl PhysicsWorld {
         self.check_frame(filter)?;
         self.bodies.assets.validate(shape)?;
         let own_reach = f64::from(self.bodies.assets.bounding_radius(shape));
-        for dense in 0..self.bodies.len() {
+        for dense in self.near_bodies(position, own_reach) {
             if !self.visible(dense, filter) {
                 continue;
             }
@@ -279,7 +291,7 @@ impl PhysicsWorld {
         self.check_frame(filter)?;
         check_max_distance(max_distance)?;
         let mut best: Option<(f64, BodyHandle, DVec3)> = None;
-        for dense in 0..self.bodies.len() {
+        for dense in self.near_bodies(position, f64::from(max_distance)) {
             if !self.visible(dense, filter) {
                 continue;
             }
@@ -347,7 +359,7 @@ impl PhysicsWorld {
         self.check_frame(filter)?;
         let own_reach = f64::from(shape.bounding_radius());
         let mut deepest: Option<(Vec3, f32)> = None;
-        for dense in 0..self.bodies.len() {
+        for dense in self.near_bodies(position, own_reach) {
             if !self.visible(dense, filter) {
                 continue;
             }
@@ -373,6 +385,15 @@ impl PhysicsWorld {
             );
         }
         Ok(deepest)
+    }
+
+    /// Bodies whose bounds come within `reach` of `at`, in dense order.
+    fn near_bodies(&self, at: GridPosition, reach: f64) -> Vec<usize> {
+        let tree = self.bodies.tree.get(&self.bodies);
+        let mut found = Vec::new();
+        tree.within(tree.local(at), reach, &mut |dense| found.push(dense));
+        found.sort_unstable();
+        found
     }
 
     pub(crate) fn visible(&self, dense: usize, filter: &QueryFilter) -> bool {
@@ -657,6 +678,7 @@ mod tests {
     use algebrix::IVec3;
 
     use super::*;
+    use crate::collision::tree::TreeCache;
     use crate::{CollisionFilter, FrameDesc, PhysicsSettings, RigidBodyDesc};
 
     fn world() -> PhysicsWorld {
@@ -1259,5 +1281,80 @@ mod tests {
             }
         }
         assert!(hits > 500, "{hits}");
+    }
+
+    #[test]
+    fn tree_answers_like_a_full_scan() {
+        let mut state = 0x2468_ace0_1357_9bdf_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 2000) as f32 / 1000.0 - 1.0
+        };
+        let shapes = [
+            Shape::sphere(0.6),
+            Shape::capsule(0.3, 0.8),
+            Shape::cuboid(Vec3::new(0.7, 0.3, 1.1)),
+        ];
+        let mut world = world();
+        let mut bodies = Vec::new();
+        for _ in 0..600 {
+            let shape = shapes[(next().abs() * 2.99) as usize];
+            let place = Vec3::new(next(), next(), next()) * 20.0;
+            let body = RigidBodyDesc::fixed(shape)
+                .rotation(Quat::new(next(), next(), next(), next() + 2.0).normalize())
+                .local_position(place);
+            bodies.push(world.spawn(body).unwrap());
+        }
+        // twins on one spot, so ties need the handle order
+        for _ in 0..20 {
+            fixed(&mut world, Shape::sphere(0.5), 3.0, 3.0, 3.0);
+        }
+        for body in bodies.iter().step_by(7) {
+            world.despawn(*body).unwrap();
+        }
+        let mut flat = world.clone();
+        flat.bodies.tree = TreeCache::flat(&flat.bodies);
+        let filter = QueryFilter::default();
+        let (mut out, mut flat_out) = (Vec::new(), Vec::new());
+        let mut hits = 0;
+        for _ in 0..1500 {
+            let from = Vec3::new(next(), next(), next()) * 25.0;
+            let origin = at(from.x, from.y, from.z);
+            let direction = Vec3::new(next(), next(), next() + 1e-3);
+            let line = Ray {
+                max_distance: 30.0 + next().abs() * 80.0,
+                ..ray(origin, direction)
+            };
+            let found = world.raycast(&line, &filter).unwrap();
+            hits += usize::from(found.is_some());
+            assert_eq!(found, flat.raycast(&line, &filter).unwrap(), "{line:?}");
+            let sweep = ShapeCast {
+                max_distance: 60.0,
+                ..cast(shapes[hits % 3], origin, direction)
+            };
+            assert_eq!(
+                world.shape_cast(&sweep, &filter).unwrap(),
+                flat.shape_cast(&sweep, &filter).unwrap(),
+                "{sweep:?}"
+            );
+            let shape = Shape::sphere(1.0 + next().abs() * 4.0);
+            world
+                .overlap(&shape, origin, Quat::IDENTITY, &filter, &mut out)
+                .unwrap();
+            flat.overlap(&shape, origin, Quat::IDENTITY, &filter, &mut flat_out)
+                .unwrap();
+            assert_eq!(out, flat_out);
+            let reach = next().abs() * 20.0;
+            assert_eq!(
+                world.nearest_point(origin, reach, &filter).unwrap(),
+                flat.nearest_point(origin, reach, &filter).unwrap()
+            );
+        }
+        let twin = ray(at(3.0, 3.0, -10.0), Vec3::Z);
+        let first = world.raycast(&twin, &filter).unwrap().unwrap();
+        assert_eq!(Some(first), flat.raycast(&twin, &filter).unwrap());
+        assert!(hits > 200, "{hits}");
     }
 }

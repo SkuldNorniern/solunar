@@ -1,0 +1,245 @@
+use std::sync::OnceLock;
+
+use algebrix::DVec3;
+
+use crate::body::Bodies;
+use crate::position::GridPosition;
+
+const LEAF: usize = 4;
+
+type Bounds = ([f64; 3], [f64; 3]);
+
+fn axes(v: DVec3) -> [f64; 3] {
+    [v.x, v.y, v.z]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Node {
+    min: [f64; 3],
+    max: [f64; 3],
+    /// A leaf holds `items[first..first + count]`, an inner node has `count` 0 and its children
+    /// at `first` and `first + 1`.
+    first: u32,
+    count: u32,
+}
+
+/// Bounding sphere boxes of all bodies, so queries visit only what they can reach.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryTree {
+    /// Boxes are offsets from here, so far cells keep their precision.
+    origin: GridPosition,
+    nodes: Vec<Node>,
+    items: Vec<u32>,
+}
+
+/// Derived from the bodies, never part of what two worlds compare as.
+#[derive(Debug, Default)]
+pub(crate) struct TreeCache(OnceLock<QueryTree>);
+
+impl Clone for TreeCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for TreeCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl TreeCache {
+    pub(crate) fn get(&self, bodies: &Bodies) -> &QueryTree {
+        self.0.get_or_init(|| QueryTree::build(bodies, LEAF))
+    }
+
+    /// One leaf over every body, the same as scanning them all.
+    #[cfg(test)]
+    pub(crate) fn flat(bodies: &Bodies) -> Self {
+        Self(OnceLock::from(QueryTree::build(bodies, usize::MAX)))
+    }
+
+    /// Bodies moved, came or went.
+    pub(crate) fn clear(&mut self) {
+        self.0 = OnceLock::new();
+    }
+}
+
+impl QueryTree {
+    fn build(bodies: &Bodies, leaf: usize) -> Self {
+        let count = bodies.len();
+        let origin = if count == 0 {
+            GridPosition::ORIGIN
+        } else {
+            bodies.position(0)
+        };
+        let boxes: Vec<Bounds> = (0..count)
+            .map(|dense| {
+                let center = axes(bodies.position(dense).offset_from(origin));
+                let reach = f64::from(bodies.assets.bounding_radius(&bodies.shape[dense]));
+                (center.map(|v| v - reach), center.map(|v| v + reach))
+            })
+            .collect();
+        let mut tree = Self {
+            origin,
+            nodes: Vec::with_capacity(count / 2 + 1),
+            items: (0..count as u32).collect(),
+        };
+        if count > 0 {
+            tree.nodes.push(Node {
+                min: [0.0; 3],
+                max: [0.0; 3],
+                first: 0,
+                count: 0,
+            });
+            tree.split(0, 0, count, leaf, &boxes);
+        }
+        tree
+    }
+
+    /// Fills node `at` over `items[start..end]`, split at the median of the longest axis.
+    fn split(&mut self, at: usize, start: usize, end: usize, leaf: usize, boxes: &[Bounds]) {
+        let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for item in &self.items[start..end] {
+            let (low, high) = boxes[*item as usize];
+            for axis in 0..3 {
+                min[axis] = min[axis].min(low[axis]);
+                max[axis] = max[axis].max(high[axis]);
+            }
+        }
+        if end - start <= leaf {
+            self.nodes[at] = Node {
+                min,
+                max,
+                first: start as u32,
+                count: (end - start) as u32,
+            };
+            return;
+        }
+        let size = [0, 1, 2].map(|axis| max[axis] - min[axis]);
+        let axis = if size[0] >= size[1] && size[0] >= size[2] {
+            0
+        } else if size[1] >= size[2] {
+            1
+        } else {
+            2
+        };
+        let middle = start + (end - start) / 2;
+        let center = |item: &u32| {
+            let (low, high) = boxes[*item as usize];
+            low[axis] + high[axis]
+        };
+        // ties go to the lower index, the same bodies give the same tree
+        self.items[start..end].select_nth_unstable_by(middle - start, |a, b| {
+            center(a).total_cmp(&center(b)).then(a.cmp(b))
+        });
+        let left = self.nodes.len();
+        self.nodes.push(self.nodes[at]);
+        self.nodes.push(self.nodes[at]);
+        self.nodes[at] = Node {
+            min,
+            max,
+            first: left as u32,
+            count: 0,
+        };
+        self.split(left, start, middle, leaf, boxes);
+        self.split(left + 1, middle, end, leaf, boxes);
+    }
+
+    pub(crate) fn local(&self, at: GridPosition) -> DVec3 {
+        at.offset_from(self.origin)
+    }
+
+    /// Every body whose box, grown by `grow`, the path from `start` along unit `direction`
+    /// enters before `limit()`. `limit` is read again as it shrinks.
+    pub(crate) fn along(
+        &self,
+        start: DVec3,
+        direction: DVec3,
+        grow: f64,
+        limit: &dyn Fn() -> f64,
+        visit: &mut dyn FnMut(usize),
+    ) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let (from, toward) = (axes(start), axes(direction));
+        let enter = |node: &Node| {
+            let (mut near, mut far) = (0.0_f64, f64::INFINITY);
+            for axis in 0..3 {
+                let (low, high) = (node.min[axis] - grow, node.max[axis] + grow);
+                if toward[axis].abs() < 1e-300 {
+                    if from[axis] < low || from[axis] > high {
+                        return None;
+                    }
+                    continue;
+                }
+                let a = (low - from[axis]) / toward[axis];
+                let b = (high - from[axis]) / toward[axis];
+                near = near.max(a.min(b));
+                far = far.min(a.max(b));
+            }
+            (near <= far).then_some(near)
+        };
+        let Some(root) = enter(&self.nodes[0]) else {
+            return;
+        };
+        let mut stack = vec![(0_usize, root)];
+        while let Some((at, near)) = stack.pop() {
+            // some room past the limit, the exact tests decide
+            if near > limit() + 1e-6 {
+                continue;
+            }
+            let node = self.nodes[at];
+            if node.count > 0 {
+                let first = node.first as usize;
+                for item in &self.items[first..first + node.count as usize] {
+                    visit(*item as usize);
+                }
+                continue;
+            }
+            let (a, b) = (node.first as usize, node.first as usize + 1);
+            // the nearer child goes on top
+            match (enter(&self.nodes[a]), enter(&self.nodes[b])) {
+                (Some(ta), Some(tb)) if ta <= tb => {
+                    stack.push((b, tb));
+                    stack.push((a, ta));
+                }
+                (Some(ta), Some(tb)) => {
+                    stack.push((a, ta));
+                    stack.push((b, tb));
+                }
+                (Some(ta), None) => stack.push((a, ta)),
+                (None, Some(tb)) => stack.push((b, tb)),
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// Every body whose box comes within `radius` of `center` on each axis.
+    pub(crate) fn within(&self, center: DVec3, radius: f64, visit: &mut dyn FnMut(usize)) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let center = axes(center);
+        let mut stack = vec![0_usize];
+        while let Some(at) = stack.pop() {
+            let node = self.nodes[at];
+            let apart = (0..3).any(|axis| {
+                node.min[axis] > center[axis] + radius || node.max[axis] < center[axis] - radius
+            });
+            if apart {
+                continue;
+            }
+            if node.count > 0 {
+                let first = node.first as usize;
+                for item in &self.items[first..first + node.count as usize] {
+                    visit(*item as usize);
+                }
+            } else {
+                stack.push(node.first as usize + 1);
+                stack.push(node.first as usize);
+            }
+        }
+    }
+}
