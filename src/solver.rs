@@ -4,7 +4,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use algebrix::Vec3;
+use algebrix::{Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal};
 use crate::collision::{Bounds, MAX_CONTACTS, MovingPairs, RawManifold, find_pairs};
@@ -15,7 +15,7 @@ use crate::joint::{
 };
 use crate::material::{Contact, Material};
 use crate::world::Integrated;
-use crate::{BodyHandle, BodyKind, JobDispatch, PhysicsError, Shape};
+use crate::{BodyHandle, BodyKind, GridPosition, JobDispatch, PhysicsError, Shape};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
@@ -256,6 +256,8 @@ struct FoundContacts {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContactScratch {
     bounds: Vec<Bounds>,
+    /// What each bound was made from, a body that did not change keeps it.
+    posed: Vec<(GridPosition, Quat, Shape, f32)>,
     order: Vec<u32>,
     pairs: Vec<(u32, u32)>,
     moving: MovingPairs,
@@ -446,14 +448,27 @@ pub(crate) fn find_broad_pairs(
     every: bool,
     dt: f32,
 ) {
-    scratch.bounds.clear();
-    for dense in 0..bodies.len() {
-        scratch.bounds.push(bodies.assets.bounds(
-            &bodies.shape[dense],
+    let count = bodies.len();
+    scratch.bounds.truncate(count);
+    scratch.posed.truncate(count);
+    for dense in 0..count {
+        let pose = (
             bodies.position(dense),
             bodies.rotation[dense],
+            bodies.shape[dense],
             CONTACT_MARGIN + 2.0 * step_motion(bodies, dense, dt),
-        ));
+        );
+        if scratch.posed.get(dense) == Some(&pose) {
+            continue;
+        }
+        let bound = bodies.assets.bounds(&pose.2, pose.0, pose.1, pose.3);
+        if dense < scratch.posed.len() {
+            scratch.bounds[dense] = bound;
+            scratch.posed[dense] = pose;
+        } else {
+            scratch.bounds.push(bound);
+            scratch.posed.push(pose);
+        }
     }
     if every {
         find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
