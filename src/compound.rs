@@ -4,7 +4,7 @@ use crate::collision::convex::{ConvexHull, Poly, poly_poly, poly_rounded};
 use crate::collision::trimesh::{Aabb, TriMesh, poly_triangle, triangle_contact};
 use crate::collision::{Bounds, Hull, RawManifold, RawPoint, contacts, sweep};
 use crate::solver::CONTACT_MARGIN;
-use crate::{GridPosition, MassProperties, PhysicsError, PhysicsWorld, Shape};
+use crate::{GridPosition, MassProperties, Material, PhysicsError, PhysicsWorld, Shape};
 
 pub(crate) const MAX_COMPOUND_CHILDREN: usize = 1 << 16;
 const JACOBI_SWEEPS: usize = 32;
@@ -38,6 +38,9 @@ pub struct CompoundChild {
     pub rotation: Quat,
     /// Times the body's density, for parts of a heavier material.
     pub density_scale: f32,
+    /// How this part's surface touches others, `None` for the body's own material. Its
+    /// density is not used, `density_scale` is.
+    pub surface: Option<Material>,
 }
 
 impl CompoundChild {
@@ -47,6 +50,7 @@ impl CompoundChild {
             position,
             rotation: Quat::IDENTITY,
             density_scale: 1.0,
+            surface: None,
         }
     }
 }
@@ -118,6 +122,9 @@ impl Compound {
 }
 
 fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
+    if let Some(surface) = &child.surface {
+        surface.validate()?;
+    }
     let squared = child.rotation.length_squared();
     let good = !matches!(
         child.shape,
@@ -143,7 +150,7 @@ pub(crate) struct ShapeAssets {
 }
 
 impl ShapeAssets {
-    fn compound(&self, id: CompoundId) -> Option<&Compound> {
+    pub(crate) fn compound(&self, id: CompoundId) -> Option<&Compound> {
         self.compounds.get(id.0 as usize)
     }
 

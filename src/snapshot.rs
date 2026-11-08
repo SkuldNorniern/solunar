@@ -122,6 +122,8 @@ impl PhysicsWorld {
                 out.vec3(child.position);
                 out.quat(child.rotation);
                 out.f32(child.density_scale);
+                out.u8(u8::from(child.surface.is_some()));
+                out.material(&child.surface.unwrap_or_default());
             }
         }
 
@@ -678,11 +680,29 @@ fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
     let count = reader.count(CHILD_BYTES, MAX_COMPOUND_CHILDREN)?;
     let mut children = Vec::with_capacity(count);
     for _ in 0..count {
+        let (shape, position, rotation, density_scale) = (
+            reader.shape()?,
+            reader.vec3()?,
+            reader.quat()?,
+            reader.f32()?,
+        );
+        let surface = if reader.version >= 3 {
+            let has = reader.u8()?;
+            let material = reader.material()?;
+            match has {
+                0 => None,
+                1 => Some(material),
+                _ => return Err(SnapshotError::Invalid("compound surface")),
+            }
+        } else {
+            None
+        };
         children.push(CompoundChild {
-            shape: reader.shape()?,
-            position: reader.vec3()?,
-            rotation: reader.quat()?,
-            density_scale: reader.f32()?,
+            shape,
+            position,
+            rotation,
+            density_scale,
+            surface,
         });
     }
     Compound::from_rebased(children, unit).map_err(|_| SnapshotError::Invalid("compound"))
@@ -969,6 +989,18 @@ impl Writer {
         self.f64(value.z);
     }
 
+    fn material(&mut self, material: &Material) {
+        self.f32(material.density);
+        self.f32(material.friction);
+        self.f32(material.restitution);
+        self.f32(material.static_friction);
+        self.f32(material.bounce_threshold);
+        self.u8(material.friction_combine.tag());
+        self.u8(material.restitution_combine.tag());
+        self.f32(material.rolling_resistance);
+        self.f32(material.spin_resistance);
+    }
+
     fn position(&mut self, value: GridPosition) {
         self.i32(value.cell.x);
         self.i32(value.cell.y);
@@ -1210,6 +1242,26 @@ impl Reader<'_> {
 
     fn dvec3(&mut self) -> Result<DVec3, SnapshotError> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
+    }
+
+    fn material(&mut self) -> Result<Material, SnapshotError> {
+        let combine =
+            |tag| crate::Combine::from_tag(tag).ok_or(SnapshotError::Invalid("material combine"));
+        let material = Material {
+            density: self.f32()?,
+            friction: self.f32()?,
+            restitution: self.f32()?,
+            static_friction: self.f32()?,
+            bounce_threshold: self.f32()?,
+            friction_combine: combine(self.u8()?)?,
+            restitution_combine: combine(self.u8()?)?,
+            rolling_resistance: self.f32()?,
+            spin_resistance: self.f32()?,
+        };
+        material
+            .validate()
+            .map_err(|_| SnapshotError::Invalid("material"))?;
+        Ok(material)
     }
 
     fn position(&mut self) -> Result<GridPosition, SnapshotError> {

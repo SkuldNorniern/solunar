@@ -13,7 +13,7 @@ use crate::joint::{
     JOINT_IMPULSES, JointPoint, JointRow, Joints, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
-use crate::material::Contact;
+use crate::material::{Contact, Material};
 use crate::world::Integrated;
 use crate::{BodyHandle, BodyKind, JobDispatch, PhysicsError, Shape};
 
@@ -1538,7 +1538,10 @@ fn contact_manifold(
     let normal = raw.normal;
     let tangent = tangent_of(normal);
     let axes = [normal, tangent, normal.cross(tangent)];
-    let contact = Contact::of(&bodies.material[a], &bodies.material[b]);
+    let contact = Contact::of(
+        &part_material(bodies, a, part_a),
+        &part_material(bodies, b, part_b),
+    );
     let manifold = SolverManifold {
         a,
         b,
@@ -1591,6 +1594,21 @@ fn contact_manifold(
         });
     }
     manifold
+}
+
+/// The material a contact on this part of the body touches: a compound part's own when it has
+/// one, the body's otherwise.
+fn part_material(bodies: &Bodies, dense: usize, part: u32) -> Material {
+    let own = bodies.material[dense];
+    let Shape::Compound(id) = bodies.shape[dense] else {
+        return own;
+    };
+    bodies
+        .assets
+        .compound(id)
+        .and_then(|compound| compound.children.get(part as usize))
+        .and_then(|child| child.surface)
+        .unwrap_or(own)
 }
 
 /// Each old point goes to one new point, two sharing it would double its load.

@@ -428,4 +428,67 @@ mod tests {
         assert!(kept > 9.0, "{kept}");
         assert!(lost.abs() < 0.5, "{lost}");
     }
+
+    #[test]
+    fn each_part_of_a_compound_floor_touches_with_its_own_material() {
+        use crate::{CompoundChild, PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape, Vec3};
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        let slab = Shape::cuboid(Vec3::new(5.0, 0.5, 20.0));
+        let ice = Material {
+            friction: 0.02,
+            friction_combine: Combine::Min,
+            ..Material::default()
+        };
+        let rubber = Material {
+            friction: 1.0,
+            friction_combine: Combine::Max,
+            ..Material::default()
+        };
+        let parts = [
+            CompoundChild {
+                surface: Some(ice),
+                ..CompoundChild::new(slab, Vec3::new(-5.0, 0.0, 0.0))
+            },
+            CompoundChild {
+                surface: Some(rubber),
+                ..CompoundChild::new(slab, Vec3::new(5.0, 0.0, 0.0))
+            },
+        ];
+        let info = world.add_compound(&parts).unwrap();
+        let (center, turn) = info.placed(Vec3::new(0.0, -0.5, 0.0), crate::Quat::IDENTITY);
+        world
+            .spawn(
+                RigidBodyDesc::fixed(info.shape)
+                    .local_position(center)
+                    .rotation(turn),
+            )
+            .unwrap();
+        let slider = |world: &mut PhysicsWorld, x: f32| {
+            let mut desc = RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.25)))
+                .local_position(Vec3::new(x, 0.25, -15.0));
+            desc.linear_velocity = Vec3::new(0.0, 0.0, 3.0);
+            world.spawn(desc).unwrap()
+        };
+        let (on_ice, on_rubber) = (slider(&mut world, -5.0), slider(&mut world, 5.0));
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        let travelled = |body| world.body_state(body).unwrap().position.local.z + 15.0;
+        let (far, near) = (travelled(on_ice), travelled(on_rubber));
+        // on ice it barely slows, 3 m/s for 2 s; on rubber it stops within v^2 / 2 g mu
+        assert!(far > 5.0, "{far}");
+        assert!(near < 0.6, "{near}");
+        // a bad part material is refused when the compound is made
+        let bad = CompoundChild {
+            surface: Some(Material {
+                restitution: 2.0,
+                ..Material::default()
+            }),
+            ..CompoundChild::new(slab, Vec3::ZERO)
+        };
+        assert!(world.add_compound(&[bad]).is_err());
+        // and a snapshot keeps the parts' materials
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+    }
 }
