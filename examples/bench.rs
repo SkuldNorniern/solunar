@@ -361,7 +361,10 @@ fn sensors() -> Result<Outcome> {
         sensors.push(world.add_sensor(solunar::SensorDesc::new(Shape::sphere(2.0), at))?);
     }
     let times = steps(&mut world, 120)?;
-    let held: usize = sensors.iter().map(|sensor| world.sensor_bodies(*sensor).len()).sum();
+    let held: usize = sensors
+        .iter()
+        .map(|sensor| world.sensor_bodies(*sensor).len())
+        .sum();
     Ok(Outcome {
         bodies: world.body_count(),
         times,
