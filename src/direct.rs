@@ -65,10 +65,6 @@ const PIVOT_FLOOR: f64 = 1e-6;
 pub(crate) struct Symbolic {
     /// Each node's two bodies and rows, `usize::MAX` for a body that never moves.
     key: Vec<(usize, usize, usize)>,
-    dims: Vec<usize>,
-    /// Where each node's rows start in a right hand side.
-    offsets: Vec<usize>,
-    rows: usize,
     /// Nodes in elimination order.
     order: Vec<u32>,
     blocks: usize,
@@ -100,13 +96,6 @@ impl Symbolic {
     pub(crate) fn new(nodes: &[DirectNode], dynamic: &dyn Fn(usize) -> bool) -> Self {
         let count = nodes.len();
         let key: Vec<_> = nodes.iter().map(|node| node_key(node, dynamic)).collect();
-        let dims: Vec<usize> = nodes.iter().map(|node| node.count).collect();
-        let mut offsets = Vec::with_capacity(count);
-        let mut rows = 0;
-        for dim in &dims {
-            offsets.push(rows);
-            rows += dim;
-        }
 
         let mut on_body: Vec<(usize, u32, Side)> = Vec::with_capacity(count * 2);
         for (index, (a, b, _)) in key.iter().enumerate() {
@@ -197,9 +186,6 @@ impl Symbolic {
         }
         Self {
             key,
-            dims,
-            offsets,
-            rows,
             order,
             blocks: slots.len(),
             diagonal,
@@ -209,11 +195,6 @@ impl Symbolic {
             updates,
             update_ends,
         }
-    }
-
-    /// Rows over all nodes, the length of a right hand side.
-    pub(crate) fn rows(&self) -> usize {
-        self.rows
     }
 
     fn range(ends: &[u32], at: usize) -> std::ops::Range<usize> {
@@ -227,19 +208,21 @@ fn node_key(node: &DirectNode, dynamic: &dyn Fn(usize) -> bool) -> (usize, usize
     (body(node.a), body(node.b), node.count)
 }
 
-/// The numbers of one island's factor. Built once a substep, solved once per pass.
+/// The numbers of one island's factor. Built once a substep, solved once per pass. Every node
+/// is 3 wide, a node with fewer rows has zeros there and its spare pivots drop.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Factor {
     blocks: Vec<Block>,
     inverse_diagonal: Vec<Block>,
     /// `L` beside `Symbolic::columns`: the later node's rows by the pivot's.
     lower: Vec<Block>,
+    column_blocks: Vec<Block>,
+    floors: Vec<f64>,
 }
 
 impl Factor {
     /// Factors `J M⁻¹ Jᵀ` of `nodes` in the shape `symbolic` gives. The buffers are reused.
     pub(crate) fn refactor(&mut self, symbolic: &Symbolic, nodes: &[DirectNode]) {
-        let dims = &symbolic.dims;
         self.blocks.clear();
         self.blocks.resize(symbolic.blocks, [0.0; 9]);
         for &(slot, low, high, side_low, side_high) in &symbolic.assemble {
@@ -252,13 +235,14 @@ impl Factor {
                 }
             }
         }
-        let mut floors = vec![0.0; nodes.len()];
-        for (node, slot) in symbolic.diagonal.iter().enumerate() {
+        self.floors.clear();
+        for (node, slot) in nodes.iter().zip(&symbolic.diagonal) {
             let block = &mut self.blocks[*slot as usize];
-            let dim = dims[node];
-            let scale = (0..dim).map(|r| block[r * 3 + r].abs()).fold(0.0, f64::max);
-            floors[node] = PIVOT_FLOOR * scale;
-            for r in 0..dim {
+            let scale = (0..node.count)
+                .map(|r| block[r * 3 + r].abs())
+                .fold(0.0, f64::max);
+            self.floors.push(PIVOT_FLOOR * scale);
+            for r in 0..node.count {
                 block[r * 3 + r] += REGULARIZE * scale.max(1e-12);
             }
         }
@@ -267,17 +251,16 @@ impl Factor {
         self.inverse_diagonal.resize(nodes.len(), [0.0; 9]);
         self.lower.clear();
         self.lower.resize(symbolic.columns.len(), [0.0; 9]);
-        // the pivot's column blocks as later node by pivot, kept for the updates
-        let mut column_blocks: Vec<Block> = Vec::new();
         for (at, &p) in symbolic.order.iter().enumerate() {
-            let dp = dims[p as usize];
             let diagonal = self.blocks[symbolic.diagonal[p as usize] as usize];
-            let inverse = invert(&diagonal, dp, floors[p as usize]);
+            let inverse = invert(&diagonal, self.floors[p as usize]);
             self.inverse_diagonal[p as usize] = inverse;
             let columns = Symbolic::range(&symbolic.column_ends, at);
-            column_blocks.clear();
-            for (entry, &(q, slot, stored_pivot_first)) in
-                columns.clone().zip(&symbolic.columns[columns.clone()])
+            // the pivot's column blocks as later node by pivot, kept for the updates
+            self.column_blocks.clear();
+            for (lower, &(_, slot, stored_pivot_first)) in self.lower[columns.clone()]
+                .iter_mut()
+                .zip(&symbolic.columns[columns.clone()])
             {
                 let stored = &self.blocks[slot as usize];
                 let a_qp = if stored_pivot_first {
@@ -285,71 +268,61 @@ impl Factor {
                 } else {
                     *stored
                 };
-                self.lower[entry] = multiply(&a_qp, dims[q as usize], dp, &inverse, dp);
-                column_blocks.push(a_qp);
+                *lower = multiply(&a_qp, &inverse);
+                self.column_blocks.push(a_qp);
             }
-            let first = columns.start;
+            let lower = &self.lower[columns];
             for &(i, j, slot) in &symbolic.updates[Symbolic::range(&symbolic.update_ends, at)] {
-                let (i, j) = (i as usize, j as usize);
-                let q = symbolic.columns[first + i].0 as usize;
-                let r = symbolic.columns[first + j].0 as usize;
                 // A_qr -= L_qp A_pr, A_pr being A_rp turned
                 subtract_times_turned(
                     &mut self.blocks[slot as usize],
-                    &self.lower[first + i],
-                    &column_blocks[j],
-                    (dims[q], dp, dims[r]),
+                    &lower[i as usize],
+                    &self.column_blocks[j as usize],
                 );
             }
         }
     }
 
-    /// Solves in place: `x` comes in as the right hand side, by node and row.
-    pub(crate) fn solve(&self, symbolic: &Symbolic, x: &mut [f64]) {
-        let (dims, offsets) = (&symbolic.dims, &symbolic.offsets);
-        let part = |x: &[f64], node: u32| -> [f64; 3] {
-            let (start, dim) = (offsets[node as usize], dims[node as usize]);
-            let mut out = [0.0; 3];
-            out[..dim].copy_from_slice(&x[start..start + dim]);
-            out
-        };
+    /// Solves in place: `x` comes in as the right hand side, one part per node.
+    pub(crate) fn solve(&self, symbolic: &Symbolic, x: &mut [[f64; 3]]) {
         for (at, &p) in symbolic.order.iter().enumerate() {
-            let value = part(x, p);
-            let dp = dims[p as usize];
-            for entry in Symbolic::range(&symbolic.column_ends, at) {
-                let (q, _, _) = symbolic.columns[entry];
-                let l_qp = &self.lower[entry];
-                let start = offsets[q as usize];
-                for r in 0..dims[q as usize] {
-                    let change: f64 = (0..dp).map(|c| l_qp[r * 3 + c] * value[c]).sum();
-                    x[start + r] -= change;
+            let value = x[p as usize];
+            let columns = Symbolic::range(&symbolic.column_ends, at);
+            for (l_qp, &(q, _, _)) in self.lower[columns.clone()]
+                .iter()
+                .zip(&symbolic.columns[columns])
+            {
+                let change = times(l_qp, value);
+                let part = &mut x[q as usize];
+                for r in 0..3 {
+                    part[r] -= change[r];
                 }
             }
         }
-        for &p in &symbolic.order {
-            let (start, dim) = (offsets[p as usize], dims[p as usize]);
-            let value = part(x, p);
-            let inverse = &self.inverse_diagonal[p as usize];
-            for r in 0..dim {
-                x[start + r] = (0..dim).map(|c| inverse[r * 3 + c] * value[c]).sum();
-            }
+        for (part, inverse) in x.iter_mut().zip(&self.inverse_diagonal) {
+            *part = times(inverse, *part);
         }
         for (at, &p) in symbolic.order.iter().enumerate().rev() {
-            let dp = dims[p as usize];
-            let start = offsets[p as usize];
-            for entry in Symbolic::range(&symbolic.column_ends, at) {
-                let (q, _, _) = symbolic.columns[entry];
-                let l_qp = &self.lower[entry];
-                let value = part(x, q);
-                for c in 0..dp {
-                    let change: f64 = (0..dims[q as usize])
-                        .map(|r| l_qp[r * 3 + c] * value[r])
-                        .sum();
-                    x[start + c] -= change;
+            let columns = Symbolic::range(&symbolic.column_ends, at);
+            let mut part = x[p as usize];
+            for (l_qp, &(q, _, _)) in self.lower[columns.clone()]
+                .iter()
+                .zip(&symbolic.columns[columns])
+            {
+                let value = x[q as usize];
+                for c in 0..3 {
+                    part[c] -= l_qp[c] * value[0] + l_qp[3 + c] * value[1] + l_qp[6 + c] * value[2];
                 }
             }
+            x[p as usize] = part;
         }
     }
+}
+
+fn times(block: &Block, value: [f64; 3]) -> [f64; 3] {
+    [0, 1, 2].map(|r| {
+        block[r * 3] * value[0] + block[r * 3 + 1] * value[1] + block[r * 3 + 2] * value[2]
+    })
 }
 
 fn transpose(block: &Block) -> Block {
@@ -362,49 +335,31 @@ fn transpose(block: &Block) -> Block {
     out
 }
 
-/// `into -= l * aᵀ`, `l` rows by inner, `a` cols by inner, all stored 3 wide.
+/// `into -= l * aᵀ`.
 #[inline]
-fn subtract_times_turned(
-    into: &mut Block,
-    l: &Block,
-    a: &Block,
-    (rows, inner, cols): (usize, usize, usize),
-) {
-    if rows == 3 && inner == 3 && cols == 3 {
-        for r in 0..3 {
-            let (l0, l1, l2) = (l[r * 3], l[r * 3 + 1], l[r * 3 + 2]);
-            for c in 0..3 {
-                into[r * 3 + c] -= l0 * a[c * 3] + l1 * a[c * 3 + 1] + l2 * a[c * 3 + 2];
-            }
-        }
-        return;
-    }
-    for r in 0..rows {
-        for c in 0..cols {
-            let mut sum = 0.0;
-            for k in 0..inner {
-                sum += l[r * 3 + k] * a[c * 3 + k];
-            }
-            into[r * 3 + c] -= sum;
+fn subtract_times_turned(into: &mut Block, l: &Block, a: &Block) {
+    for r in 0..3 {
+        let (l0, l1, l2) = (l[r * 3], l[r * 3 + 1], l[r * 3 + 2]);
+        for c in 0..3 {
+            into[r * 3 + c] -= l0 * a[c * 3] + l1 * a[c * 3 + 1] + l2 * a[c * 3 + 2];
         }
     }
 }
 
-/// `a` (rows by inner) times `b` (inner by cols), all stored 3 wide.
-fn multiply(a: &Block, rows: usize, inner: usize, b: &Block, cols: usize) -> Block {
+fn multiply(a: &Block, b: &Block) -> Block {
     let mut out = [0.0; 9];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[r * 3 + c] = (0..inner).map(|k| a[r * 3 + k] * b[k * 3 + c]).sum();
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
         }
     }
     out
 }
 
-/// Inverse of the top left `dim` square by its own LDLᵀ. A pivot under `floor` is a
-/// redundant direction: it gets no impulse instead of a huge one, so the result is a pseudo
-/// inverse there.
-fn invert(block: &Block, dim: usize, floor: f64) -> Block {
+/// Inverse by its own LDLᵀ. A pivot under `floor` is a redundant direction: it gets no impulse
+/// instead of a huge one, so the result is a pseudo inverse there.
+fn invert(block: &Block, floor: f64) -> Block {
+    let dim = 3;
     let mut lower = [0.0_f64; 9];
     let mut pivots = [0.0_f64; 3];
     for k in 0..dim {
@@ -485,11 +440,12 @@ mod tests {
         let symbolic = Symbolic::new(&nodes, &dynamic);
         let mut factor = Factor::default();
         factor.refactor(&symbolic, &nodes);
-        let mut x: Vec<f64> = nodes
+        let mut parts: Vec<[f64; 3]> = nodes
             .iter()
-            .map(|node| f64::from(node.rows[0].target))
+            .map(|node| [f64::from(node.rows[0].target), 0.0, 0.0])
             .collect();
-        factor.solve(&symbolic, &mut x);
+        factor.solve(&symbolic, &mut parts);
+        let x: Vec<f64> = parts.iter().map(|part| part[0]).collect();
         // J M⁻¹ Jᵀ of the chain: 1 on the first diagonal, 2 on the others, -1 beside them
         let matrix = [
             [1.0, -1.0, 0.0, 0.0],
@@ -528,14 +484,14 @@ mod tests {
         };
         let nodes = [point(0, 1), point(1, 2)];
         let symbolic = Symbolic::new(&nodes, &|_| true);
-        assert_eq!(symbolic.rows(), 6);
         assert!(symbolic.fits(&nodes, &|_| true));
         assert!(!symbolic.fits(&nodes[..1], &|_| true));
         let mut factor = Factor::default();
         factor.refactor(&symbolic, &nodes);
-        let mut x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let want = x.clone();
-        factor.solve(&symbolic, &mut x);
+        let mut parts = vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        factor.solve(&symbolic, &mut parts);
+        let x: Vec<f64> = parts.concat();
+        let want = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         // per axis: [[2.5, -0.5], [-0.5, 1.5]]
         for axis in 0..3 {
             let (u, v) = (x[axis], x[3 + axis]);

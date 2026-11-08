@@ -915,23 +915,23 @@ unsafe fn solve_direct(
             (motion.linear, motion.angular)
         }
     };
-    let mut x = Vec::with_capacity(shape.rows());
+    let mut x = Vec::with_capacity(nodes.len());
     for node in nodes {
         // SAFETY: the island's bodies are this job's, others are only read.
         let (a, b) = unsafe { (states.read(node.a), states.read(node.b)) };
         let ((va, wa), (vb, wb)) = (speeds(&a), speeds(&b));
-        for row in &node.rows[..node.count] {
+        let mut part = [0.0; 3];
+        for (value, row) in part.iter_mut().zip(&node.rows[..node.count]) {
             let speed =
                 row.lin_a.dot(va) + row.ang_a.dot(wa) + row.lin_b.dot(vb) + row.ang_b.dot(wb);
             let goal = if recovery { row.recovery } else { row.target };
-            x.push(f64::from(goal) - f64::from(speed));
+            *value = f64::from(goal) - f64::from(speed);
         }
+        x.push(part);
     }
     factor.solve(shape, &mut x);
-    let mut at = 0;
-    for (node, item) in nodes.iter().zip(items) {
-        let impulse = &x[at..at + node.count];
-        at += node.count;
+    for ((node, item), part) in nodes.iter().zip(items).zip(&x) {
+        let impulse = &part[..node.count];
         for (dense, side_a) in [(node.a, true), (node.b, false)] {
             if !dynamic(dense) {
                 continue;
