@@ -59,14 +59,16 @@ pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Ve
     pairs.sort_unstable();
 }
 
+fn by_min_x(bounds: &[Bounds], a: u32, b: u32) -> std::cmp::Ordering {
+    bounds[a as usize]
+        .min
+        .x
+        .total_cmp(&bounds[b as usize].min.x)
+        .then(a.cmp(&b))
+}
+
 fn sort_by_min_x(bounds: &[Bounds], order: &mut [u32]) {
-    order.sort_unstable_by(|a, b| {
-        bounds[*a as usize]
-            .min
-            .x
-            .total_cmp(&bounds[*b as usize].min.x)
-            .then(a.cmp(b))
-    });
+    order.sort_unstable_by(|a, b| by_min_x(bounds, *a, *b));
 }
 
 /// Pairs among `order`, which it sorts. Adds to `pairs` unsorted.
@@ -91,7 +93,9 @@ fn sweep(bounds: &[Bounds], order: &mut [u32], pairs: &mut Vec<(u32, u32)>) {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MovingPairs {
     movers: Vec<u32>,
+    /// Sorted by min x. Kept between steps, still things stay sorted.
     narrow: Vec<u32>,
+    is_narrow: Vec<bool>,
     wide: Vec<u32>,
     reach: f64,
 }
@@ -105,23 +109,41 @@ impl MovingPairs {
         pairs: &mut Vec<(u32, u32)>,
     ) {
         self.movers.clear();
-        self.narrow.clear();
         self.wide.clear();
         self.reach = 0.0;
+        self.is_narrow.clear();
+        self.is_narrow.resize(bounds.len(), false);
+        let mut narrow = 0;
         for (index, bound) in bounds.iter().enumerate() {
             let width = bound.max.x - bound.min.x;
             if moving(index) {
                 self.movers.push(index as u32);
             } else if width.is_finite() && width <= WIDE {
-                self.narrow.push(index as u32);
+                self.is_narrow[index] = true;
+                narrow += 1;
                 self.reach = self.reach.max(width);
             } else {
                 self.wide.push(index as u32);
             }
         }
+        let same = self.narrow.len() == narrow
+            && self
+                .narrow
+                .iter()
+                .all(|index| self.is_narrow.get(*index as usize) == Some(&true));
+        if !same {
+            self.narrow.clear();
+            self.narrow
+                .extend((0..bounds.len() as u32).filter(|index| self.is_narrow[*index as usize]));
+        }
+        if !self
+            .narrow
+            .is_sorted_by(|a, b| by_min_x(bounds, *a, *b).is_le())
+        {
+            sort_by_min_x(bounds, &mut self.narrow);
+        }
         pairs.clear();
         sweep(bounds, &mut self.movers, pairs);
-        sort_by_min_x(bounds, &mut self.narrow);
         for at in 0..self.movers.len() {
             self.against_passive(bounds, self.movers[at] as usize, pairs);
         }
@@ -253,6 +275,36 @@ mod tests {
                 })
                 .collect();
             assert_eq!(pairs, wanted);
+        }
+    }
+
+    #[test]
+    fn kept_passive_order_matches_a_fresh_search() {
+        let mut state = 0x0f1e_2d3c_4b5a_6978_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 10_000) as f64 / 100.0
+        };
+        let mut bounds: Vec<Bounds> = (0..300)
+            .map(|_| at(next(), next(), next(), next() / 20.0))
+            .collect();
+        let mut kept = MovingPairs::default();
+        let (mut pairs, mut fresh_pairs) = (Vec::new(), Vec::new());
+        for step in 0..40_usize {
+            let moving = |index: usize| (index + step / 5).is_multiple_of(9);
+            // a passive body moves now and then, a body goes now and then
+            if step % 7 == 3 {
+                let index = (next() * 2.0) as usize % bounds.len();
+                bounds[index] = at(next(), next(), next(), 1.0);
+            }
+            if step % 11 == 6 {
+                bounds.swap_remove((next() * 2.0) as usize % bounds.len());
+            }
+            kept.find(&bounds, moving, &mut pairs);
+            MovingPairs::default().find(&bounds, moving, &mut fresh_pairs);
+            assert_eq!(pairs, fresh_pairs, "step {step}");
         }
     }
 
