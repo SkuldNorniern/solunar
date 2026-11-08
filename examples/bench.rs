@@ -1,6 +1,8 @@
 //! Fixed rigid body scenes, timed per step.
 //! `cargo run --release --example bench [--threads N] [pile ...]`.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use solunar::{
@@ -57,6 +59,56 @@ impl JobDispatch for Pool {
     }
 }
 
+/// The system allocator, counting calls and bytes, so a step's allocations can be read.
+struct Counting;
+
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+// SAFETY: every call goes straight to `System` with the same arguments, only counters are added.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED.fetch_add(new_size as u64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: as the caller promised to us.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+
+/// Allocations over the measured steps: calls, bytes and the most calls in one step.
+#[derive(Clone, Copy, Default)]
+struct Allocs {
+    calls: u64,
+    bytes: u64,
+    most: u64,
+}
+
+thread_local! {
+    static ALLOCS: std::cell::Cell<Allocs> = const { std::cell::Cell::new(Allocs { calls: 0, bytes: 0, most: 0 }) };
+}
+
 thread_local! {
     static DISPATCH: std::cell::RefCell<Option<Pool>> = const { std::cell::RefCell::new(None) };
 }
@@ -100,18 +152,24 @@ fn main() {
             continue;
         }
         PHASES.with(|phases| *phases.borrow_mut() = (PhaseTimes::default(), 0));
+        ALLOCS.with(|allocs| allocs.set(Allocs::default()));
         match suite() {
             Ok(outcome) => print_row(name, &outcome),
             Err(error) => println!("| {name} | failed: {error} | | | | | | |"),
         }
-        splits.push((name, PHASES.with(|phases| *phases.borrow())));
+        splits.push((
+            name,
+            PHASES.with(|phases| *phases.borrow()),
+            ALLOCS.with(std::cell::Cell::get),
+        ));
     }
     println!();
     println!("mean ms per measured step, step is the sum");
     println!();
     println!("| suite | broadphase | narrowphase | solve | integrate | finish | step |");
     println!("| --- | --- | --- | --- | --- | --- | --- |");
-    for (name, (sum, count)) in splits {
+    for (name, (sum, count), _) in &splits {
+        let (sum, count) = (*sum, *count);
         if count == 0 {
             continue;
         }
@@ -124,6 +182,23 @@ fn main() {
             mean(sum.integrate),
             mean(sum.finish),
             mean(sum.broadphase + sum.narrowphase + sum.solve + sum.integrate + sum.finish),
+        );
+    }
+    println!();
+    println!("allocations per measured step, every thread");
+    println!();
+    println!("| suite | mean calls | most calls | mean kib |");
+    println!("| --- | --- | --- | --- |");
+    for (name, (_, count), allocs) in &splits {
+        if *count == 0 {
+            continue;
+        }
+        let steps = f64::from(*count);
+        println!(
+            "| {name} | {:.1} | {} | {:.1} |",
+            allocs.calls as f64 / steps,
+            allocs.most,
+            allocs.bytes as f64 / steps / 1024.0,
         );
     }
 }
@@ -259,12 +334,25 @@ fn ground(world: &mut PhysicsWorld, half: f32) -> Result<()> {
 fn steps(world: &mut PhysicsWorld, count: usize) -> Result<Vec<Duration>> {
     let mut times = Vec::with_capacity(count);
     for _ in 0..count {
+        let (calls, bytes) = (
+            ALLOCATIONS.load(Ordering::Relaxed),
+            ALLOCATED.load(Ordering::Relaxed),
+        );
         let started = Instant::now();
         DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
             Some(pool) => world.step_with(pool),
             None => world.step_with(&Sequential),
         })?;
         times.push(started.elapsed());
+        let calls = ALLOCATIONS.load(Ordering::Relaxed) - calls;
+        let bytes = ALLOCATED.load(Ordering::Relaxed) - bytes;
+        ALLOCS.with(|allocs| {
+            let mut sum = allocs.get();
+            sum.calls += calls;
+            sum.bytes += bytes;
+            sum.most = sum.most.max(calls);
+            allocs.set(sum);
+        });
         let step = world.phase_times();
         PHASES.with(|phases| {
             let (sum, count) = &mut *phases.borrow_mut();
