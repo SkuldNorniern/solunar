@@ -17,7 +17,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 3;
+pub const SNAPSHOT_VERSION: u32 = 4;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -371,6 +371,15 @@ impl PhysicsWorld {
             {
                 return Err(SnapshotError::Invalid("sensor"));
             }
+        }
+        if world
+            .fields
+            .slots
+            .iter()
+            .flatten()
+            .any(|desc| !world.frames.contains(desc.frame))
+        {
+            return Err(SnapshotError::Invalid("field"));
         }
         Ok(world)
     }
@@ -1067,6 +1076,8 @@ impl Writer {
         }
         self.u32(desc.filter.layers);
         self.u32(desc.filter.mask);
+        // version 4: the field's frame
+        self.u32(desc.frame.0);
     }
 
     fn quat(&mut self, value: Quat) {
@@ -1316,10 +1327,16 @@ impl Reader<'_> {
             layers: self.u32()?,
             mask: self.u32()?,
         };
+        let frame = if self.version >= 4 {
+            crate::FrameId(self.u32()?)
+        } else {
+            crate::FrameId::ROOT
+        };
         Ok(FieldDesc {
             field,
             region,
             filter,
+            frame,
         })
     }
 

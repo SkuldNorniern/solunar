@@ -113,7 +113,7 @@ pub struct PhysicsWorld {
     pub(crate) contact_scratch: ContactScratch,
     sleep: SleepScratch,
     scratch: Vec<Integrated>,
-    frame_gravity: Vec<Vec3>,
+    pub(crate) frame_gravity: Vec<Vec3>,
     times: StepTimes,
     phases: PhaseTimes,
 }

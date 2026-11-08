@@ -5,6 +5,7 @@ use algebrix::{Quat, Vec3};
 use crate::body::BodyKind;
 use crate::collision::CollisionFilter;
 use crate::error::PhysicsError;
+use crate::frame::FrameId;
 use crate::position::GridPosition;
 use crate::shape::Shape;
 use crate::world::PhysicsWorld;
@@ -23,7 +24,7 @@ pub enum ForceField {
     Wind { velocity: Vec3, drag: f32 },
     /// Force `-linear * velocity` and torque `-angular * spin`.
     Drag { linear: f32, angular: f32 },
-    /// Fluid below `level`, measured against gravity from the field's frame origin: lift of the
+    /// Fluid below `level`, a height against gravity from the field's frame origin: lift of the
     /// volume under it, and `drag` times the share under it against the body's velocity.
     Fluid { level: f32, density: f32, drag: f32 },
     /// Pull toward `at`, `strength * mass / distance^2`, the distance no less than
@@ -56,6 +57,8 @@ pub struct FieldDesc {
     pub region: FieldRegion,
     /// Bodies whose layers meet `mask` feel it.
     pub filter: CollisionFilter,
+    /// Only bodies in this frame feel it. Its places and speeds are in this frame's space.
+    pub frame: FrameId,
 }
 
 impl FieldDesc {
@@ -64,11 +67,17 @@ impl FieldDesc {
             field,
             region: FieldRegion::Everywhere,
             filter: CollisionFilter::default(),
+            frame: FrameId::ROOT,
         }
     }
 
     pub fn region(mut self, region: FieldRegion) -> Self {
         self.region = region;
+        self
+    }
+
+    pub fn frame(mut self, frame: FrameId) -> Self {
+        self.frame = frame;
         self
     }
 
@@ -186,9 +195,10 @@ impl PhysicsWorld {
     /// Its force starts with the next step. Bodies in its region wake.
     ///
     /// # Errors
-    /// Fails on a non finite or negative setting.
+    /// Fails on an unknown frame or a non finite or negative setting.
     pub fn add_field(&mut self, desc: FieldDesc) -> Result<FieldHandle, PhysicsError> {
         desc.validate()?;
+        self.check_field_frame(&desc)?;
         let fields = &mut self.fields;
         let index = match fields.slots.iter().position(Option::is_none) {
             Some(index) => index,
@@ -204,25 +214,34 @@ impl PhysicsWorld {
             index: index as u32,
             generation: fields.generations[index],
         };
-        self.wake_in(&desc.region);
+        self.wake_in(&desc);
         Ok(handle)
+    }
+
+    fn check_field_frame(&self, desc: &FieldDesc) -> Result<(), PhysicsError> {
+        if self.frames.contains(desc.frame) {
+            Ok(())
+        } else {
+            Err(PhysicsError::InvalidFrame)
+        }
     }
 
     /// For gusts, tides and moving pulls, between steps. Bodies in the old and new region wake.
     ///
     /// # Errors
-    /// Fails on a stale handle or a bad setting, then nothing changed.
+    /// Fails on a stale handle, an unknown frame or a bad setting, then nothing changed.
     pub fn set_field(&mut self, handle: FieldHandle, desc: FieldDesc) -> Result<(), PhysicsError> {
         let index = self
             .fields
             .index(handle)
             .ok_or(PhysicsError::InvalidHandle)?;
         desc.validate()?;
+        self.check_field_frame(&desc)?;
         let old = self.fields.slots[index].replace(desc);
         if let Some(old) = old {
-            self.wake_in(&old.region);
+            self.wake_in(&old);
         }
-        self.wake_in(&desc.region);
+        self.wake_in(&desc);
         Ok(())
     }
 
@@ -235,22 +254,23 @@ impl PhysicsWorld {
         true
     }
 
-    fn wake_in(&mut self, region: &FieldRegion) {
+    fn wake_in(&mut self, desc: &FieldDesc) {
         for dense in 0..self.bodies.len() {
             if self.bodies.kind[dense] == BodyKind::Dynamic
-                && inside(region, self.bodies.position(dense))
+                && self.bodies.frame[dense] == desc.frame
+                && inside(&desc.region, self.bodies.position(dense))
             {
                 self.bodies.wake(dense);
             }
         }
     }
 
-    /// Adds every field's force and torque to the awake dynamic bodies, before the step.
+    /// Adds every field's force and torque to the awake dynamic bodies, before the step. Needs
+    /// this step's frame gravity.
     pub(crate) fn apply_fields(&mut self) {
         if self.fields.slots.iter().all(Option::is_none) {
             return;
         }
-        let up = (-self.settings.gravity).normalize_or(Vec3::Y);
         let gravity = self.settings.gravity.length();
         for dense in 0..self.bodies.len() {
             let bodies = &self.bodies;
@@ -266,9 +286,12 @@ impl PhysicsWorld {
             let position = bodies.position(dense);
             let (velocity, spin) = (bodies.linear[dense], bodies.angular[dense]);
             let shape = &bodies.shape[dense];
+            let frame = bodies.frame[dense];
+            let up = (-self.frame_gravity[frame.0 as usize]).normalize_or(Vec3::Y);
             let (mut force, mut torque) = (Vec3::ZERO, Vec3::ZERO);
             for desc in self.fields.slots.iter().flatten() {
-                if bodies.filter[dense].layers & desc.filter.mask == 0
+                if desc.frame != frame
+                    || bodies.filter[dense].layers & desc.filter.mask == 0
                     || !inside(&desc.region, position)
                 {
                     continue;
@@ -374,6 +397,53 @@ mod tests {
         }
         let y = world.body_state(ball).unwrap().position.local.y;
         assert!(y.abs() < 0.03, "{y}");
+    }
+
+    #[test]
+    fn a_field_acts_in_its_own_frame_and_only_there() {
+        use crate::frame::FrameDesc;
+        let mut world = world();
+        // turned a quarter about z, the frame's +x points up
+        let tilted = world
+            .add_frame(FrameDesc {
+                rotation: algebrix::DQuat::from_quat(Quat::from_rotation_z(
+                    std::f32::consts::FRAC_PI_2,
+                )),
+                ..FrameDesc::new(FrameId::ROOT)
+            })
+            .unwrap();
+        let ball = |world: &mut PhysicsWorld, frame: FrameId| {
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::sphere(0.5))
+                        .density(500.0)
+                        .frame(frame)
+                        .local_position(Vec3::new(2.0, 0.0, 0.0)),
+                )
+                .unwrap()
+        };
+        let (floating, in_root) = (ball(&mut world, tilted), ball(&mut world, FrameId::ROOT));
+        let water = FieldDesc::new(ForceField::Fluid {
+            level: 0.0,
+            density: 1000.0,
+            drag: 400.0,
+        })
+        .frame(tilted);
+        world.add_field(water).unwrap();
+        for _ in 0..600 {
+            world.step_fixed().unwrap();
+        }
+        let afloat = world.body_state(floating).unwrap().position.local;
+        assert!(afloat.x.abs() < 0.03, "{afloat:?}");
+        // the root ball falls through, no water in its frame
+        let fallen = world.body_state(in_root).unwrap().position.local;
+        assert!(fallen.y < -100.0, "{fallen:?}");
+        let unknown = FieldDesc::new(ForceField::Drag {
+            linear: 1.0,
+            angular: 1.0,
+        })
+        .frame(FrameId(77));
+        assert_eq!(world.add_field(unknown), Err(PhysicsError::InvalidFrame));
     }
 
     #[test]
