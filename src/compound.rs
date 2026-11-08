@@ -89,6 +89,7 @@ impl Compound {
     pub(crate) fn from_rebased(
         children: Vec<CompoundChild>,
         unit: MassProperties,
+        convexes: &[ConvexHull],
     ) -> Result<Self, PhysicsError> {
         if children.is_empty() || children.len() > MAX_COMPOUND_CHILDREN {
             return Err(PhysicsError::InvalidShape);
@@ -97,8 +98,8 @@ impl Compound {
         let mut high = Vec3::splat(f32::NEG_INFINITY);
         let mut radius = 0.0_f32;
         for child in &children {
-            validate_child(child)?;
-            let reach = child.shape.bounding_radius();
+            validate_child(child, convexes)?;
+            let reach = part_radius(&child.shape, convexes);
             low = low.min(child.position - Vec3::splat(reach));
             high = high.max(child.position + Vec3::splat(reach));
             radius = radius.max(child.position.length() + reach);
@@ -121,21 +122,53 @@ impl Compound {
     }
 }
 
-fn validate_child(child: &CompoundChild) -> Result<(), PhysicsError> {
+/// A hull part reaches as far as its hull, other parts by their own shape.
+fn part_radius(shape: &Shape, convexes: &[ConvexHull]) -> f32 {
+    match *shape {
+        Shape::Convex(id) => convexes
+            .get(id.0 as usize)
+            .map_or(f32::INFINITY, |hull| hull.radius),
+        _ => shape.bounding_radius(),
+    }
+}
+
+fn part_mass(shape: &Shape, density: f32, convexes: &[ConvexHull]) -> MassProperties {
+    match *shape {
+        Shape::Convex(id) => convexes.get(id.0 as usize).map_or(
+            MassProperties {
+                mass: 0.0,
+                inertia: Vec3::ZERO,
+            },
+            |hull| MassProperties {
+                mass: hull.unit.mass * density,
+                inertia: hull.unit.inertia * density,
+            },
+        ),
+        _ => shape.mass_properties(density),
+    }
+}
+
+fn validate_child(child: &CompoundChild, convexes: &[ConvexHull]) -> Result<(), PhysicsError> {
     if let Some(surface) = &child.surface {
         surface.validate()?;
     }
+    if let Shape::Convex(id) = child.shape
+        && convexes.get(id.0 as usize).is_none()
+    {
+        return Err(PhysicsError::InvalidShape);
+    }
     let squared = child.rotation.length_squared();
-    let good = !matches!(
-        child.shape,
-        Shape::Compound(_) | Shape::TriMesh(_) | Shape::Convex(_)
-    ) && child.position.is_finite()
+    let good = !matches!(child.shape, Shape::Compound(_) | Shape::TriMesh(_))
+        && child.position.is_finite()
         && squared.is_finite()
         && squared > 1e-12
         && child.density_scale.is_finite()
         && child.density_scale > 0.0;
     if !good {
         return Err(PhysicsError::InvalidShape);
+    }
+    if matches!(child.shape, Shape::Convex(_)) {
+        return Ok(());
     }
     child.shape.validate()
 }
@@ -608,12 +641,15 @@ fn add_outer(matrix: &mut [[f64; 3]; 3], scale: f64, axis: DVec3) {
     }
 }
 
-fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), PhysicsError> {
+fn rebased(
+    children: &[CompoundChild],
+    convexes: &[ConvexHull],
+) -> Result<(Compound, Vec3, Quat), PhysicsError> {
     let mut mass = 0.0_f64;
     let mut weighted = DVec3::ZERO;
     for child in children {
-        validate_child(child)?;
-        let part = f64::from(child.shape.mass_properties(child.density_scale).mass);
+        validate_child(child, convexes)?;
+        let part = f64::from(part_mass(&child.shape, child.density_scale, convexes).mass);
         mass += part;
         weighted += DVec3::from_vec3(child.position) * part;
     }
@@ -623,7 +659,7 @@ fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), Physics
     let center = weighted / mass;
     let mut inertia = [[0.0; 3]; 3];
     for child in children {
-        let part = child.shape.mass_properties(child.density_scale);
+        let part = part_mass(&child.shape, child.density_scale, convexes);
         let turn = DQuat::from_quat(child.rotation.normalize());
         for (axis, value) in [
             (DVec3::X, part.inertia.x),
@@ -663,7 +699,7 @@ fn rebased(children: &[CompoundChild]) -> Result<(Compound, Vec3, Quat), Physics
         mass: mass as f32,
         inertia: Vec3::new(values[0] as f32, values[1] as f32, values[2] as f32),
     };
-    Ok((Compound::from_rebased(moved, unit)?, center, axes))
+    Ok((Compound::from_rebased(moved, unit, convexes)?, center, axes))
 }
 
 impl PhysicsWorld {
@@ -744,7 +780,7 @@ impl PhysicsWorld {
     }
 
     /// A convex shape from the hull of up to 64 points. Like a compound it is rebased, so place
-    /// it with [`CompoundInfo::placed`]. Convex shapes can not be parts of a compound yet.
+    /// it with [`CompoundInfo::placed`]. A hull can be a compound part, placed by its own info.
     ///
     /// # Errors
     /// Fails on too few or too many points, non finite ones or no volume.
@@ -794,7 +830,7 @@ impl PhysicsWorld {
         }
         let id = u32::try_from(self.bodies.assets.compounds.len())
             .map_err(|_| PhysicsError::OutOfRange)?;
-        let (compound, center, axes) = rebased(children)?;
+        let (compound, center, axes) = rebased(children, &self.bodies.assets.convexes)?;
         self.bodies.assets.compounds.push(compound);
         Ok(CompoundInfo {
             shape: Shape::Compound(CompoundId(id)),
@@ -1048,6 +1084,84 @@ mod tests {
         }
         let spin = world.body_state(body).unwrap().angular_velocity;
         assert!((spin - axis * 5.0).length() < 1e-2, "{spin:?}");
+    }
+
+    #[test]
+    fn hull_parts_weigh_rest_and_save_like_the_boxes_they_are() {
+        let mut world = world();
+        ground(&mut world);
+        let mut corners = Vec::new();
+        for x in [-0.5, 0.5] {
+            for y in [-0.5, 0.5] {
+                for z in [-0.5, 0.5] {
+                    corners.push(Vec3::new(x, y, z));
+                }
+            }
+        }
+        let hull = world.add_convex(&corners).unwrap();
+        let part = |x: f32| {
+            let (at, turn) = hull.placed(Vec3::new(x, 3.0, 0.0), Quat::IDENTITY);
+            CompoundChild {
+                rotation: turn,
+                ..CompoundChild::new(hull.shape, at)
+            }
+        };
+        let hulls = world.add_compound(&[part(-1.0), part(1.0)]).unwrap();
+        let boxes = world
+            .add_compound(&[cube_at(-1.0, 3.0, 0.0), cube_at(1.0, 3.0, 0.0)])
+            .unwrap();
+        let unit = |info: &CompoundInfo| match info.shape {
+            Shape::Compound(id) => world.bodies.assets.compounds[id.0 as usize].unit,
+            _ => unreachable!(),
+        };
+        let sorted = |inertia: Vec3| {
+            let mut values = inertia.to_array();
+            values.sort_by(f32::total_cmp);
+            values
+        };
+        near(unit(&hulls).mass, unit(&boxes).mass, 1e-4);
+        for (a, b) in sorted(unit(&hulls).inertia)
+            .iter()
+            .zip(sorted(unit(&boxes).inertia))
+        {
+            near(*a, b, 1e-3);
+        }
+        near(
+            world.bodies.assets.bounding_radius(&hulls.shape),
+            world.bodies.assets.bounding_radius(&boxes.shape),
+            1e-4,
+        );
+        // bottoms a hair over the floor
+        let (place, turn) = hulls.placed(Vec3::new(0.0, -2.48, 0.0), Quat::IDENTITY);
+        let body = world
+            .spawn(
+                RigidBodyDesc::dynamic(hulls.shape)
+                    .local_position(place)
+                    .rotation(turn),
+            )
+            .unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        let state = world.body_state(body).unwrap();
+        assert!(state.asleep, "{state:?}");
+        near(state.position.local.y, 0.5, 0.02);
+        // the snapshot holds the compound before its hull, it still loads the same
+        let bytes = world.save_snapshot();
+        let mut back = PhysicsWorld::load_snapshot(&bytes).unwrap();
+        assert_eq!(back.save_snapshot(), bytes);
+        world.apply_impulse(body, Vec3::new(0.0, 3.0, 1.0)).unwrap();
+        back.apply_impulse(body, Vec3::new(0.0, 3.0, 1.0)).unwrap();
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+            back.step_fixed().unwrap();
+        }
+        assert_eq!(back.state_hash(), world.state_hash());
+        let unknown = CompoundChild::new(Shape::Convex(ConvexId(99)), Vec3::ZERO);
+        assert_eq!(
+            world.add_compound(&[unknown]),
+            Err(PhysicsError::InvalidShape)
+        );
     }
 
     #[test]

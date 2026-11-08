@@ -493,14 +493,21 @@ fn read_bodies(
 ) -> Result<Bodies, SnapshotError> {
     let mut bodies = Bodies::default();
     let compound_count = reader.count(COMPOUND_BYTES, limits.max_slots)?;
-    bodies.assets.compounds.reserve(compound_count);
+    let mut compounds = Vec::with_capacity(compound_count);
     for _ in 0..compound_count {
-        bodies.assets.compounds.push(read_compound(reader)?);
+        compounds.push(read_compound(reader)?);
     }
     let convex_count = reader.count(4 + 12 + 4, limits.max_slots)?;
     bodies.assets.convexes.reserve(convex_count);
     for _ in 0..convex_count {
         bodies.assets.convexes.push(read_convex(reader)?);
+    }
+    // compounds come first in the data, their hull parts after
+    bodies.assets.compounds.reserve(compound_count);
+    for (children, unit) in compounds {
+        let compound = Compound::from_rebased(children, unit, &bodies.assets.convexes)
+            .map_err(|_| SnapshotError::Invalid("compound"))?;
+        bodies.assets.compounds.push(compound);
     }
     let mesh_count = reader.count(5, limits.max_slots)?;
     bodies.assets.meshes.reserve(mesh_count);
@@ -681,7 +688,9 @@ fn read_body(
     Ok(())
 }
 
-fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
+fn read_compound(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<CompoundChild>, MassProperties), SnapshotError> {
     let unit = MassProperties {
         mass: reader.f32()?,
         inertia: reader.vec3()?,
@@ -714,7 +723,7 @@ fn read_compound(reader: &mut Reader<'_>) -> Result<Compound, SnapshotError> {
             surface,
         });
     }
-    Compound::from_rebased(children, unit).map_err(|_| SnapshotError::Invalid("compound"))
+    Ok((children, unit))
 }
 
 fn read_convex(reader: &mut Reader<'_>) -> Result<ConvexHull, SnapshotError> {
