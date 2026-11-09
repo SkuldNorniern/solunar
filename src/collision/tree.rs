@@ -6,6 +6,8 @@ use crate::body::Bodies;
 use crate::position::GridPosition;
 
 const LEAF: usize = 4;
+/// Steps of movement a body's worth a refit tree takes before it is built again.
+const REFITS_PER_BODY: usize = 8;
 
 type Bounds = ([f64; 3], [f64; 3]);
 
@@ -32,6 +34,11 @@ pub(crate) struct QueryTree {
     items: Vec<u32>,
     /// Each item's box, in the order of `items`, so a leaf tests its bodies before visiting.
     boxes: Vec<Bounds>,
+    /// Where each body is in `items`.
+    slot_of: Vec<u32>,
+    /// Bodies moved since the tree was built, counted each step they moved: past a few times
+    /// the body count its shape no longer fits them and it is built again.
+    moved: usize,
 }
 
 /// Pending nodes of a walk, in place on the call stack. A median split tree of `u32` items is
@@ -107,9 +114,31 @@ impl TreeCache {
         self.0.get().is_some()
     }
 
-    /// Bodies moved, came or went.
+    /// Bodies came or went.
     pub(crate) fn clear(&mut self) {
         self.0 = OnceLock::new();
+    }
+
+    /// `moved` bodies moved: their boxes and the nodes over them follow, with no new tree. A
+    /// tree not built yet is left so. Built again from scratch it cost 1.7 ms on the first query
+    /// after each step of 10,000 bodies with one moving, a refit costs what moved.
+    pub(crate) fn refit(&mut self, bodies: &Bodies, moved: &[u32]) {
+        let rebuild = match self.0.get_mut() {
+            None => return,
+            Some(tree) => {
+                tree.moved += moved.len();
+                if tree.slot_of.len() != bodies.len() || tree.moved > REFITS_PER_BODY * bodies.len()
+                {
+                    true
+                } else {
+                    tree.refit(bodies, moved);
+                    false
+                }
+            }
+        };
+        if rebuild {
+            self.clear();
+        }
     }
 }
 
@@ -139,6 +168,8 @@ impl QueryTree {
             nodes: Vec::with_capacity(count / 2 + 1),
             items: (0..count as u32).collect(),
             boxes: Vec::new(),
+            slot_of: vec![0; count],
+            moved: 0,
         };
         if count > 0 {
             tree.nodes.push(Node {
@@ -154,7 +185,50 @@ impl QueryTree {
             .iter()
             .map(|item| boxes[*item as usize])
             .collect();
+        for (slot, item) in tree.items.iter().enumerate() {
+            tree.slot_of[*item as usize] = slot as u32;
+        }
         tree
+    }
+
+    fn body_box(&self, bodies: &Bodies, dense: usize) -> Bounds {
+        let base = self.origin.to_dvec3();
+        let bound = bodies.assets.bounds(
+            &bodies.shape[dense],
+            bodies.position(dense),
+            bodies.rotation[dense],
+            0.0,
+        );
+        (axes(bound.min - base), axes(bound.max - base))
+    }
+
+    /// New boxes for `moved`, then every node from the leaves up: children come after their
+    /// parent in `nodes`, so one pass from the end does it.
+    fn refit(&mut self, bodies: &Bodies, moved: &[u32]) {
+        for dense in moved {
+            let slot = self.slot_of[*dense as usize] as usize;
+            self.boxes[slot] = self.body_box(bodies, *dense as usize);
+        }
+        for at in (0..self.nodes.len()).rev() {
+            let node = self.nodes[at];
+            let (mut min, mut max) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            let mut grow = |(low, high): Bounds| {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(low[axis]);
+                    max[axis] = max[axis].max(high[axis]);
+                }
+            };
+            if node.count > 0 {
+                let range = node.first as usize..(node.first + node.count) as usize;
+                self.boxes[range].iter().for_each(|bound| grow(*bound));
+            } else {
+                for child in [node.first as usize, node.first as usize + 1] {
+                    grow((self.nodes[child].min, self.nodes[child].max));
+                }
+            }
+            self.nodes[at].min = min;
+            self.nodes[at].max = max;
+        }
     }
 
     /// Fills node `at` over `items[start..end]`, split at the median of the longest axis.

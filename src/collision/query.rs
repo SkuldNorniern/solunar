@@ -1542,7 +1542,11 @@ mod tests {
             world.step_fixed().unwrap();
             if world.body_state(ball).unwrap().position != before {
                 moved = true;
-                assert!(!world.bodies.tree.is_built(), "woken and moved");
+                // refit, not dropped, and the ray sees it where it went
+                assert!(world.bodies.tree.is_built(), "woken and moved");
+                let hit = world.raycast(&down, &filter).unwrap().unwrap();
+                let top = world.body_state(ball).unwrap().position.to_dvec3().y as f32 + 0.5;
+                assert!((10.0 - hit.distance - top).abs() < 1e-3);
             }
         }
         assert!(moved);
@@ -1621,5 +1625,52 @@ mod tests {
         let first = world.raycast(&twin, &filter).unwrap().unwrap();
         assert_eq!(Some(first), flat.raycast(&twin, &filter).unwrap());
         assert!(hits > 200, "{hits}");
+    }
+
+    #[test]
+    fn a_tree_refit_over_moving_bodies_answers_as_a_new_one() {
+        let mut world = world();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(30.0, 1.0, 30.0)))
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+        for index in 0..300 {
+            let (x, z) = (
+                (index % 15) as f32 * 1.3 - 9.0,
+                (index / 15) as f32 * 1.3 - 12.0,
+            );
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.4)))
+                        .local_position(Vec3::new(x, 3.0 + (index % 7) as f32, z))
+                        .linear_velocity(Vec3::new(0.5, 0.0, -0.3))
+                        .angular_velocity(Vec3::new(0.0, 1.0, 0.5)),
+                )
+                .unwrap();
+        }
+        let filter = QueryFilter::default();
+        let mut hits = 0;
+        for step in 0..200 {
+            world.step_fixed().unwrap();
+            let mut flat = world.clone();
+            flat.bodies.tree = TreeCache::flat(&flat.bodies);
+            for index in 0..20 {
+                let x = (index as f32 * 1.7 + step as f32 * 0.13) % 24.0 - 12.0;
+                let line = ray(
+                    at(x, 12.0, (index as f32 * 2.3) % 24.0 - 12.0),
+                    Vec3::new(0.1, -1.0, 0.05),
+                );
+                let found = world.raycast(&line, &filter).unwrap();
+                hits += usize::from(found.is_some());
+                assert_eq!(
+                    found,
+                    flat.raycast(&line, &filter).unwrap(),
+                    "{step} {line:?}"
+                );
+            }
+        }
+        assert!(hits > 2000, "{hits}");
     }
 }
