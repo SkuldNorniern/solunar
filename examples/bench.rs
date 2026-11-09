@@ -23,7 +23,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 17] = [
+const SUITES: [(&str, Suite); 18] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -32,6 +32,7 @@ const SUITES: [(&str, Suite); 17] = [
     ("compound", compound),
     ("queries", queries),
     ("ray-batch", ray_batch),
+    ("blocked-batch", blocked_batch),
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
@@ -636,8 +637,8 @@ fn compound() -> Result<Outcome> {
 }
 
 /// The falling pile at rest, then 10,000 rays and 1,000 sphere casts, timed one by one.
-/// The `queries` scene, 10,000 rays asked as one batch on the bench's workers, 100 times.
-fn ray_batch() -> Result<Outcome> {
+/// The `queries` scene and 10,000 rays down into it.
+fn ray_scene() -> Result<(PhysicsWorld, Vec<Ray>)> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
     let shapes = [
@@ -670,6 +671,12 @@ fn ray_batch() -> Result<Outcome> {
             max_distance: 40.0,
         });
     }
+    Ok((world, rays))
+}
+
+/// The `queries` scene, 10,000 rays asked as one batch on the bench's workers, 100 times.
+fn ray_batch() -> Result<Outcome> {
+    let (world, rays) = ray_scene()?;
     let filter = QueryFilter::default();
     let mut out = Vec::new();
     let mut times = Vec::with_capacity(100);
@@ -687,6 +694,29 @@ fn ray_batch() -> Result<Outcome> {
         times,
         unit: "ms",
         check: format!("{hits} of 10000 hit, per batch of 10000"),
+    })
+}
+
+/// The same rays as `ray-batch`, asked only whether something is in the way.
+fn blocked_batch() -> Result<Outcome> {
+    let (world, rays) = ray_scene()?;
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.ray_blocked_batch(&rays, &filter, pool, &mut out),
+            None => world.ray_blocked_batch(&rays, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let blocked = out.iter().filter(|hit| matches!(hit, Ok(true))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{blocked} of 10000 blocked, per batch of 10000"),
     })
 }
 
