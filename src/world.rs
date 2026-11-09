@@ -109,6 +109,7 @@ pub struct PhysicsWorld {
     pub(crate) contact_cache: Vec<CachedManifold>,
     /// Last step's cache, kept for its memory: the next one is built in it.
     spare_cache: Vec<CachedManifold>,
+    finish_scratch: crate::solver::FinishScratch,
     /// Touching pairs before and after a step, for the contact events.
     touched: (Pairs, Pairs),
     contact_events: Vec<ContactEvent>,
@@ -157,6 +158,7 @@ impl PhysicsWorld {
             accumulator,
             contact_cache: Vec::new(),
             spare_cache: Vec::new(),
+            finish_scratch: crate::solver::FinishScratch::default(),
             touched: (Vec::new(), Vec::new()),
             contact_events: Vec::new(),
             sensors: Sensors::default(),
@@ -827,7 +829,13 @@ impl PhysicsWorld {
             })?;
             lap(&mut phases.integrate);
         }
-        finish_contacts(bodies, awake, &mut next_cache, &self.contact_scratch);
+        finish_contacts(
+            bodies,
+            awake,
+            &mut next_cache,
+            &self.contact_scratch,
+            &mut self.finish_scratch,
+        );
 
         self.commit()?;
         contact_changes(

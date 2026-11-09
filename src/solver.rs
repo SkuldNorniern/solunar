@@ -1400,11 +1400,22 @@ fn refresh_manifold(
 
 /// `cache` goes in old and comes out new.
 /// Pairs with nothing awake were skipped, and keep their entry for the wake up.
+/// Keys and a spare list for [`finish_contacts`], kept between steps so it allocates nothing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FinishScratch {
+    keys: Vec<((BodyHandle, BodyHandle, u32, u32), u32)>,
+    merged: Vec<CachedManifold>,
+}
+
+/// The next contact cache: sleeping pairs kept, this step's contacts in, all in key order. The
+/// kept entries are in order already, this step's are sorted by key alone and merged in, so no
+/// manifold is moved more than once.
 pub(crate) fn finish_contacts(
     bodies: &Bodies,
     awake: &[bool],
     cache: &mut Vec<CachedManifold>,
     scratch: &ContactScratch,
+    spare: &mut FinishScratch,
 ) {
     let active = |dense: usize| bodies.kind[dense] == BodyKind::Dynamic && awake[dense];
     cache.retain(
@@ -1413,7 +1424,26 @@ pub(crate) fn finish_contacts(
             _ => false,
         },
     );
-    for manifold in &scratch.manifolds {
+    let key = |entry: &CachedManifold| (entry.a, entry.b, entry.part_a, entry.part_b);
+    spare.keys.clear();
+    spare.keys.extend(
+        scratch
+            .manifolds
+            .iter()
+            .enumerate()
+            .map(|(index, manifold)| {
+                let key = (
+                    manifold.handle_a,
+                    manifold.handle_b,
+                    manifold.part_a,
+                    manifold.part_b,
+                );
+                (key, index as u32)
+            }),
+    );
+    spare.keys.sort_unstable();
+    let built = |index: usize| {
+        let manifold = &scratch.manifolds[index];
         let mut points = [CachedPoint::default(); MAX_CONTACTS];
         let range = manifold.first..manifold.first + manifold.count;
         let solved = scratch.points[range.clone()]
@@ -1426,16 +1456,27 @@ pub(crate) fn finish_contacts(
                 pushed: frame.pushed,
             };
         }
-        cache.push(CachedManifold {
+        CachedManifold {
             a: manifold.handle_a,
             b: manifold.handle_b,
             part_a: manifold.part_a,
             part_b: manifold.part_b,
             points,
             count: manifold.count,
-        });
+        }
+    };
+    let merged = &mut spare.merged;
+    merged.clear();
+    merged.reserve(cache.len() + spare.keys.len());
+    let mut kept = cache.iter().peekable();
+    for &(wanted, index) in &spare.keys {
+        while let Some(entry) = kept.next_if(|entry| key(entry) < wanted) {
+            merged.push(*entry);
+        }
+        merged.push(built(index as usize));
     }
-    cache.sort_unstable_by_key(|entry| (entry.a, entry.b, entry.part_a, entry.part_b));
+    merged.extend(kept.copied());
+    std::mem::swap(cache, merged);
 }
 
 #[allow(clippy::too_many_arguments)]
