@@ -1,3 +1,4 @@
+mod batch;
 mod broadphase;
 pub(crate) mod convex;
 mod gjk;
