@@ -47,7 +47,7 @@ impl Writer {
         self.u32(value.to_bits());
     }
 
-    pub(super) fn f64(&mut self, value: f64) {
+    pub(crate) fn f64(&mut self, value: f64) {
         self.u64(value.to_bits());
     }
 
@@ -62,7 +62,7 @@ impl Writer {
         self.f32(value.z);
     }
 
-    pub(super) fn dvec3(&mut self, value: DVec3) {
+    pub(crate) fn dvec3(&mut self, value: DVec3) {
         self.f64(value.x);
         self.f64(value.y);
         self.f64(value.z);
@@ -125,7 +125,7 @@ impl Reader<'_> {
         Ok(f32::from_bits(self.u32()?))
     }
 
-    pub(super) fn f64(&mut self) -> Result<f64, SnapshotError> {
+    pub(crate) fn f64(&mut self) -> Result<f64, SnapshotError> {
         Ok(f64::from_bits(self.u64()?))
     }
 
@@ -153,7 +153,7 @@ impl Reader<'_> {
         Ok(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
     }
 
-    pub(super) fn dvec3(&mut self) -> Result<DVec3, SnapshotError> {
+    pub(crate) fn dvec3(&mut self) -> Result<DVec3, SnapshotError> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
 

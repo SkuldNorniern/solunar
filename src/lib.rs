@@ -1,4 +1,5 @@
 mod assembly;
+mod atmosphere;
 mod body;
 mod character;
 mod collision;
@@ -33,6 +34,10 @@ mod vehicle;
 mod world;
 
 pub use algebrix::{DQuat, DVec3, IVec3, Quat, Vec3};
+pub use atmosphere::{
+    AeroDesc, AeroReport, Air, AtmosphereDesc, AtmosphereId, MAX_AERO_BODIES, MAX_ATMOSPHERES,
+    MAX_SURFACES, Surface,
+};
 pub use body::{BodyHandle, BodyKind, BodyState, RigidBodyDesc};
 pub use character::{Character, CharacterDesc, Ground, MoveReport, Touch};
 pub use collision::{CastHit, CollisionFilter, PointHit, QueryFilter, Ray, ShapeCast};
