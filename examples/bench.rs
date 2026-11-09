@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use solunar::{
-    Base, BodyKind, CompoundChild, Edit, EditOp, EditShape, FluidSettings, FluidSolver, FluidWorld,
-    GridPosition, JobDispatch, JointDesc, JointHandle, Material, PhaseTimes, PhysicsError,
-    PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc, SdfDesc, SdfTerrain,
-    Sequential, ShallowSettings, ShallowWater, Shape, ShapeCast, Vec3,
+    Base, BodyKind, BreakableDesc, CompoundChild, Edit, EditOp, EditShape, FluidSettings,
+    FluidSolver, FluidWorld, GridPosition, JobDispatch, JointDesc, JointHandle, Material,
+    PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc,
+    SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape, ShapeCast, Vec3,
+    voronoi_box,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -23,10 +24,11 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 23] = [
+const SUITES: [(&str, Suite); 24] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
+    ("fracture", fracture_wall),
     ("stacks", stacks),
     ("chains", chains),
     ("net", net),
@@ -541,6 +543,55 @@ fn sleep_rays() -> Result<Outcome> {
         times,
         unit: "ms",
         check: format!("{hits} of 100 hit, {} asleep", world.sleeping_body_count()),
+    })
+}
+
+/// A fixed concrete wall of 60 voronoi pieces on a floor, a steel ball at 32 m/s into it every
+/// second at a new spot, 300 steps. Times are whole steps, the splits in them.
+fn fracture_wall() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 30.0)?;
+    let wall = voronoi_box(Vec3::new(1.6, 1.25, 0.12), 60, 7)?;
+    let target = world.add_breakable(BreakableDesc {
+        fixed: true,
+        strength: 2.0e5,
+        material: Material {
+            density: 2400.0,
+            ..Material::default()
+        },
+        ..BreakableDesc::new(
+            wall,
+            GridPosition::from_local(Vec3::new(0.0, 1.25, 0.0)).ok_or(PhysicsError::OutOfRange)?,
+        )
+    })?;
+    let xs = [0.0, -0.9, 0.8, -0.3, 1.1];
+    let mut times = Vec::with_capacity(300);
+    let mut splits = Vec::new();
+    for step in 0..300 {
+        if step % 60 == 0 {
+            world.spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.18))
+                    .density(7800.0)
+                    .local_position(Vec3::new(xs[step / 60], 1.1, -3.0))
+                    .linear_velocity(Vec3::new(0.0, 0.6, 32.0)),
+            )?;
+        }
+        times.extend(steps(&mut world, 1)?);
+        if !world.fracture_events().is_empty() {
+            splits.push(times[times.len() - 1]);
+        }
+    }
+    splits.sort_unstable();
+    let worst = splits.last().map_or(0.0, |time| time.as_secs_f64() * 1e3);
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "{} parts, {} steps split, slowest of those {worst:.2} ms",
+            world.breakable_bodies(target).len(),
+            splits.len()
+        ),
     })
 }
 
