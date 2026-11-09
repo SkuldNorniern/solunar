@@ -23,7 +23,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 20] = [
+const SUITES: [(&str, Suite); 21] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -35,6 +35,7 @@ const SUITES: [(&str, Suite); 20] = [
     ("blocked-batch", blocked_batch),
     ("fan-nearest", fan_nearest),
     ("fan-blocked", fan_blocked),
+    ("terrain-fan", terrain_fan),
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
@@ -703,8 +704,12 @@ fn ray_batch() -> Result<Outcome> {
 /// sphere: like a listener or a light, about half go down into the pile, half up into nothing.
 fn fan_scene() -> Result<(PhysicsWorld, Vec<Ray>)> {
     let (world, _) = ray_scene()?;
-    let origin =
-        GridPosition::from_local(Vec3::new(0.0, 20.0, 0.0)).ok_or(PhysicsError::OutOfRange)?;
+    Ok((world, fan(Vec3::new(0.0, 20.0, 0.0), 40.0)?))
+}
+
+/// 10,000 rays out from `from`, spread evenly over the sphere.
+fn fan(from: Vec3, length: f32) -> Result<Vec<Ray>> {
+    let origin = GridPosition::from_local(from).ok_or(PhysicsError::OutOfRange)?;
     let count = 10_000;
     let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
     let rays = (0..count)
@@ -715,11 +720,53 @@ fn fan_scene() -> Result<(PhysicsWorld, Vec<Ray>)> {
             Ray {
                 origin,
                 direction: Vec3::new(around * turn.cos(), y, around * turn.sin()),
-                max_distance: 40.0,
+                max_distance: length,
             }
         })
         .collect();
-    Ok((world, rays))
+    Ok(rays)
+}
+
+/// The fan nearest hits from 6 m over the middle of the tunnel hills, 60 m long: the down half
+/// lands on terrain triangles, the up half runs to its end.
+fn terrain_fan() -> Result<Outcome> {
+    let mut world = world()?;
+    SdfTerrain::new(
+        &mut world,
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [16, 6, 16],
+            base: Base::Hills {
+                seed: 5,
+                height: 24.0,
+                amplitude: 3.0,
+                wavelength: 30.0,
+                octaves: 4,
+            },
+            material: Material::default(),
+        },
+    )?;
+    let rays = fan(Vec3::new(64.0, 33.0, 64.0), 60.0)?;
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.raycast_batch(&rays, &filter, pool, &mut out),
+            None => world.raycast_batch(&rays, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let hits = out.iter().filter(|hit| matches!(hit, Ok(Some(_)))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{hits} of 10000 hit, per batch of 10000"),
+    })
 }
 
 fn fan_nearest() -> Result<Outcome> {
