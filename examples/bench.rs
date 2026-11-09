@@ -23,7 +23,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 18] = [
+const SUITES: [(&str, Suite); 20] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -33,6 +33,8 @@ const SUITES: [(&str, Suite); 18] = [
     ("queries", queries),
     ("ray-batch", ray_batch),
     ("blocked-batch", blocked_batch),
+    ("fan-nearest", fan_nearest),
+    ("fan-blocked", fan_blocked),
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
@@ -694,6 +696,73 @@ fn ray_batch() -> Result<Outcome> {
         times,
         unit: "ms",
         check: format!("{hits} of 10000 hit, per batch of 10000"),
+    })
+}
+
+/// The `queries` scene and 10,000 rays out from one point over it, spread evenly over the
+/// sphere: like a listener or a light, about half go down into the pile, half up into nothing.
+fn fan_scene() -> Result<(PhysicsWorld, Vec<Ray>)> {
+    let (world, _) = ray_scene()?;
+    let origin =
+        GridPosition::from_local(Vec3::new(0.0, 20.0, 0.0)).ok_or(PhysicsError::OutOfRange)?;
+    let count = 10_000;
+    let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+    let rays = (0..count)
+        .map(|i| {
+            let y = 1.0 - 2.0 * (i as f32 + 0.5) / count as f32;
+            let around = (1.0 - y * y).sqrt();
+            let turn = golden * i as f32;
+            Ray {
+                origin,
+                direction: Vec3::new(around * turn.cos(), y, around * turn.sin()),
+                max_distance: 40.0,
+            }
+        })
+        .collect();
+    Ok((world, rays))
+}
+
+fn fan_nearest() -> Result<Outcome> {
+    let (world, rays) = fan_scene()?;
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.raycast_batch(&rays, &filter, pool, &mut out),
+            None => world.raycast_batch(&rays, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let hits = out.iter().filter(|hit| matches!(hit, Ok(Some(_)))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{hits} of 10000 hit, per batch of 10000"),
+    })
+}
+
+fn fan_blocked() -> Result<Outcome> {
+    let (world, rays) = fan_scene()?;
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.ray_blocked_batch(&rays, &filter, pool, &mut out),
+            None => world.ray_blocked_batch(&rays, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let blocked = out.iter().filter(|hit| matches!(hit, Ok(true))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{blocked} of 10000 blocked, per batch of 10000"),
     })
 }
 
