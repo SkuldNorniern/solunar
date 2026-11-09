@@ -152,11 +152,8 @@ impl PhysicsWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompoundChild, JointDesc, PhysicsSettings, RigidBodyDesc};
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
+    use crate::world::testing::world;
+    use crate::{CompoundChild, JointDesc, RigidBodyDesc};
 
     #[test]
     fn every_body_is_listed_and_stale_ones_are_not() {

@@ -766,15 +766,9 @@ mod tests {
 
     use super::*;
     use crate::collision::tree::TreeCache;
+    use crate::position::testing::at;
+    use crate::world::testing::world;
     use crate::{CollisionFilter, FrameDesc, PhysicsSettings, RigidBodyDesc};
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
-    }
 
     fn fixed(world: &mut PhysicsWorld, shape: Shape, x: f32, y: f32, z: f32) -> BodyHandle {
         world

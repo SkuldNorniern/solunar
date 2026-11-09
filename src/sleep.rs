@@ -240,14 +240,11 @@ pub(crate) fn update_sleep(
 #[cfg(test)]
 mod tests {
     use crate::dispatch::testing::SkipsJobs;
+    use crate::world::testing::world;
     use crate::{
         BodyHandle, Command, CommandBuffer, PhysicsError, PhysicsSettings, PhysicsWorld,
         RigidBodyDesc, Shape, Vec3,
     };
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
 
     fn ground(world: &mut PhysicsWorld) -> BodyHandle {
         world

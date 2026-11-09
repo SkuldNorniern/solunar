@@ -75,12 +75,13 @@ pub struct EditReport {
 #[cfg(test)]
 mod tests {
     use crate::dispatch::testing::{SkipsJobs, Threads};
+    use crate::world::testing::world;
     use std::collections::HashMap;
 
     use algebrix::Quat;
 
     use super::*;
-    use crate::{BodyHandle, PhysicsSettings, PhysicsWorld, Ray, RigidBodyDesc, Sequential, Shape};
+    use crate::{BodyHandle, PhysicsWorld, Ray, RigidBodyDesc, Sequential, Shape};
     use algebrix::Vec3;
 
     fn hills() -> Base {
@@ -105,10 +106,6 @@ mod tests {
                 ..Material::default()
             },
         }
-    }
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
     }
 
     fn edits() -> Vec<Edit> {

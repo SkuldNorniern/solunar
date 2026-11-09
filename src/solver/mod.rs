@@ -264,6 +264,7 @@ pub(crate) fn part_material(bodies: &Bodies, dense: usize, part: u32) -> Materia
 #[cfg(test)]
 mod tests {
     use crate::dispatch::testing::SkipsJobs;
+    use crate::world::testing::{no_gravity, world};
     use algebrix::IVec3;
 
     use crate::{
@@ -316,18 +317,6 @@ mod tests {
         }
         let (body, at) = top.unwrap();
         (world, body, at)
-    }
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn no_gravity() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings {
-            gravity: Vec3::ZERO,
-            ..PhysicsSettings::default()
-        })
-        .unwrap()
     }
 
     /// Top surface at y = 0.

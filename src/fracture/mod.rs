@@ -887,6 +887,7 @@ fn connected(pieces: &[u32], bonds: &[Bond]) -> Vec<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::position::testing::at;
     use crate::{JobDispatch, PhysicsSettings, Sequential, Shape};
 
     struct Threads(usize);
@@ -919,10 +920,6 @@ mod tests {
             )
             .unwrap();
         world
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
     }
 
     fn mass(world: &PhysicsWorld, bodies: &[BodyHandle]) -> f32 {

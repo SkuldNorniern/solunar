@@ -891,19 +891,10 @@ pub(crate) fn point_triangle(point: Vec3, triangle: &[Vec3; 3]) -> (f32, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        GridPosition, Material, PhysicsSettings, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc,
-        ShapeCast,
-    };
+    use crate::position::testing::at;
+    use crate::world::testing::world;
+    use crate::{Material, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc, ShapeCast};
     use std::collections::HashSet;
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
-    }
 
     fn near(a: f32, b: f32, tolerance: f32) {
         assert!((a - b).abs() <= tolerance, "{a} != {b}");

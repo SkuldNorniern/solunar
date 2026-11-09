@@ -364,15 +364,9 @@ fn inside(region: &FieldRegion, at: GridPosition) -> bool {
 mod tests {
     use super::*;
     use crate::body::RigidBodyDesc;
+    use crate::position::testing::at;
     use crate::world::PhysicsSettings;
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
-    }
+    use crate::world::testing::world;
 
     #[test]
     fn a_ball_in_still_water_floats_at_the_depth_its_density_says() {

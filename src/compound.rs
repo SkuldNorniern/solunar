@@ -907,11 +907,9 @@ mod tests {
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
 
     use super::*;
-    use crate::{CollisionFilter, PhysicsSettings, QueryFilter, Ray, RigidBodyDesc, ShapeCast};
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
+    use crate::position::testing::at;
+    use crate::world::testing::{ground, no_gravity, world};
+    use crate::{CollisionFilter, QueryFilter, Ray, RigidBodyDesc, ShapeCast};
 
     fn ramp(world: &mut PhysicsWorld) -> Shape {
         let vertices = [Vec3::ZERO, Vec3::new(0.0, 0.0, 1.0), Vec3::X];
@@ -954,33 +952,12 @@ mod tests {
         assert_ne!(ramp(&mut back), gone);
     }
 
-    fn no_gravity() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings {
-            gravity: Vec3::ZERO,
-            ..PhysicsSettings::default()
-        })
-        .unwrap()
-    }
-
-    fn ground(world: &mut PhysicsWorld) {
-        world
-            .spawn(
-                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 1.0, 50.0)))
-                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
-            )
-            .unwrap();
-    }
-
     fn cube_at(x: f32, y: f32, z: f32) -> CompoundChild {
         CompoundChild::new(Shape::cuboid(Vec3::splat(0.5)), Vec3::new(x, y, z))
     }
 
     fn near(a: f32, b: f32, tolerance: f32) {
         assert!((a - b).abs() <= tolerance, "{a} != {b}");
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
     }
 
     #[test]

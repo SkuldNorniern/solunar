@@ -489,15 +489,9 @@ fn shift(at: GridPosition, by: Vec3) -> Result<GridPosition, PhysicsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CollisionFilter, PhysicsSettings, RigidBodyDesc};
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
-    }
+    use crate::position::testing::at;
+    use crate::world::testing::world;
+    use crate::{CollisionFilter, RigidBodyDesc};
 
     fn floor(world: &mut PhysicsWorld) {
         world

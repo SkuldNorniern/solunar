@@ -690,23 +690,39 @@ fn finite(value: Vec3, what: &'static str) -> Result<(), PhysicsError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use algebrix::IVec3;
-
+pub(crate) mod testing {
     use super::*;
-    use crate::{CELL_SIZE, Shape};
+    use crate::{RigidBodyDesc, Shape};
 
-    pub(super) fn world() -> PhysicsWorld {
+    pub(crate) fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
     }
 
-    pub(super) fn no_gravity() -> PhysicsWorld {
+    pub(crate) fn no_gravity() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings {
             gravity: Vec3::ZERO,
             ..PhysicsSettings::default()
         })
         .unwrap()
     }
+
+    pub(crate) fn ground(world: &mut PhysicsWorld) {
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 1.0, 50.0)))
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use algebrix::IVec3;
+
+    use super::*;
+    use crate::world::testing::{no_gravity, world};
+    use crate::{CELL_SIZE, Shape};
 
     pub(super) fn cube() -> RigidBodyDesc {
         RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))

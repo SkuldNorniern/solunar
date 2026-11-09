@@ -278,22 +278,11 @@ mod tests {
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
     use super::*;
+    use crate::world::testing::{no_gravity, world};
     use crate::{
         Command, CommandBuffer, FrameDesc, FrameId, GridPosition, PhysicsSettings, PhysicsWorld,
         RigidBodyDesc, Shape,
     };
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn no_gravity() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings {
-            gravity: Vec3::ZERO,
-            ..PhysicsSettings::default()
-        })
-        .unwrap()
-    }
 
     fn fixed_at(world: &mut PhysicsWorld, at: Vec3) -> BodyHandle {
         world

@@ -713,18 +713,12 @@ pub(crate) fn poly_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::position::testing::at;
+    use crate::world::testing::{ground, world};
     use crate::{
-        ConvexInfo, GridPosition, PhysicsSettings, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc,
-        Shape, ShapeCast,
+        ConvexInfo, PhysicsSettings, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc, Shape,
+        ShapeCast,
     };
-
-    fn world() -> PhysicsWorld {
-        PhysicsWorld::new(PhysicsSettings::default()).unwrap()
-    }
-
-    fn at(x: f32, y: f32, z: f32) -> GridPosition {
-        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
-    }
 
     fn near(a: f32, b: f32, tolerance: f32) {
         assert!((a - b).abs() <= tolerance, "{a} != {b}");
@@ -755,15 +749,6 @@ mod tests {
             Vec3::Z * half,
             -Vec3::Z * half,
         ]
-    }
-
-    fn ground(world: &mut PhysicsWorld) {
-        world
-            .spawn(
-                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 1.0, 50.0)))
-                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
-            )
-            .unwrap();
     }
 
     fn drop_on(world: &mut PhysicsWorld, info: &ConvexInfo, x: f32, y: f32) -> crate::BodyHandle {

@@ -107,6 +107,15 @@ fn rebase_axis(cell: i32, local: f32) -> Option<(i32, f32)> {
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub(crate) fn at(x: f32, y: f32, z: f32) -> GridPosition {
+        GridPosition::from_local(Vec3::new(x, y, z)).unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

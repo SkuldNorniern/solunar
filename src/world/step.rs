@@ -489,7 +489,8 @@ mod tests {
     use crate::dispatch::testing::SkipsJobs;
     use crate::{Command, CommandBuffer, IslandStats, JointDesc, RigidBodyDesc, Shape};
 
-    use super::super::tests::{cube, no_gravity, world};
+    use super::super::testing::{no_gravity, world};
+    use super::super::tests::cube;
     use super::*;
 
     fn angular_momentum(world: &PhysicsWorld, body: BodyHandle) -> Vec3 {
@@ -793,7 +794,7 @@ mod tests {
             steps += world.advance(1.0 / 60.0).unwrap().steps;
         }
         assert_eq!(steps, 180);
-        let mut world = super::super::tests::world();
+        let mut world = super::super::testing::world();
         assert_eq!(world.advance(3.0).unwrap().steps, 8);
         for _ in 0..30 {
             world.advance(0.0).unwrap();
