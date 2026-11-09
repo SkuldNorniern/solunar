@@ -55,7 +55,7 @@ pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Ve
     order.clear();
     order.extend(0..bounds.len() as u32);
     pairs.clear();
-    sweep(bounds, order, pairs);
+    sweep(bounds, order, &mut Vec::new(), pairs);
     pairs.sort_unstable();
 }
 
@@ -71,18 +71,26 @@ fn sort_by_min_x(bounds: &[Bounds], order: &mut [u32]) {
     order.sort_unstable_by(|a, b| by_min_x(bounds, *a, *b));
 }
 
-/// Pairs among `order`, which it sorts. Adds to `pairs` unsorted.
-fn sweep(bounds: &[Bounds], order: &mut [u32], pairs: &mut Vec<(u32, u32)>) {
+/// Pairs among `order`, which it sorts. Adds to `pairs` unsorted. The bounds are copied into
+/// `packed` in sweep order first, the inner loop then reads memory in a row.
+fn sweep(
+    bounds: &[Bounds],
+    order: &mut [u32],
+    packed: &mut Vec<Bounds>,
+    pairs: &mut Vec<(u32, u32)>,
+) {
     sort_by_min_x(bounds, order);
-    for (at, a) in order.iter().enumerate() {
-        let first = &bounds[*a as usize];
-        for b in &order[at + 1..] {
-            let second = &bounds[*b as usize];
+    packed.clear();
+    packed.extend(order.iter().map(|index| bounds[*index as usize]));
+    for (at, first) in packed.iter().enumerate() {
+        let a = order[at];
+        for (offset, second) in packed[at + 1..].iter().enumerate() {
             if second.min.x > first.max.x {
                 break;
             }
             if first.overlaps_yz(second) {
-                pairs.push(((*a).min(*b), (*a).max(*b)));
+                let b = order[at + 1 + offset];
+                pairs.push((a.min(b), a.max(b)));
             }
         }
     }
@@ -98,6 +106,7 @@ pub(crate) struct MovingPairs {
     is_narrow: Vec<bool>,
     wide: Vec<u32>,
     reach: f64,
+    packed: Vec<Bounds>,
 }
 
 impl MovingPairs {
@@ -143,7 +152,7 @@ impl MovingPairs {
             sort_by_min_x(bounds, &mut self.narrow);
         }
         pairs.clear();
-        sweep(bounds, &mut self.movers, pairs);
+        sweep(bounds, &mut self.movers, &mut self.packed, pairs);
         for at in 0..self.movers.len() {
             self.against_passive(bounds, self.movers[at] as usize, pairs);
         }
