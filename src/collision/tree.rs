@@ -114,11 +114,17 @@ impl QueryTree {
         } else {
             bodies.position(0)
         };
+        // each body's own turned box, far tighter than its bounding sphere for a floor or a wall
+        let base = origin.to_dvec3();
         let boxes: Vec<Bounds> = (0..count)
             .map(|dense| {
-                let center = axes(bodies.position(dense).offset_from(origin));
-                let reach = f64::from(bodies.assets.bounding_radius(&bodies.shape[dense]));
-                (center.map(|v| v - reach), center.map(|v| v + reach))
+                let bound = bodies.assets.bounds(
+                    &bodies.shape[dense],
+                    bodies.position(dense),
+                    bodies.rotation[dense],
+                    0.0,
+                );
+                (axes(bound.min - base), axes(bound.max - base))
             })
             .collect();
         let mut tree = Self {
