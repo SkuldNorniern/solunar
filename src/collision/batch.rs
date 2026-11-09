@@ -18,6 +18,18 @@ impl PhysicsWorld {
         self.batch(rays, dispatch, out, &|ray| self.raycast(ray, filter));
     }
 
+    /// Whether each ray is blocked, spread over `dispatch`, as [`Self::ray_blocked`] answers
+    /// one. For many light or sound paths at once.
+    pub fn ray_blocked_batch(
+        &self,
+        rays: &[Ray],
+        filter: &QueryFilter,
+        dispatch: &dyn JobDispatch,
+        out: &mut Vec<Result<bool, PhysicsError>>,
+    ) {
+        self.batch(rays, dispatch, out, &|ray| self.ray_blocked(ray, filter));
+    }
+
     /// Every cast, spread over `dispatch`, as [`Self::raycast_batch`] does rays.
     pub fn shape_cast_batch(
         &self,
@@ -145,6 +157,16 @@ mod tests {
             assert_eq!(out, alone);
             world.shape_cast_batch(&casts, &filter, &Threads(workers), &mut out);
             assert_eq!(out, cast_alone);
+        }
+        // blocked exactly where the nearest hit is in reach, on any worker count
+        let wanted: Vec<_> = alone
+            .iter()
+            .map(|hit| hit.as_ref().map(Option::is_some).map_err(Clone::clone))
+            .collect();
+        let mut blocked = Vec::new();
+        for workers in [1, 3] {
+            world.ray_blocked_batch(&rays, &filter, &Threads(workers), &mut blocked);
+            assert_eq!(blocked, wanted);
         }
         // a bad ray answers with its own error, the rest still answer
         let mut mixed = rays[..3].to_vec();

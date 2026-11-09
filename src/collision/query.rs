@@ -82,51 +82,15 @@ impl PhysicsWorld {
             if !self.visible(dense, filter) {
                 return;
             }
-            let offset = ray.origin.offset_from(self.bodies.position(dense));
             let limit = best.map_or(max, |found| found.0);
-            let assets = &self.bodies.assets;
-            let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
-            if !sphere_near_path(offset, direction, limit, reach) {
+            let Some((time, normal)) = self.ray_body(dense, ray.origin, direction, limit, false)
+            else {
                 return;
-            }
+            };
             let handle = self.bodies.handle_at(dense);
-            let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
-            if let Some(mesh) = assets.mesh(body.0) {
-                let rotation = DQuat::from_quat(body.1);
-                let inverse = rotation.conjugate();
-                let start = inverse.mul_vec3(offset);
-                let along = inverse.mul_vec3(direction);
-                let tip = (start + along * limit).as_vec3();
-                let area = Aabb::around(start.as_vec3(), 0.0).union(Aabb::around(tip, 0.0));
-                mesh.for_each_near(area, |index| {
-                    let limit = best.map_or(max, |found| found.0);
-                    let triangle = mesh.triangle(index);
-                    if let Some((time, normal)) = ray_triangle(start, along, &triangle, limit)
-                        && best.is_none_or(|found| (time, handle) < (found.0, found.1))
-                    {
-                        best = Some((time, handle, rotation.mul_vec3(normal)));
-                    }
-                });
-                return;
+            if best.is_none_or(|found| (time, handle) < (found.0, found.1)) {
+                best = Some((time, handle, normal));
             }
-            assets.for_each_part(body.0, body.1, |_, part, at, turn| {
-                let limit = best.map_or(max, |found| found.0);
-                let rotation = DQuat::from_quat(turn);
-                let inverse = rotation.conjugate();
-                let start = inverse.mul_vec3(offset - DVec3::from_vec3(at));
-                let along = inverse.mul_vec3(direction);
-                let found = match assets.convex(part) {
-                    Some(hull) => hull.ray(start, along, limit),
-                    None => ray_shape(part, start, along, limit),
-                };
-                let Some((time, normal)) = found else {
-                    return;
-                };
-                let normal = rotation.mul_vec3(normal);
-                if best.is_none_or(|found| (time, handle) < (found.0, found.1)) {
-                    best = Some((time, handle, normal));
-                }
-            });
             shortest.set(best.map_or(max, |found| found.0));
         };
         let tree = self.bodies.tree.get(&self.bodies);
@@ -142,6 +106,95 @@ impl PhysicsWorld {
             })
         })
         .transpose()
+    }
+
+    /// Whether anything visible lies on the ray within its length: one hit ends the search, so
+    /// it costs less than [`Self::raycast`]. For line of sight, light and sound paths.
+    ///
+    /// # Errors
+    /// Fails on an unknown frame, non finite input or a zero direction.
+    pub fn ray_blocked(&self, ray: &Ray, filter: &QueryFilter) -> Result<bool, PhysicsError> {
+        let direction = self.check_cast(ray.origin, ray.direction, ray.max_distance, filter)?;
+        let max = f64::from(ray.max_distance);
+        let blocked = Cell::new(false);
+        let mut visit = |dense: usize| {
+            if blocked.get() || !self.visible(dense, filter) {
+                return;
+            }
+            if self
+                .ray_body(dense, ray.origin, direction, max, true)
+                .is_some()
+            {
+                blocked.set(true);
+            }
+        };
+        let tree = self.bodies.tree.get(&self.bodies);
+        let start = tree.local(ray.origin);
+        // once blocked, every node left is past the limit
+        let limit = || if blocked.get() { -1.0 } else { max };
+        tree.along(start, direction, 0.0, &limit, &mut visit);
+        Ok(blocked.get())
+    }
+
+    /// The ray against one body, in world axes from `origin` along unit `direction`: the
+    /// nearest time under `limit` and the normal there. With `first`, any hit will do.
+    fn ray_body(
+        &self,
+        dense: usize,
+        origin: GridPosition,
+        direction: DVec3,
+        limit: f64,
+        first: bool,
+    ) -> Option<(f64, DVec3)> {
+        let offset = origin.offset_from(self.bodies.position(dense));
+        let assets = &self.bodies.assets;
+        let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
+        if !sphere_near_path(offset, direction, limit, reach) {
+            return None;
+        }
+        let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
+        let mut nearest: Option<(f64, DVec3)> = None;
+        let shortest = |nearest: &Option<(f64, DVec3)>| nearest.map_or(limit, |found| found.0);
+        if let Some(mesh) = assets.mesh(body.0) {
+            let rotation = DQuat::from_quat(body.1);
+            let inverse = rotation.conjugate();
+            let start = inverse.mul_vec3(offset);
+            let along = inverse.mul_vec3(direction);
+            let tip = (start + along * limit).as_vec3();
+            let area = Aabb::around(start.as_vec3(), 0.0).union(Aabb::around(tip, 0.0));
+            mesh.for_each_near(area, |index| {
+                if first && nearest.is_some() {
+                    return;
+                }
+                let triangle = mesh.triangle(index);
+                if let Some((time, normal)) =
+                    ray_triangle(start, along, &triangle, shortest(&nearest))
+                    && nearest.is_none_or(|found| time < found.0)
+                {
+                    nearest = Some((time, rotation.mul_vec3(normal)));
+                }
+            });
+            return nearest;
+        }
+        assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+            if first && nearest.is_some() {
+                return;
+            }
+            let rotation = DQuat::from_quat(turn);
+            let inverse = rotation.conjugate();
+            let start = inverse.mul_vec3(offset - DVec3::from_vec3(at));
+            let along = inverse.mul_vec3(direction);
+            let found = match assets.convex(part) {
+                Some(hull) => hull.ray(start, along, shortest(&nearest)),
+                None => ray_shape(part, start, along, shortest(&nearest)),
+            };
+            if let Some((time, normal)) = found
+                && nearest.is_none_or(|found| time < found.0)
+            {
+                nearest = Some((time, rotation.mul_vec3(normal)));
+            }
+        });
+        nearest
     }
 
     /// Nearest hit along the sweep, the lower handle wins a tie.
@@ -1281,6 +1334,78 @@ mod tests {
             }
         }
         assert!(hits > 500, "{hits}");
+    }
+
+    #[test]
+    fn blocked_is_whether_the_nearest_hit_is_in_reach_on_meshes_and_parts() {
+        let mut state = 0x0b5c_ac1e_2468_1357_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 2000) as f32 / 1000.0 - 1.0
+        };
+        let mut world = world();
+        // a bumpy mesh floor and a compound of two parts above it
+        let mut vertices = Vec::new();
+        for z in 0..9 {
+            for x in 0..9 {
+                let bump = ((x * 7 + z * 3) % 5) as f32 * 0.2;
+                vertices.push(Vec3::new(
+                    x as f32 * 5.0 - 20.0,
+                    bump,
+                    z as f32 * 5.0 - 20.0,
+                ));
+            }
+        }
+        let mut triangles = Vec::new();
+        for z in 0..8u32 {
+            for x in 0..8u32 {
+                let at = z * 9 + x;
+                triangles.push([at, at + 9, at + 1]);
+                triangles.push([at + 1, at + 9, at + 10]);
+            }
+        }
+        let floor = world.add_mesh(&vertices, &triangles).unwrap();
+        world.spawn(RigidBodyDesc::fixed(floor)).unwrap();
+        let info = world
+            .add_compound(&[
+                crate::CompoundChild::new(Shape::sphere(1.0), Vec3::new(-1.5, 0.0, 0.0)),
+                crate::CompoundChild::new(
+                    Shape::cuboid(Vec3::splat(0.8)),
+                    Vec3::new(1.5, 0.0, 0.0),
+                ),
+            ])
+            .unwrap();
+        let (place, turn) = info.placed(Vec3::new(0.0, 4.0, 0.0), Quat::IDENTITY);
+        world
+            .spawn(
+                RigidBodyDesc::fixed(info.shape)
+                    .local_position(place)
+                    .rotation(turn),
+            )
+            .unwrap();
+        let filter = QueryFilter::default();
+        let (mut hits, mut misses) = (0, 0);
+        for _ in 0..2000 {
+            let from = Vec3::new(next() * 25.0, 2.0 + next().abs() * 10.0, next() * 25.0);
+            let line = Ray {
+                origin: at(from.x, from.y, from.z),
+                direction: Vec3::new(next(), next() - 0.3, next()),
+                max_distance: 3.0 + next().abs() * 30.0,
+            };
+            let Ok(nearest) = world.raycast(&line, &filter) else {
+                continue;
+            };
+            let blocked = world.ray_blocked(&line, &filter).unwrap();
+            assert_eq!(blocked, nearest.is_some(), "{line:?} {nearest:?}");
+            if blocked {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
+        }
+        assert!(hits > 200 && misses > 200, "{hits} {misses}");
     }
 
     #[test]
