@@ -268,6 +268,14 @@ impl Breakables {
         self.slots.iter().all(Option::is_none)
     }
 
+    /// Whether `body` is a group of some breakable's pieces.
+    pub(crate) fn holds(&self, body: BodyHandle) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|breakable| breakable.groups.iter().any(|group| group.body == body))
+    }
+
     pub(crate) fn save(&self, out: &mut Writer) {
         out.len(self.slots.len());
         for (slot, generation) in self.slots.iter().zip(&self.generations) {

@@ -453,7 +453,7 @@ impl PhysicsWorld {
     }
 
     /// Whatever rested on `body` loses it, so it can not stay asleep.
-    fn wake_contacts_of(&mut self, body: BodyHandle) {
+    pub(crate) fn wake_contacts_of(&mut self, body: BodyHandle) {
         for entry in &self.contact_cache {
             let other = if entry.a == body {
                 entry.b

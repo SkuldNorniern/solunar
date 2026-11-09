@@ -1,3 +1,4 @@
+mod assembly;
 mod body;
 mod character;
 mod collision;
