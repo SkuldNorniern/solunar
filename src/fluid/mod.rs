@@ -20,6 +20,7 @@ mod terrain;
 
 pub use boundary::BoundaryId;
 use boundary::Walls;
+pub use couple::FluidHook;
 use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;

@@ -6,6 +6,7 @@ use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
 use crate::shape::Shape;
 use crate::snapshot::{Reader, SnapshotError, Writer};
+use crate::substep::{SubstepBodies, SubstepHook, SubstepPose};
 use crate::world::PhysicsWorld;
 
 use super::step::FluidReport;
@@ -79,6 +80,60 @@ impl Coupled {
 
     pub(super) fn point_count(&self) -> usize {
         self.points.len()
+    }
+}
+
+/// The water as a [`SubstepHook`]: each rigid substep it steps the substep's time with the
+/// bodies where the substep has them, and pushes them before that substep's solve, so the
+/// tick's lag of [`FluidWorld::step_with_bodies`] goes. Not ready: a body held only by water
+/// spins more this way, see the tests.
+pub struct FluidHook<'a> {
+    fluid: &'a mut FluidWorld,
+    /// What the water did over the rigid step so far, substeps added, highs kept.
+    pub report: FluidReport,
+}
+
+impl FluidWorld {
+    /// Passes this water to [`PhysicsWorld::step_with_hooks`].
+    pub fn hook(&mut self) -> FluidHook<'_> {
+        FluidHook {
+            fluid: self,
+            report: FluidReport::default(),
+        }
+    }
+}
+
+impl SubstepHook for FluidHook<'_> {
+    fn before_solve(
+        &mut self,
+        bodies: &mut SubstepBodies<'_>,
+        dt: f32,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<(), PhysicsError> {
+        let fluid = &mut *self.fluid;
+        if fluid.settings.solver != FluidSolver::Wcsph && !fluid.coupled.is_empty() {
+            return Err(PhysicsError::InvalidSettings);
+        }
+        fluid.place_movers_at(|body| bodies.pose(body));
+        let stepped = fluid.step(dt, dispatch);
+        fluid.movers = Movers::default();
+        let step = stepped?;
+        let total = &mut self.report;
+        total.substeps += step.substeps;
+        total.capped |= step.capped;
+        total.max_compression = total.max_compression.max(step.max_compression);
+        total.max_speed = total.max_speed.max(step.max_speed);
+        total.held_back += step.held_back;
+        total.iterations += step.iterations;
+        total.emitted += step.emitted;
+        total.drained += step.drained;
+        total.lost += step.lost;
+        total.sound_speed = total.sound_speed.max(step.sound_speed);
+        for known in &mut fluid.coupled {
+            let (impulse, angular) = std::mem::take(&mut known.impulse);
+            bodies.push(known.body, impulse, angular)?;
+        }
+        Ok(())
     }
 }
 
@@ -163,12 +218,24 @@ impl FluidWorld {
     }
 
     fn place_movers(&mut self, world: &PhysicsWorld) {
-        self.coupled
-            .retain(|known| world.body_state(known.body).is_ok());
+        self.place_movers_at(|body| {
+            let state = world.body_state(body).ok()?;
+            Some(SubstepPose {
+                position: state.position,
+                rotation: state.rotation,
+                linear_velocity: state.linear_velocity,
+                angular_velocity: state.angular_velocity,
+            })
+        });
+    }
+
+    /// Body points where `pose` says their bodies are. A body it does not know is uncoupled.
+    fn place_movers_at(&mut self, pose: impl Fn(BodyHandle) -> Option<SubstepPose>) {
+        self.coupled.retain(|known| pose(known.body).is_some());
         let mut placed: Vec<(CellKey, u32, Vec3, Vec3)> = Vec::new();
         let radius = self.settings.radius();
         for (owner, known) in self.coupled.iter_mut().enumerate() {
-            let Ok(state) = world.body_state(known.body) else {
+            let Some(state) = pose(known.body) else {
                 continue;
             };
             let center = state.position.to_dvec3().as_vec3();
@@ -429,6 +496,70 @@ mod tests {
         // its own sound speed, 9.4 now
         assert!(fastest < 12.0, "{fastest}");
         assert!(last < 2.0, "{last}");
+    }
+
+    /// A brick dropped into a 1 m deep pool, and its fastest motion in the fifth second, settled
+    /// on the floor by then.
+    fn brick_under_water(hooked: bool) -> (f32, f32, f32) {
+        let mut fluid = FluidWorld::new(FluidSettings {
+            spacing: 0.1,
+            ..FluidSettings::default()
+        })
+        .unwrap();
+        fluid
+            .add_box_container(Vec3::ZERO, Vec3::new(3.0, 2.0, 2.0))
+            .unwrap();
+        fluid
+            .fill_box(Vec3::ZERO, Vec3::new(3.0, 1.0, 2.0))
+            .unwrap();
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)))
+                    .local_position(Vec3::new(1.5, -0.5, 1.0)),
+            )
+            .unwrap();
+        let shape = Shape::cuboid(Vec3::new(0.2, 0.15, 0.35));
+        let brick = world
+            .spawn(
+                RigidBodyDesc::dynamic(shape)
+                    .density(2400.0)
+                    .local_position(Vec3::new(1.5, 1.3, 1.0)),
+            )
+            .unwrap();
+        fluid.couple(brick, &shape).unwrap();
+        let (mut speed, mut spin, mut highest) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for tick in 0..300 {
+            if hooked {
+                let mut hook = fluid.hook();
+                world
+                    .step_with_hooks(&Sequential, &mut [&mut hook])
+                    .unwrap();
+            } else {
+                fluid
+                    .step_with_bodies(TICK, &mut world, &Sequential)
+                    .unwrap();
+                world.step_fixed().unwrap();
+            }
+            let state = world.body_state(brick).unwrap();
+            if tick >= 240 {
+                speed = speed.max(state.linear_velocity.length());
+                spin = spin.max(state.angular_velocity.length());
+                highest = highest.max(state.position.to_dvec3().y as f32 - 0.15);
+            }
+        }
+        (speed, spin, highest)
+    }
+
+    #[test]
+    fn pushing_inside_the_substeps_takes_out_the_tick_lag_bounce() {
+        // measured in the fifth second, speed m/s, spin rad/s, off the floor m: once a tick
+        // 0.21, 0.05, 0.05. inside the substeps 0.07, 1.6, 0.05. the lag's bounce goes, the half
+        // spacing layer of water under the brick stays and the spin it floats with grows
+        let (speed, _, gap) = brick_under_water(true);
+        let (lagged, _, lagged_gap) = brick_under_water(false);
+        assert!(speed < lagged / 2.0, "{speed} against {lagged}");
+        assert!(gap < 0.06 && lagged_gap < 0.06, "{gap} {lagged_gap}");
     }
 
     #[test]

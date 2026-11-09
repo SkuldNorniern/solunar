@@ -736,6 +736,20 @@ impl PhysicsWorld {
     /// Fails if a body goes non finite or out of range, or the dispatcher skips a job.
     /// State stays at the last step when this fails.
     pub fn step_with(&mut self, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
+        self.step_with_hooks(dispatch, &mut [])
+    }
+
+    /// [`Self::step_with`], with `hooks` run inside every substep before its solve, in order.
+    /// Coupled solvers that must push bodies and be pushed back within the step go here.
+    ///
+    /// # Errors
+    /// As [`Self::step_with`], and when a hook fails. State stays at the last step then too,
+    /// whatever the hook did to its own state.
+    pub fn step_with_hooks(
+        &mut self,
+        dispatch: &dyn JobDispatch,
+        hooks: &mut [&mut dyn crate::substep::SubstepHook],
+    ) -> Result<(), PhysicsError> {
         let started = Instant::now();
         self.failed_body = None;
         self.prepare_frame_gravity()?;
@@ -799,6 +813,7 @@ impl PhysicsWorld {
             dt,
         )?;
         lap(&mut phases.narrowphase);
+        let mut woken = Vec::new();
         for substep in 0..substeps {
             // outside forces were worked out at the start of the step, so they go in whole before
             // the first move. spread over substeps they would lag the motion and add energy
@@ -814,6 +829,17 @@ impl PhysicsWorld {
                 );
             })?;
             lap(&mut phases.integrate);
+            if !hooks.is_empty() {
+                let mut view = crate::substep::SubstepBodies {
+                    bodies,
+                    state: &mut self.scratch,
+                    awake,
+                    woken: &mut woken,
+                };
+                for hook in hooks.iter_mut() {
+                    hook.before_solve(&mut view, part, dispatch)?;
+                }
+            }
             solve_substep(
                 bodies,
                 awake,
@@ -855,6 +881,9 @@ impl PhysicsWorld {
             &mut self.sleep,
             dt,
         );
+        for dense in woken {
+            self.bodies.wake(dense);
+        }
         self.recheck_sleepers = false;
         self.tick += 1;
         self.update_sensors()?;
