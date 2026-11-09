@@ -437,7 +437,7 @@ mod tests {
             .local_position(Vec3::new(0.0, 1.2, 0.0));
         desc.frame = frame;
         let body = world.spawn(desc).unwrap();
-        let mut vehicle = Vehicle::new(&mut world, body, &wheels()).unwrap();
+        let mut vehicle = Vehicle::new(&world, body, &wheels()).unwrap();
         run(&mut world, &mut vehicle, Controls::default(), 300);
         let state = chassis(&world, &vehicle);
         let sag = 1_000.0 * 9.81 / (4.0 * 30_000.0);
