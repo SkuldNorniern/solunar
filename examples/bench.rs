@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use solunar::{
-    Base, BodyKind, BreakableDesc, CompoundChild, Edit, EditOp, EditShape, FluidSettings,
+    Base, BodyKind, BreakableDesc, CompoundChild, Debris, Edit, EditOp, EditShape, FluidSettings,
     FluidSolver, FluidWorld, FractureMaterial, GridPosition, JobDispatch, JointDesc, JointHandle,
     LinkDesc, Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter,
     Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
@@ -24,13 +24,14 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 28] = [
+const SUITES: [(&str, Suite); 29] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
     ("moving-rays", moving_rays),
     ("fracture", fracture_wall),
     ("gallery", gallery),
+    ("gallery-debris", gallery_debris),
     ("ship", ship),
     ("stacks", stacks),
     ("chains", chains),
@@ -709,6 +710,19 @@ fn fracture_wall() -> Result<Outcome> {
 /// ball at 32 m/s two seconds apart, and a glass cube dropped from 5 m. Every step timed, the
 /// worst named.
 fn gallery() -> Result<Outcome> {
+    gallery_with(None)
+}
+
+/// `gallery` with pieces of a litre or less turning fixed after a second still.
+fn gallery_debris() -> Result<Outcome> {
+    gallery_with(Some(Debris {
+        volume: 0.001,
+        settle: 1.0,
+        remove: None,
+    }))
+}
+
+fn gallery_with(debris: Option<Debris>) -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 30.0)?;
     let targets = [
@@ -723,6 +737,7 @@ fn gallery() -> Result<Outcome> {
     for (index, (kind, half, x)) in targets.iter().enumerate() {
         world.add_breakable(BreakableDesc {
             fixed: true,
+            debris,
             ..BreakableDesc::of(
                 kind,
                 *half,
@@ -731,12 +746,15 @@ fn gallery() -> Result<Outcome> {
             )?
         })?;
     }
-    world.add_breakable(BreakableDesc::of(
-        &FractureMaterial::GLASS,
-        Vec3::splat(0.3),
-        at(Vec3::new(0.0, 5.0, -2.5))?,
-        3,
-    )?)?;
+    world.add_breakable(BreakableDesc {
+        debris,
+        ..BreakableDesc::of(
+            &FractureMaterial::GLASS,
+            Vec3::splat(0.3),
+            at(Vec3::new(0.0, 5.0, -2.5))?,
+            3,
+        )?
+    })?;
     let mut times = Vec::with_capacity(900);
     let mut worst = (Duration::ZERO, 0);
     for step in 0..900_usize {
