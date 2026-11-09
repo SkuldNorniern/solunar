@@ -19,6 +19,11 @@ const RECOVERY_RATE: f32 = 0.2;
 const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
+/// A pair whose bodies moved less than this against each other since its contacts were found,
+/// meters squared, keeps them rather than finding them again.
+const REUSE_DISTANCE_SQUARED: f32 = 0.0002 * 0.0002;
+/// The same for turning: the cosine of half of 0.1 degree.
+const REUSE_HALF_TURN_COS: f32 = 0.999_999_6;
 
 /// Pairs in one job of contact finding. Fixed, so the output does not depend on the thread count.
 const PAIR_CHUNK: usize = 128;
@@ -27,6 +32,8 @@ const PAIR_CHUNK: usize = 128;
 pub(crate) struct CachedPoint {
     /// Contact in body A axes, finds the same point next step.
     pub(crate) local_a: Vec3,
+    /// The same on B, in its axes.
+    pub(crate) local_b: Vec3,
     pub(crate) impulse: Vec3,
     /// Normal impulse over the whole step, every substep's added, newton seconds. A hit is
     /// mostly taken in the first substep, the last one alone says little about it.
@@ -37,7 +44,9 @@ pub(crate) struct CachedPoint {
 /// out and equal state ignores it.
 impl PartialEq for CachedPoint {
     fn eq(&self, other: &Self) -> bool {
-        self.local_a == other.local_a && self.impulse == other.impulse
+        self.local_a == other.local_a
+            && self.local_b == other.local_b
+            && self.impulse == other.impulse
     }
 }
 
@@ -49,6 +58,18 @@ pub(crate) struct CachedManifold {
     pub(crate) part_b: u32,
     pub(crate) points: [CachedPoint; MAX_CONTACTS],
     pub(crate) count: usize,
+    /// The normal in A axes, zero when these contacts may not be kept, as from an old snapshot.
+    pub(crate) normal: Vec3,
+    /// Where B was in A's axes, center and turn, when these contacts were found.
+    pub(crate) pose: (Vec3, Quat),
+}
+
+impl CachedManifold {
+    fn keeps(&self, (center, turn): (Vec3, Quat)) -> bool {
+        self.normal != Vec3::ZERO
+            && (center - self.pose.0).length_squared() < REUSE_DISTANCE_SQUARED
+            && turn.dot(self.pose.1).abs() > REUSE_HALF_TURN_COS
+    }
 }
 
 /// `arm_a[k]` is `offset_a × axes[k]`, `turn_a[k]` the spin of A per unit impulse along it.
@@ -103,6 +124,8 @@ pub(super) struct SolverManifold {
     /// Its points are `first..first + count` in the scratch point lists.
     pub(super) first: usize,
     pub(super) count: usize,
+    normal_a: Vec3,
+    pose: (Vec3, Quat),
 }
 
 /// What one job of contact finding made. `first` in its manifolds is local to it.
@@ -372,6 +395,7 @@ pub(crate) fn finish_contacts(
         for (out, (point, frame)) in points.iter_mut().zip(solved) {
             *out = CachedPoint {
                 local_a: frame.local_a,
+                local_b: frame.local_b,
                 impulse: point.impulse,
                 pushed: frame.pushed,
             };
@@ -383,6 +407,8 @@ pub(crate) fn finish_contacts(
             part_b: manifold.part_b,
             points,
             count: manifold.count,
+            normal: manifold.normal_a,
+            pose: manifold.pose,
         }
     };
     let merged = &mut spare.merged;
@@ -494,6 +520,22 @@ fn find_contacts(
         }
         let center_b = bodies.position(b).offset_from(bodies.position(a)).as_vec3();
         let (manifolds, points, frames) = (&mut out.manifolds, &mut out.points, &mut out.frames);
+        let pose = relative_pose(bodies, a, b, center_b);
+        let kept = kept_contacts(bodies, cache, (a, b), pose);
+        if !kept.is_empty() {
+            for old in kept {
+                manifolds.push(kept_manifold(
+                    bodies,
+                    state,
+                    old,
+                    (a, b),
+                    center_b,
+                    (&mut *points, &mut *frames),
+                    dt,
+                ));
+            }
+            continue;
+        }
         bodies.assets.for_each_contact(
             (&bodies.shape[a], bodies.rotation[a]),
             (&bodies.shape[b], bodies.rotation[b]),
@@ -518,6 +560,145 @@ fn find_contacts(
     }
 }
 
+/// Where B is in A's axes.
+fn relative_pose(bodies: &Bodies, a: usize, b: usize, center_b: Vec3) -> (Vec3, Quat) {
+    let back = bodies.rotation[a].conjugate();
+    (back.rotate_vec3(center_b), back * bodies.rotation[b])
+}
+
+/// The cached contacts of pair `a`, `b` when all of them may be kept as they are: the bodies
+/// barely moved against each other since they were found. Empty otherwise, or for a mesh, which
+/// a terrain edit changes under a still body.
+fn kept_contacts<'c>(
+    bodies: &Bodies,
+    cache: &'c [CachedManifold],
+    (a, b): (usize, usize),
+    pose: (Vec3, Quat),
+) -> &'c [CachedManifold] {
+    if matches!(bodies.shape[a], Shape::TriMesh(_)) || matches!(bodies.shape[b], Shape::TriMesh(_))
+    {
+        return &[];
+    }
+    let key = (bodies.handle_at(a), bodies.handle_at(b));
+    let start = cache.partition_point(|entry| (entry.a, entry.b) < key);
+    let end = start + cache[start..].partition_point(|entry| (entry.a, entry.b) == key);
+    let found = &cache[start..end];
+    if found.iter().all(|entry| entry.keeps(pose)) {
+        found
+    } else {
+        &[]
+    }
+}
+
+/// A cached manifold again, its points where they were on each body. Only the bounce is new.
+fn kept_manifold(
+    bodies: &Bodies,
+    state: &[Integrated],
+    old: &CachedManifold,
+    (a, b): (usize, usize),
+    center_b: Vec3,
+    (points, frames): (&mut Vec<SolverPoint>, &mut Vec<PointFrame>),
+    dt: f32,
+) -> SolverManifold {
+    let normal = bodies.rotation[a].rotate_vec3(old.normal);
+    let (manifold, contact) = new_manifold(
+        bodies,
+        (a, b),
+        (old.part_a, old.part_b),
+        normal,
+        (points.len(), old.count),
+    );
+    for cached in &old.points[..old.count] {
+        let offset_a = bodies.rotation[a].rotate_vec3(cached.local_a);
+        let offset_b = bodies.rotation[b].rotate_vec3(cached.local_b);
+        let depth = (offset_a - offset_b - center_b).dot(normal);
+        points.push(SolverPoint {
+            impulse: cached.impulse,
+            ..SolverPoint::default()
+        });
+        frames.push(PointFrame {
+            local_a: cached.local_a,
+            local_b: cached.local_b,
+            bounce: bounce(
+                state,
+                (a, b),
+                (offset_a, offset_b),
+                normal,
+                depth,
+                &contact,
+                dt,
+            ),
+            pushed: 0.0,
+        });
+    }
+    SolverManifold {
+        normal_a: old.normal,
+        pose: old.pose,
+        ..manifold
+    }
+}
+
+/// What a point bounces back at, if it reaches the other body this step fast enough.
+fn bounce(
+    state: &[Integrated],
+    (a, b): (usize, usize),
+    (offset_a, offset_b): (Vec3, Vec3),
+    normal: Vec3,
+    depth: f32,
+    contact: &Contact,
+    dt: f32,
+) -> f32 {
+    let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
+    let reaches = -approach * dt >= -depth;
+    if reaches && approach < -contact.bounce_threshold {
+        -contact.restitution * approach
+    } else {
+        0.0
+    }
+}
+
+/// A manifold's materials and axes, before its points.
+fn new_manifold(
+    bodies: &Bodies,
+    (a, b): (usize, usize),
+    (part_a, part_b): (u32, u32),
+    normal: Vec3,
+    (first, count): (usize, usize),
+) -> (SolverManifold, Contact) {
+    let tangent = tangent_of(normal);
+    let axes = [normal, tangent, normal.cross(tangent)];
+    let contact = Contact::of(
+        &part_material(bodies, a, part_a),
+        &part_material(bodies, b, part_b),
+    );
+    let manifold = SolverManifold {
+        a,
+        b,
+        handle_a: bodies.handle_at(a),
+        handle_b: bodies.handle_at(b),
+        part_a,
+        part_b,
+        axes,
+        friction: contact.friction,
+        static_friction: contact.static_friction,
+        surface: bodies.rotation[b].rotate_vec3(bodies.surface[b])
+            - bodies.rotation[a].rotate_vec3(bodies.surface[a]),
+        resist: [contact.spin, contact.rolling, contact.rolling],
+        resist_turn: [[Vec3::ZERO; 2]; 3],
+        resist_mass: [0.0; 3],
+        resist_impulse: [0.0; 3],
+        inverse_mass: [
+            dynamic_inverse_mass(bodies, a),
+            dynamic_inverse_mass(bodies, b),
+        ],
+        first,
+        count,
+        normal_a: bodies.rotation[a].conjugate().rotate_vec3(normal),
+        pose: (Vec3::ZERO, Quat::IDENTITY),
+    };
+    (manifold, contact)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn contact_manifold(
     bodies: &Bodies,
@@ -540,34 +721,16 @@ fn contact_manifold(
         .map(|at| &cache[at]);
 
     let normal = raw.normal;
-    let tangent = tangent_of(normal);
-    let axes = [normal, tangent, normal.cross(tangent)];
-    let contact = Contact::of(
-        &part_material(bodies, a, part_a),
-        &part_material(bodies, b, part_b),
+    let (manifold, contact) = new_manifold(
+        bodies,
+        (a, b),
+        (part_a, part_b),
+        normal,
+        (points.len(), raw.count),
     );
     let manifold = SolverManifold {
-        a,
-        b,
-        handle_a,
-        handle_b,
-        part_a,
-        part_b,
-        axes,
-        friction: contact.friction,
-        static_friction: contact.static_friction,
-        surface: bodies.rotation[b].rotate_vec3(bodies.surface[b])
-            - bodies.rotation[a].rotate_vec3(bodies.surface[a]),
-        resist: [contact.spin, contact.rolling, contact.rolling],
-        resist_turn: [[Vec3::ZERO; 2]; 3],
-        resist_mass: [0.0; 3],
-        resist_impulse: [0.0; 3],
-        inverse_mass: [
-            dynamic_inverse_mass(bodies, a),
-            dynamic_inverse_mass(bodies, b),
-        ],
-        first: points.len(),
-        count: raw.count,
+        pose: relative_pose(bodies, a, b, center_b),
+        ..manifold
     };
     let inverse_rotation_a = bodies.rotation[a].conjugate();
     let inverse_rotation_b = bodies.rotation[b].conjugate();
@@ -580,13 +743,15 @@ fn contact_manifold(
         let offset_b = middle - normal * (point.depth * 0.5) - center_b;
         let local_a = inverse_rotation_a.rotate_vec3(offset_a);
         let local_b = inverse_rotation_b.rotate_vec3(offset_b);
-        let approach = relative_velocity(state, a, b, offset_a, offset_b).dot(normal);
-        let reaches = -approach * dt >= -point.depth;
-        let bounce = if reaches && approach < -contact.bounce_threshold {
-            -contact.restitution * approach
-        } else {
-            0.0
-        };
+        let bounce = bounce(
+            state,
+            (a, b),
+            (offset_a, offset_b),
+            normal,
+            point.depth,
+            &contact,
+            dt,
+        );
         points.push(SolverPoint {
             impulse: matching_impulse(old, local_a, &mut claimed),
             ..SolverPoint::default()

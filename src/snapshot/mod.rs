@@ -12,7 +12,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 7;
+pub const SNAPSHOT_VERSION: u32 = 8;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -210,7 +210,11 @@ impl PhysicsWorld {
             for point in &manifold.points[..manifold.count] {
                 out.vec3(point.local_a);
                 out.vec3(point.impulse);
+                out.vec3(point.local_b);
             }
+            out.vec3(manifold.normal);
+            out.vec3(manifold.pose.0);
+            out.quat(manifold.pose.1);
         }
 
         out.len(self.joints.slots.len());

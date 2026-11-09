@@ -436,11 +436,33 @@ pub(super) fn read_contacts(
         for point in &mut points[..points_count] {
             point.local_a = reader.vec3()?;
             point.impulse = reader.vec3()?;
+            if reader.version >= 8 {
+                point.local_b = reader.vec3()?;
+            }
             // the normal impulse only ever pushes apart
-            if !point.local_a.is_finite() || !point.impulse.is_finite() || point.impulse.x < 0.0 {
+            if !point.local_a.is_finite()
+                || !point.local_b.is_finite()
+                || !point.impulse.is_finite()
+                || point.impulse.x < 0.0
+            {
                 return Err(SnapshotError::Invalid("contact"));
             }
         }
+        // older snapshots kept no normal, those contacts are found again
+        let (normal, pose) = if reader.version >= 8 {
+            let normal = reader.vec3()?;
+            let pose = (reader.vec3()?, reader.quat()?);
+            let unit = |length: f32| (length - 1.0).abs() < 1e-3;
+            if !pose.0.is_finite()
+                || !unit(pose.1.length())
+                || !(normal == Vec3::ZERO || unit(normal.length()))
+            {
+                return Err(SnapshotError::Invalid("contact"));
+            }
+            (normal, pose)
+        } else {
+            (Vec3::ZERO, (Vec3::ZERO, Quat::IDENTITY))
+        };
         cache.push(CachedManifold {
             a,
             b,
@@ -448,6 +470,8 @@ pub(super) fn read_contacts(
             part_b,
             points,
             count: points_count,
+            normal,
+            pose,
         });
     }
     Ok(cache)
