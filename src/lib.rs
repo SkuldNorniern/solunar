@@ -54,8 +54,8 @@ pub use fluid::{
     ShallowReport, ShallowSettings, ShallowWater, hand_off,
 };
 pub use fracture::{
-    BreakableDesc, BreakableHandle, FractureEvent, FractureMaterial, FracturePattern, Grain,
-    MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
+    BreakableDesc, BreakableHandle, Debris, FractureEvent, FractureMaterial, FracturePattern,
+    Grain, MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };
 pub use frame::{FrameDesc, FrameId, FrameMotion, FrameState, Frames, MAX_FRAME_DEPTH, Orbit};
 pub use gas::{CompartmentDesc, CompartmentId, MAX_COMPARTMENTS, OpeningDesc, OpeningId};

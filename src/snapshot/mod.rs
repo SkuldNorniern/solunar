@@ -14,7 +14,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 14;
+pub const SNAPSHOT_VERSION: u32 = 15;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 

@@ -291,6 +291,7 @@ impl PhysicsWorld {
         let shape = self.bodies.shape[self.bodies.dense_index(body)?];
         self.bodies.remove(body)?;
         self.free_owned(shape);
+        self.breakables.forget(body);
         self.wake_contacts_of(body);
         let attached: Vec<JointHandle> = self.joints.touching(body).collect();
         for joint in attached {

@@ -54,7 +54,38 @@ pub struct BreakableDesc {
     /// whose cracks run on and shatter it, low for wood.
     pub crack_spread: f32,
     pub grain: Option<Grain>,
+    /// What becomes of small pieces once they lie still, none for nothing.
+    pub debris: Option<Debris>,
 }
+
+/// Small broken pieces lying still turn fixed, so a pile stops costing anything and stops
+/// waking up each time something lands on it, and may go some time after. A hard hit still
+/// breaks them loose as it would a wall.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Debris {
+    /// A part this many cubic meters or less counts as debris.
+    pub volume: f32,
+    /// Seconds it must lie still before it turns fixed.
+    pub settle: f32,
+    /// Seconds fixed before it is taken out of the world, none to keep it.
+    pub remove: Option<f32>,
+}
+
+impl Debris {
+    fn is_valid(&self) -> bool {
+        let positive = |value: f32| value.is_finite() && value > 0.0;
+        positive(self.volume)
+            && self.settle.is_finite()
+            && self.settle >= 0.0
+            && self
+                .remove
+                .is_none_or(|after| after.is_finite() && after >= 0.0)
+    }
+}
+
+/// A part counts as lying still under these.
+const STILL_SPEED: f32 = 0.05;
+const STILL_SPIN: f32 = 0.5;
 
 /// A direction a material is stronger across than along, as wood's fibres.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +108,7 @@ impl BreakableDesc {
             strength: 2.0e6,
             crack_spread: 0.0,
             grain: None,
+            debris: None,
         }
     }
 
@@ -226,6 +258,8 @@ struct Piece {
     /// Where its middle is in the pattern.
     center: Vec3,
     anchored: bool,
+    /// Its body was taken out of the world, by the host or as debris.
+    gone: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,6 +279,9 @@ struct Group {
     pieces: Vec<u32>,
     /// How the body sits in the pattern, to get the pattern's place back from the body's.
     info: CompoundInfo,
+    /// Seconds a small part has lain still, and fixed since, for debris.
+    still: f32,
+    frozen: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +291,7 @@ pub(crate) struct Breakable {
     groups: Vec<Group>,
     material: Material,
     spread: f32,
+    debris: Option<Debris>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -261,6 +299,8 @@ pub(crate) struct Breakables {
     slots: Vec<Option<Breakable>>,
     generations: Vec<u32>,
     events: Vec<FractureEvent>,
+    /// Debris bodies the last step took out of the world.
+    removed: Vec<BodyHandle>,
     /// Velocities as the step started, while any breakable is there.
     pub(crate) before: Vec<Vec3>,
 }
@@ -268,6 +308,20 @@ pub(crate) struct Breakables {
 impl Breakables {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
+    }
+
+    /// `body` left the world: its group goes, its pieces are gone.
+    pub(crate) fn forget(&mut self, body: BodyHandle) {
+        for breakable in self.slots.iter_mut().flatten() {
+            let Some(at) = breakable.groups.iter().position(|group| group.body == body) else {
+                continue;
+            };
+            let group = breakable.groups.remove(at);
+            for piece in group.pieces {
+                breakable.pieces[piece as usize].gone = true;
+            }
+            return;
+        }
     }
 
     /// Whether `body` is a group of some breakable's pieces.
@@ -357,7 +411,7 @@ impl Breakable {
             save_info(out, &piece.info);
             out.f32(piece.volume);
             out.vec3(piece.center);
-            out.u8(u8::from(piece.anchored));
+            out.u8(u8::from(piece.anchored) | u8::from(piece.gone) << 1);
         }
         out.len(self.bonds.len());
         for bond in &self.bonds {
@@ -374,6 +428,17 @@ impl Breakable {
             out.len(group.pieces.len());
             for piece in &group.pieces {
                 out.u32(*piece);
+            }
+            out.f32(group.still);
+            out.f32(group.frozen.unwrap_or(-1.0));
+        }
+        match self.debris {
+            None => out.u8(0),
+            Some(debris) => {
+                out.u8(1);
+                out.f32(debris.volume);
+                out.f32(debris.settle);
+                out.f32(debris.remove.unwrap_or(-1.0));
             }
         }
     }
@@ -399,7 +464,11 @@ impl Breakable {
         for _ in 0..count {
             let info = load_info(reader)?;
             let (volume, center) = (reader.f32()?, reader.vec3()?);
-            let anchored = flag(reader.u8()?)?;
+            let flags = reader.u8()?;
+            if flags > 3 || (reader.version < 15 && flags > 1) {
+                return Err(invalid());
+            }
+            let (anchored, gone) = (flags & 1 == 1, flags & 2 == 2);
             if !matches!(info.shape, Shape::Convex(_))
                 || !volume.is_finite()
                 || volume <= 0.0
@@ -412,6 +481,7 @@ impl Breakable {
                 volume,
                 center,
                 anchored,
+                gone,
             });
         }
         let bonds_count = reader.count(17, MAX_CELLS * MAX_CELLS)?;
@@ -456,21 +526,57 @@ impl Breakable {
             if group_pieces.is_empty() || bodies.dense_index(body).is_err() {
                 return Err(invalid());
             }
+            let (still, frozen) = if reader.version >= 15 {
+                (reader.f32()?, reader.f32()?)
+            } else {
+                (0.0, -1.0)
+            };
+            if !still.is_finite() || still < 0.0 || !frozen.is_finite() {
+                return Err(invalid());
+            }
             groups.push(Group {
                 body,
                 pieces: group_pieces,
                 info,
+                still,
+                frozen: (frozen >= 0.0).then_some(frozen),
             });
         }
-        if placed.iter().any(|in_group| !in_group) {
+        // each piece in one group, or gone
+        if placed
+            .iter()
+            .zip(&pieces)
+            .any(|(in_group, piece)| *in_group == piece.gone)
+        {
             return Err(invalid());
         }
+        let debris = if reader.version >= 15 {
+            match reader.u8()? {
+                0 => None,
+                1 => {
+                    let (volume, settle, remove) = (reader.f32()?, reader.f32()?, reader.f32()?);
+                    let debris = Debris {
+                        volume,
+                        settle,
+                        remove: (remove >= 0.0).then_some(remove),
+                    };
+                    if !debris.is_valid() {
+                        return Err(invalid());
+                    }
+                    Some(debris)
+                }
+                _ => return Err(invalid()),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             pieces,
             bonds,
             groups,
             material,
             spread,
+            debris,
         })
     }
 }
@@ -504,6 +610,7 @@ impl PhysicsWorld {
             || desc.strength <= 0.0
             || !(0.0..=1.0).contains(&desc.crack_spread)
             || !grain_ok
+            || !desc.debris.is_none_or(|debris| debris.is_valid())
             || !(desc.anchored.is_empty() || desc.anchored.len() == count)
         {
             return Err(PhysicsError::InvalidShape);
@@ -530,6 +637,7 @@ impl PhysicsWorld {
                 volume: piece.volume,
                 center: piece.center,
                 anchored,
+                gone: false,
             });
         }
         let bonds = desc
@@ -550,6 +658,7 @@ impl PhysicsWorld {
             groups: Vec::new(),
             material: desc.material,
             spread: desc.crack_spread,
+            debris: desc.debris,
         };
         let all: Vec<u32> = (0..count as u32).collect();
         let kind = if desc.fixed {
@@ -592,6 +701,11 @@ impl PhysicsWorld {
     }
 
     /// Parts that broke off in the last step.
+    /// Debris bodies the last step took out of the world, for the host to drop what it drew.
+    pub fn removed_debris(&self) -> &[BodyHandle] {
+        &self.breakables.removed
+    }
+
     pub fn fracture_events(&self) -> &[FractureEvent] {
         &self.breakables.events
     }
@@ -640,7 +754,13 @@ impl PhysicsWorld {
             desc = desc.linear_velocity(linear).angular_velocity(angular);
         }
         let body = self.spawn(desc)?;
-        Ok(Group { body, pieces, info })
+        Ok(Group {
+            body,
+            pieces,
+            info,
+            still: 0.0,
+            frozen: None,
+        })
     }
 
     /// Velocities before the step, for parts that break off to take their share of a hit.
@@ -672,6 +792,7 @@ impl PhysicsWorld {
             .filter(|(dense, _)| *dense < self.bodies.len())
             .map(|(dense, velocity)| (self.bodies.handle_at(dense), *velocity))
             .collect();
+        self.breakables.removed.clear();
         let loads = self.piece_loads(dt);
         for (index, (force, hitter)) in loads.into_iter().enumerate() {
             let Some(mut breakable) = self.breakables.slots[index].take() else {
@@ -684,6 +805,66 @@ impl PhysicsWorld {
             let result = self.load_and_split(handle, &mut breakable, (&force, &hitter), &before);
             self.breakables.slots[index] = Some(breakable);
             result?;
+        }
+        self.settle_debris(dt)
+    }
+
+    /// Small parts lying still turn fixed after their rule's time, and are taken out after its
+    /// time more if it says so.
+    fn settle_debris(&mut self, dt: f32) -> Result<(), PhysicsError> {
+        let mut freeze = Vec::new();
+        let mut remove = Vec::new();
+        for breakable in self.breakables.slots.iter_mut().flatten() {
+            let Some(rule) = breakable.debris else {
+                continue;
+            };
+            for group in &mut breakable.groups {
+                let Ok(dense) = self.bodies.dense_index(group.body) else {
+                    continue;
+                };
+                if let Some(frozen) = group.frozen.as_mut() {
+                    *frozen += dt;
+                    if rule.remove.is_some_and(|after| *frozen >= after) {
+                        remove.push(group.body);
+                    }
+                    continue;
+                }
+                if self.bodies.kind[dense] != BodyKind::Dynamic {
+                    continue;
+                }
+                let volume: f32 = group
+                    .pieces
+                    .iter()
+                    .map(|piece| breakable.pieces[*piece as usize].volume)
+                    .sum();
+                let still = self.bodies.asleep[dense]
+                    || (self.bodies.linear[dense].length() < STILL_SPEED
+                        && self.bodies.angular[dense].length() < STILL_SPIN);
+                group.still = if volume <= rule.volume && still {
+                    group.still + dt
+                } else {
+                    0.0
+                };
+                if group.still >= rule.settle {
+                    group.frozen = Some(0.0);
+                    freeze.push(dense);
+                }
+            }
+        }
+        for dense in freeze {
+            let bodies = &mut self.bodies;
+            bodies.kind[dense] = BodyKind::Static;
+            bodies.inverse_mass[dense] = 0.0;
+            bodies.inverse_inertia[dense] = Vec3::ZERO;
+            bodies.linear[dense] = Vec3::ZERO;
+            bodies.angular[dense] = Vec3::ZERO;
+            bodies.momentum[dense] = Vec3::ZERO;
+            bodies.asleep[dense] = false;
+            self.recheck_sleepers = true;
+        }
+        for body in remove {
+            self.despawn(body)?;
+            self.breakables.removed.push(body);
         }
         Ok(())
     }
@@ -1260,6 +1441,74 @@ mod tests {
             .filter(|compound| compound.life != crate::compound::Life::Freed)
             .count();
         assert_eq!(live, held);
+    }
+
+    #[test]
+    fn still_debris_turns_fixed_then_goes_and_the_world_still_saves() {
+        let mut world = world();
+        let pattern = voronoi_box(Vec3::splat(0.5), 24, 5).unwrap();
+        let cube = world
+            .add_breakable(BreakableDesc {
+                strength: 2.0e5,
+                debris: Some(Debris {
+                    volume: 0.2,
+                    settle: 0.5,
+                    remove: Some(1.0),
+                }),
+                material: Material {
+                    density: 2500.0,
+                    ..Material::default()
+                },
+                ..BreakableDesc::new(pattern, at(0.0, 4.0, 0.0))
+            })
+            .unwrap();
+        let (mut froze, mut gone) = (0, Vec::new());
+        for _ in 0..60 * 8 {
+            world.step_fixed().unwrap();
+            gone.extend_from_slice(world.removed_debris());
+            froze = froze.max(
+                world
+                    .breakable_bodies(cube)
+                    .iter()
+                    .filter(|body| world.body_state(**body).unwrap().kind == BodyKind::Static)
+                    .count(),
+            );
+        }
+        assert!(world.breakable_bodies(cube).len() < 24, "it broke");
+        assert!(froze > 0, "small pieces froze");
+        assert!(!gone.is_empty(), "and went");
+        assert!(gone.iter().all(|body| world.body_state(*body).is_err()));
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+        let bad = Debris {
+            volume: 0.0,
+            settle: 1.0,
+            remove: None,
+        };
+        let mut desc = BreakableDesc::new(
+            voronoi_box(Vec3::splat(0.5), 8, 1).unwrap(),
+            at(5.0, 1.0, 0.0),
+        );
+        desc.debris = Some(bad);
+        assert!(world.add_breakable(desc).is_err());
+    }
+
+    #[test]
+    fn a_piece_the_host_takes_away_leaves_a_world_that_still_saves() {
+        let (mut world, cube) = world_with_cube(4.0, 2.0e5);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        let bodies = world.breakable_bodies(cube);
+        assert!(bodies.len() > 1);
+        world.despawn(bodies[0]).unwrap();
+        assert_eq!(world.breakable_bodies(cube).len(), bodies.len() - 1);
+        let mut loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+            loaded.step_fixed().unwrap();
+        }
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
     }
 
     #[test]
