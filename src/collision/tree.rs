@@ -102,6 +102,11 @@ impl TreeCache {
         Self(OnceLock::from(QueryTree::build(bodies, usize::MAX)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_built(&self) -> bool {
+        self.0.get().is_some()
+    }
+
     /// Bodies moved, came or went.
     pub(crate) fn clear(&mut self) {
         self.0 = OnceLock::new();

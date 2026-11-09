@@ -848,7 +848,15 @@ impl PhysicsWorld {
                 return Err(error);
             }
         }
-        self.bodies.tree.clear();
+        // the query tree stays while nothing moved, a sleeping world keeps it from step to step
+        let moved = self.scratch.iter().enumerate().any(|(dense, result)| {
+            result.position.cell != self.bodies.cell[dense]
+                || result.position.local != self.bodies.local[dense]
+                || result.rotation != self.bodies.rotation[dense]
+        });
+        if moved {
+            self.bodies.tree.clear();
+        }
         for (dense, result) in self.scratch.iter().enumerate() {
             self.bodies.cell[dense] = result.position.cell;
             self.bodies.local[dense] = result.position.local;

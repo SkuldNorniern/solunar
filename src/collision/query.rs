@@ -1506,6 +1506,55 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_outlives_steps_where_nothing_moved() {
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        world
+            .spawn(RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(
+                20.0, 1.0, 20.0,
+            ))))
+            .unwrap();
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.5)).local_position(Vec3::new(0.0, 4.0, 0.0)),
+            )
+            .unwrap();
+        let down = Ray {
+            origin: GridPosition::from_local(Vec3::new(0.0, 10.0, 0.0)).unwrap(),
+            direction: Vec3::NEG_Y,
+            max_distance: 20.0,
+        };
+        let filter = QueryFilter::default();
+        // falling: every step moves it, each ray sees where it is now
+        for _ in 0..20 {
+            world.step_fixed().unwrap();
+            let hit = world.raycast(&down, &filter).unwrap().unwrap();
+            let top = world.body_state(ball).unwrap().position.to_dvec3().y as f32 + 0.5;
+            assert!((10.0 - hit.distance - top).abs() < 1e-3);
+        }
+        for _ in 0..600 {
+            world.step_fixed().unwrap();
+        }
+        assert!(world.body_state(ball).unwrap().asleep);
+        world.raycast(&down, &filter).unwrap();
+        world.step_fixed().unwrap();
+        assert!(world.bodies.tree.is_built(), "asleep, nothing moved");
+        world
+            .apply_impulse(ball, Vec3::new(0.0, 3000.0, 0.0))
+            .unwrap();
+        let mut moved = false;
+        for _ in 0..3 {
+            let before = world.body_state(ball).unwrap().position;
+            world.raycast(&down, &filter).unwrap();
+            world.step_fixed().unwrap();
+            if world.body_state(ball).unwrap().position != before {
+                moved = true;
+                assert!(!world.bodies.tree.is_built(), "woken and moved");
+            }
+        }
+        assert!(moved);
+    }
+
+    #[test]
     fn tree_answers_like_a_full_scan() {
         let mut state = 0x2468_ace0_1357_9bdf_u64;
         let mut next = move || {
