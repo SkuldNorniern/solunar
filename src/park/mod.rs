@@ -1,45 +1,275 @@
 use algebrix::{DQuat, DVec3};
 
 use crate::body::{BodyHandle, BodyKind, RigidBodyDesc};
-use crate::compound::CompoundChild;
 use crate::error::PhysicsError;
 use crate::frame::{FrameId, FrameState};
 use crate::gravity::GravityId;
 use crate::orbit::Coast;
 use crate::position::GridPosition;
-use crate::shape::Shape;
+use crate::snapshot::{Reader, SnapshotError, Writer};
+use crate::structure::{Link, MAX_LINKS, StructureHandle};
 use crate::world::PhysicsWorld;
 
-/// A body taken out of the world, coasting round a gravity source until it is put back: a
-/// satellite nobody is near, worked out as an orbit rather than stepped. The host owns it and
-/// decides when it goes out and comes back. Its turning is kept as it was, torque free.
+mod stored;
+
+use stored::{Geometry, load_geometry, save_geometry};
+
+const MAGIC: [u8; 4] = *b"SLPK";
+const STAND_IN: crate::Shape = crate::Shape::Sphere { radius: 1.0 };
+/// Version of [`Parked::to_bytes`].
+pub const PARKED_VERSION: u32 = 1;
+
+/// A body taken out of the world, kept small until it is wanted again: a satellite nobody is
+/// near coasting round a planet, a ship left at a far station held where it is. It keeps its
+/// shape as it is, not as an id, so it goes back into any world with the same frames and
+/// gravity, and its structure with the strain and damage it had. The host owns it, keeps it as
+/// bytes if it likes, and decides when it comes back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parked {
     desc: RigidBodyDesc,
-    /// A compound the world made for the body, made again when it comes back.
-    children: Option<Vec<CompoundChild>>,
-    source: GravityId,
-    /// Round the source's center, in the root, from `since`.
-    coast: Coast,
-    since: f64,
-    /// The body's turn in the root and how it turns, at `since`.
-    rotation: DQuat,
-    spin: DVec3,
+    geometry: Geometry,
+    motion: Motion,
+    links: Option<Vec<Link>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Motion {
+    /// Where it was in its frame and how it moved, as it was.
+    Held,
+    /// Round a source's center in the root from world time `since`, turning torque free.
+    Coasting {
+        source: GravityId,
+        coast: Coast,
+        since: f64,
+        rotation: DQuat,
+        spin: DVec3,
+    },
+}
+
+/// A parked body back in the world: its new handle, and its structure's if it had one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unparked {
+    pub body: BodyHandle,
+    pub structure: Option<StructureHandle>,
 }
 
 impl Parked {
-    pub fn source(&self) -> GravityId {
-        self.source
+    /// The coast it is on, none for one held where it is.
+    pub fn coast(&self) -> Option<&Coast> {
+        match &self.motion {
+            Motion::Coasting { coast, .. } => Some(coast),
+            Motion::Held => None,
+        }
     }
 
-    /// Its coast round the source's center in root axes, time 0 when it was parked.
-    pub fn coast(&self) -> &Coast {
-        &self.coast
+    /// World seconds it started coasting at, none for one held.
+    pub fn since(&self) -> Option<f64> {
+        match self.motion {
+            Motion::Coasting { since, .. } => Some(since),
+            Motion::Held => None,
+        }
     }
 
-    /// World seconds it was parked at.
-    pub fn since(&self) -> f64 {
-        self.since
+    pub fn source(&self) -> Option<GravityId> {
+        match self.motion {
+            Motion::Coasting { source, .. } => Some(source),
+            Motion::Held => None,
+        }
+    }
+
+    /// The links it carries, numbered by its parts.
+    pub fn links(&self) -> Option<&[Link]> {
+        self.links.as_deref()
+    }
+
+    /// As bytes for keeping, with a version and a checksum.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Writer::with_capacity(256);
+        out.bytes(&MAGIC);
+        out.u32(PARKED_VERSION);
+        let desc = &self.desc;
+        out.u32(desc.frame.index());
+        out.material(&desc.material);
+        out.u32(desc.filter.layers);
+        out.u32(desc.filter.mask);
+        out.u8(u8::from(desc.can_sleep));
+        out.vec3(desc.surface_velocity);
+        out.position(desc.position);
+        out.quat(desc.rotation);
+        out.vec3(desc.linear_velocity);
+        out.vec3(desc.angular_velocity);
+        save_geometry(&mut out, &self.geometry);
+        match self.motion {
+            Motion::Held => out.u8(0),
+            Motion::Coasting {
+                source,
+                coast,
+                since,
+                rotation,
+                spin,
+            } => {
+                out.u8(1);
+                out.u32(source.0);
+                out.f64(coast.mu);
+                out.dvec3(coast.position);
+                out.dvec3(coast.velocity);
+                out.f64(since);
+                for value in [rotation.x, rotation.y, rotation.z, rotation.w] {
+                    out.f64(value);
+                }
+                out.dvec3(spin);
+            }
+        }
+        match &self.links {
+            None => out.u8(0),
+            Some(links) => {
+                out.u8(1);
+                out.len(links.len());
+                for link in links {
+                    out.u32(link.a);
+                    out.u32(link.b);
+                    for value in [link.strength, link.load, link.strain, link.damage] {
+                        out.f32(value);
+                    }
+                    out.u8(u8::from(link.broken));
+                }
+            }
+        }
+        let sum = crate::snapshot::fnv1a(&out.data);
+        out.u64(sum);
+        out.data
+    }
+
+    /// # Errors
+    /// Fails on bytes that are short, corrupt, of another version or out of range.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let bad = SnapshotError::Invalid("parked");
+        if bytes.len() < 16 || bytes[..4] != MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        let (body, sum) = bytes.split_at(bytes.len() - 8);
+        if crate::snapshot::fnv1a(body) != u64::from_le_bytes(sum.try_into().map_err(|_| bad)?) {
+            return Err(SnapshotError::BadChecksum);
+        }
+        let mut reader = Reader {
+            data: body,
+            at: 4,
+            version: 0,
+        };
+        let version = reader.u32()?;
+        if version != PARKED_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        reader.version = crate::snapshot::SNAPSHOT_VERSION;
+        let frame = FrameId(reader.u32()?);
+        let material = reader.material()?;
+        let filter = crate::CollisionFilter {
+            layers: reader.u32()?,
+            mask: reader.u32()?,
+        };
+        let can_sleep = match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad),
+        };
+        let surface_velocity = reader.vec3()?;
+        let position = reader.position()?;
+        let rotation = reader.quat()?;
+        if (rotation.length() - 1.0).abs() >= 1e-3 || rotation.length().is_nan() {
+            return Err(bad);
+        }
+        let (linear_velocity, angular_velocity) = (reader.vec3()?, reader.vec3()?);
+        let geometry = load_geometry(&mut reader)?;
+        let motion = match reader.u8()? {
+            0 => Motion::Held,
+            1 => {
+                let source = GravityId(reader.u32()?);
+                let mu = reader.f64()?;
+                let (start, speed) = (reader.dvec3()?, reader.dvec3()?);
+                let since = reader.f64()?;
+                let turn = DQuat::new(reader.f64()?, reader.f64()?, reader.f64()?, reader.f64()?);
+                let spin = reader.dvec3()?;
+                let coast = Coast::new(mu, start, speed).ok_or(bad)?;
+                let finite = |v: DVec3| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+                let length =
+                    (turn.x * turn.x + turn.y * turn.y + turn.z * turn.z + turn.w * turn.w).sqrt();
+                if !since.is_finite()
+                    || !finite(spin)
+                    || (length - 1.0).abs() >= 1e-3
+                    || length.is_nan()
+                {
+                    return Err(bad);
+                }
+                Motion::Coasting {
+                    source,
+                    coast,
+                    since,
+                    rotation: turn,
+                    spin,
+                }
+            }
+            _ => return Err(bad),
+        };
+        let links = match reader.u8()? {
+            0 => None,
+            1 => {
+                let count = reader.count(25, MAX_LINKS)?;
+                let mut links = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (a, b) = (reader.u32()?, reader.u32()?);
+                    let (strength, load, strain, damage) =
+                        (reader.f32()?, reader.f32()?, reader.f32()?, reader.f32()?);
+                    let broken = match reader.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(bad),
+                    };
+                    let positive = strength.is_finite() && strength > 0.0;
+                    if a == b
+                        || !positive
+                        || !load.is_finite()
+                        || !strain.is_finite()
+                        || !(0.0..=1.0).contains(&damage)
+                    {
+                        return Err(bad);
+                    }
+                    links.push(Link {
+                        a,
+                        b,
+                        strength,
+                        load,
+                        strain,
+                        damage,
+                        broken,
+                    });
+                }
+                Some(links)
+            }
+            _ => return Err(bad),
+        };
+        if reader.at != reader.data.len()
+            || !linear_velocity.is_finite()
+            || !angular_velocity.is_finite()
+            || !surface_velocity.is_finite()
+        {
+            return Err(bad);
+        }
+        let mut desc = RigidBodyDesc::new(BodyKind::Dynamic, STAND_IN)
+            .material(material)
+            .position(position)
+            .rotation(rotation)
+            .linear_velocity(linear_velocity)
+            .angular_velocity(angular_velocity);
+        desc.frame = frame;
+        desc.filter = filter;
+        desc.can_sleep = can_sleep;
+        desc.surface_velocity = surface_velocity;
+        Ok(Self {
+            desc,
+            geometry,
+            motion,
+            links,
+        })
     }
 }
 
@@ -48,19 +278,8 @@ impl PhysicsWorld {
     /// and how it moves now. Between steps.
     ///
     /// # Errors
-    /// Fails on a stale handle, an unknown source, a body that is not dynamic, has joints or
-    /// that a breakable owns.
+    /// As [`Self::hold`], and on an unknown source.
     pub fn park(&mut self, body: BodyHandle, source: GravityId) -> Result<Parked, PhysicsError> {
-        let dense = self.bodies.dense_index(body)?;
-        if self.bodies.kind[dense] != BodyKind::Dynamic {
-            return Err(PhysicsError::NotDynamic);
-        }
-        if self.joints.touching(body).next().is_some() {
-            return Err(PhysicsError::BodyHasJoints);
-        }
-        if self.breakables.holds(body) || self.structures.holds(body) {
-            return Err(PhysicsError::ShapeInUse);
-        }
         let pull = *self
             .gravity_source(source)
             .ok_or(PhysicsError::InvalidSettings)?;
@@ -82,84 +301,127 @@ impl PhysicsWorld {
             root.linear_velocity - moving,
         )
         .ok_or(PhysicsError::OutOfRange)?;
+        self.take_out(
+            body,
+            Motion::Coasting {
+                source,
+                coast,
+                since: time,
+                rotation: root.rotation,
+                spin: root.angular_velocity,
+            },
+        )
+    }
+
+    /// Takes a dynamic `body` out of the world, held where it is in its frame and moving as it
+    /// moves: a ship at a station, a wreck on a moon. It comes back just so, however long it was
+    /// away. Between steps.
+    ///
+    /// # Errors
+    /// Fails on a stale handle, a body that is not dynamic, has joints, is a mesh or a
+    /// breakable owns.
+    pub fn hold(&mut self, body: BodyHandle) -> Result<Parked, PhysicsError> {
+        self.take_out(body, Motion::Held)
+    }
+
+    fn take_out(&mut self, body: BodyHandle, motion: Motion) -> Result<Parked, PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        if self.bodies.kind[dense] != BodyKind::Dynamic {
+            return Err(PhysicsError::NotDynamic);
+        }
+        if self.joints.touching(body).next().is_some() {
+            return Err(PhysicsError::BodyHasJoints);
+        }
+        if self.breakables.holds(body) {
+            return Err(PhysicsError::ShapeInUse);
+        }
         let shape = self.bodies.shape[dense];
-        let children = match shape {
-            Shape::Compound(id)
-                if self
-                    .bodies
-                    .assets
-                    .compound(id)
-                    .is_some_and(|compound| compound.life == crate::compound::Life::Engine) =>
-            {
-                Some(self.compound_children(body)?)
-            }
-            _ => None,
-        };
-        let mut desc =
-            RigidBodyDesc::new(BodyKind::Dynamic, shape).material(self.bodies.material[dense]);
+        let geometry = self.store_geometry(&shape)?;
+        let state = self.body_state(body)?;
+        // the shape lives in the geometry, the desc's is a stand in until it is built again
+        let mut desc = RigidBodyDesc::new(BodyKind::Dynamic, STAND_IN)
+            .material(self.bodies.material[dense])
+            .position(state.position)
+            .rotation(state.rotation)
+            .linear_velocity(state.linear_velocity)
+            .angular_velocity(state.angular_velocity);
         desc.frame = state.frame;
         desc.filter = self.bodies.filter[dense];
         desc.can_sleep = self.bodies.can_sleep[dense];
         desc.surface_velocity = self.bodies.surface[dense];
+        let links = self.structures.take(body);
         self.despawn(body)?;
         Ok(Parked {
             desc,
-            children,
-            source,
-            coast,
-            since: time,
-            rotation: root.rotation,
-            spin: root.angular_velocity,
+            geometry,
+            motion,
+            links,
         })
     }
 
-    /// Puts `parked` back where its coast has taken it by now, in the frame it left. A new
-    /// handle. Between steps.
+    /// Puts `parked` back: where its coast has taken it by now, or where it was held, in the
+    /// frame it left, with its structure. A new handle. Between steps.
     ///
     /// # Errors
-    /// Fails when its source is gone, or the world refuses the body.
-    pub fn unpark(&mut self, parked: &Parked) -> Result<BodyHandle, PhysicsError> {
-        let pull = *self
-            .gravity_source(parked.source)
-            .ok_or(PhysicsError::InvalidSettings)?;
-        let time = self.frames.time();
-        let elapsed = time - parked.since;
-        let (position, velocity) = parked.coast.state_at(elapsed);
-        let (center, moving) = self.source_in_root(pull.frame, pull.center, time);
-        let rate = parked.spin.length();
-        let rotation = if rate > 0.0 {
-            (DQuat::from_axis_angle(parked.spin / rate, rate * elapsed) * parked.rotation)
-                .normalize()
-        } else {
-            parked.rotation
-        };
-        let local = self.frames.from_root(
-            parked.desc.frame,
-            FrameState {
-                position: center + position,
-                rotation,
-                linear_velocity: moving + velocity,
-                angular_velocity: parked.spin,
-            },
-        )?;
+    /// Fails when its source or frame is gone, or the world refuses the body or its parts.
+    pub fn unpark(&mut self, parked: &Parked) -> Result<Unparked, PhysicsError> {
         let mut desc = parked.desc;
-        let mut at = local.position;
-        let mut turn = local.rotation.as_quat().normalize();
-        if let Some(children) = &parked.children {
-            let info = self.add_owned_compound(children)?;
-            desc.shape = info.shape;
-            at += DVec3::from_vec3(turn.rotate_vec3(info.center));
-            turn = (turn * info.axes).normalize();
+        if let Motion::Coasting {
+            source,
+            coast,
+            since,
+            rotation,
+            spin,
+        } = parked.motion
+        {
+            let pull = *self
+                .gravity_source(source)
+                .ok_or(PhysicsError::InvalidSettings)?;
+            let time = self.frames.time();
+            let elapsed = time - since;
+            let (position, velocity) = coast.state_at(elapsed);
+            let (center, moving) = self.source_in_root(pull.frame, pull.center, time);
+            let rate = spin.length();
+            let turned = if rate > 0.0 {
+                (DQuat::from_axis_angle(spin / rate, rate * elapsed) * rotation).normalize()
+            } else {
+                rotation
+            };
+            let local = self.frames.from_root(
+                desc.frame,
+                FrameState {
+                    position: center + position,
+                    rotation: turned,
+                    linear_velocity: moving + velocity,
+                    angular_velocity: spin,
+                },
+            )?;
+            desc.position =
+                GridPosition::from_dvec3(local.position).ok_or(PhysicsError::OutOfRange)?;
+            desc.rotation = local.rotation.as_quat().normalize();
+            desc.linear_velocity = local.linear_velocity.as_vec3();
+            desc.angular_velocity = local.angular_velocity.as_vec3();
         }
-        desc.position = GridPosition::from_dvec3(at).ok_or(PhysicsError::OutOfRange)?;
-        desc.rotation = turn;
-        desc.linear_velocity = local.linear_velocity.as_vec3();
-        desc.angular_velocity = local.angular_velocity.as_vec3();
-        let made = self.spawn(desc);
-        if made.is_err() {
-            self.free_owned(desc.shape);
-        }
-        made
+        self.frames.get(desc.frame)?;
+        let (shape, center, axes) = self.restore_geometry(&parked.geometry)?;
+        desc.shape = shape;
+        desc.position = desc
+            .position
+            .shifted(DVec3::from_vec3(desc.rotation.rotate_vec3(center)))
+            .ok_or(PhysicsError::OutOfRange)?;
+        desc.rotation = (desc.rotation * axes).normalize();
+        let body = match self.spawn(desc) {
+            Ok(body) => body,
+            Err(error) => {
+                self.free_owned(shape);
+                return Err(error);
+            }
+        };
+        let structure = match &parked.links {
+            Some(links) => Some(self.restore_structure(body, links.clone())?),
+            None => None,
+        };
+        Ok(Unparked { body, structure })
     }
 
     /// Where a point standing in `frame` is in the root at `time`, and how fast it goes there.
@@ -180,7 +442,8 @@ mod tests {
     use crate::frame::{FrameDesc, FrameMotion};
     use crate::gravity::GravitySource;
     use crate::world::testing::no_gravity;
-    use algebrix::Vec3;
+    use crate::{RigidBodyDesc, Shape};
+    use algebrix::{Quat, Vec3};
 
     /// A small planet, a minute a turn at 100 m, and a ball going round it.
     fn orbiting(world: &mut PhysicsWorld, frame: FrameId) -> (GravityId, BodyHandle, f64) {
@@ -216,7 +479,7 @@ mod tests {
             stayed.step_fixed().unwrap();
             parked_world.step_fixed().unwrap();
         }
-        let back = parked_world.unpark(&parked).unwrap();
+        let back = parked_world.unpark(&parked).unwrap().body;
         // the coast is exact, the stepped one has the integrator's error: well under a meter
         let gap = (at(&parked_world, back) - at(&stayed, kept)).length();
         assert!(gap < 0.5, "{gap}");
@@ -246,17 +509,18 @@ mod tests {
         // its speed was given in the turning frame: the turning adds 50 m/s in the root, and it
         // leaves the planet on a hyperbola
         let parked = world.park(body, source).unwrap();
-        assert!((parked.coast().velocity.length() - (50.0 + 10.47)).abs() < 0.1);
-        assert!(parked.coast().period().is_none());
+        assert!((parked.coast().unwrap().velocity.length() - (50.0 + 10.47)).abs() < 0.1);
+        assert!(parked.coast().unwrap().period().is_none());
         for _ in 0..(period * 60.0 * 0.25) as usize {
             world.step_fixed().unwrap();
         }
-        let back = world.unpark(&parked).unwrap();
+        let back = world.unpark(&parked).unwrap().body;
         let state = world.body_state(back).unwrap();
         assert_eq!(state.frame, planet);
         let (expected, _) = parked
             .coast()
-            .state_at(world.frames().time() - parked.since());
+            .unwrap()
+            .state_at(world.frames().time() - parked.since().unwrap());
         let root = world
             .frames()
             .to_root(
@@ -304,7 +568,7 @@ mod tests {
         };
         let before = mass(&world, ship);
         let parked = world.park(ship, source).unwrap();
-        let back = world.unpark(&parked).unwrap();
+        let back = world.unpark(&parked).unwrap().body;
         assert!((mass(&world, back) - before).abs() < 1e-3);
         assert_eq!(world.compound_children(back).unwrap().len(), 2);
         let fixed = world
@@ -316,5 +580,119 @@ mod tests {
         assert!(world.park(ball, GravityId(99)).is_err());
         world.remove_gravity(source);
         assert!(world.unpark(&parked).is_err());
+    }
+
+    #[test]
+    fn a_held_ship_comes_back_where_it_was_with_its_structure() {
+        let mut world = no_gravity();
+        let parts: Vec<CompoundChild> = (0..3)
+            .map(|index| {
+                CompoundChild::new(
+                    Shape::cuboid(Vec3::splat(0.5)),
+                    Vec3::new(index as f32, 0.0, 0.0),
+                )
+            })
+            .collect();
+        let info = world.add_compound(&parts).unwrap();
+        let (center, turn) = info.placed(Vec3::new(3.0, 2.0, 1.0), Quat::from_rotation_y(0.3));
+        let ship = world
+            .spawn(
+                RigidBodyDesc::dynamic(info.shape)
+                    .local_position(center)
+                    .rotation(turn),
+            )
+            .unwrap();
+        let link = |a, b| crate::LinkDesc {
+            a,
+            b,
+            strength: 1.0e5,
+        };
+        let structure = world
+            .add_structure(ship, &[link(0, 1), link(1, 2)])
+            .unwrap();
+        world.break_link(structure, 1).unwrap();
+        let before = world.body_state(ship).unwrap();
+        let parked = world.hold(ship).unwrap();
+        assert!(parked.coast().is_none());
+        assert_eq!(parked.links().unwrap().len(), 2);
+        assert!(
+            world.structure_links(structure).is_err(),
+            "its only body left"
+        );
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+        }
+        let back = world.unpark(&parked).unwrap();
+        let after = world.body_state(back.body).unwrap();
+        assert!((after.position.to_dvec3() - before.position.to_dvec3()).length() < 1e-4);
+        assert!((after.rotation.dot(before.rotation)).abs() > 1.0 - 1e-5);
+        let links = world.structure_links(back.structure.unwrap()).unwrap();
+        assert_eq!(links.iter().filter(|link| link.broken).count(), 1);
+        // the next step splits it where its link was broken before it went
+        world.step_fixed().unwrap();
+        assert_eq!(
+            world
+                .structure_bodies(back.structure.unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn as_bytes_it_goes_into_a_new_world_and_bad_bytes_are_refused() {
+        let mut world = no_gravity();
+        let (source, ball, _) = orbiting(&mut world, FrameId::ROOT);
+        // a hull, which the new world has never seen
+        let points = [
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(-0.5, 0.0, 0.0),
+            Vec3::new(0.0, 0.7, 0.0),
+            Vec3::new(0.0, 0.0, 0.6),
+            Vec3::new(0.1, -0.4, -0.3),
+        ];
+        let hull = world.add_convex(&points).unwrap();
+        let (place, turn) = hull.placed(Vec3::new(0.0, 100.0, 0.0), Quat::IDENTITY);
+        let rock = world
+            .spawn(
+                RigidBodyDesc::dynamic(hull.shape)
+                    .local_position(place)
+                    .rotation(turn)
+                    .linear_velocity(Vec3::new(10.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        let mass = world.bodies.inverse_mass[world.bodies.dense_index(rock).unwrap()].recip();
+        let parked = world.park(rock, source).unwrap();
+        let bytes = parked.to_bytes();
+        let again = Parked::from_bytes(&bytes).unwrap();
+        assert_eq!(again, parked);
+        // a new world with the same pull: the rock comes back on its coast
+        let mut other = no_gravity();
+        let _ = orbiting(&mut other, FrameId::ROOT);
+        let back = other.unpark(&again).unwrap().body;
+        let dense = other.bodies.dense_index(back).unwrap();
+        assert!((other.bodies.inverse_mass[dense].recip() - mass).abs() < 1e-3 * mass);
+        let at = other.body_state(back).unwrap().position.to_dvec3();
+        assert!((at - DVec3::from_vec3(place)).length() < 1e-3, "{at:?}");
+        let _ = ball;
+        // broken bytes fail, never panic
+        let mut seed = 0x1234_5678_u32;
+        for _ in 0..2_000 {
+            let mut broken = bytes.clone();
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let at = (seed as usize >> 4) % broken.len();
+            broken[at] ^= 1 + (seed as u8 >> 1);
+            let _ = Parked::from_bytes(&broken);
+        }
+        assert!(Parked::from_bytes(&bytes[..bytes.len() - 3]).is_err());
+        let mut later = bytes.clone();
+        later[4..8].copy_from_slice(&(PARKED_VERSION + 1).to_le_bytes());
+        let body = later.len() - 8;
+        let sum = crate::snapshot::fnv1a(&later[..body]);
+        later[body..].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(
+            Parked::from_bytes(&later),
+            Err(SnapshotError::UnsupportedVersion(PARKED_VERSION + 1))
+        );
     }
 }

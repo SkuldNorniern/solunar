@@ -67,7 +67,7 @@ pub use joint::{
 };
 pub use material::{Combine, Material};
 pub use orbit::{Coast, leapfrog, propagate};
-pub use park::Parked;
+pub use park::{PARKED_VERSION, Parked, Unparked};
 pub use planet::{
     Climate, ClimateDesc, MAX_LEVEL, Planet, PlanetDesc, PlanetFrames, PlanetGround,
     SECONDS_PER_YEAR, TileKey, direction, face_of, level_at, level_for,

@@ -100,6 +100,40 @@ impl Structures {
             .any(|structure| structure.groups.iter().any(|group| group.body == body))
     }
 
+    /// Takes `body`'s part out of whatever structure holds it: its links among its own parts,
+    /// numbered by its compound's children, and their state. Links from its parts to the parts
+    /// left behind break. A structure left with no body goes.
+    pub(crate) fn take(&mut self, body: BodyHandle) -> Option<Vec<Link>> {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let Some(structure) = slot else {
+                continue;
+            };
+            let Some(at) = structure.groups.iter().position(|group| group.body == body) else {
+                continue;
+            };
+            let group = structure.groups.remove(at);
+            let local = |id: u32| group.parts.iter().position(|part| *part == id);
+            let mut taken = Vec::new();
+            for link in &mut structure.links {
+                match (local(link.a), local(link.b)) {
+                    (Some(a), Some(b)) => taken.push(Link {
+                        a: a as u32,
+                        b: b as u32,
+                        ..*link
+                    }),
+                    (Some(_), None) | (None, Some(_)) => link.broken = true,
+                    (None, None) => {}
+                }
+            }
+            if structure.groups.is_empty() {
+                *slot = None;
+                self.generations[index] = self.generations[index].wrapping_add(1);
+            }
+            return Some(taken);
+        }
+        None
+    }
+
     pub(crate) fn save(&self, out: &mut Writer) {
         out.len(self.slots.len());
         for (slot, generation) in self.slots.iter().zip(&self.generations) {
@@ -266,6 +300,27 @@ impl PhysicsWorld {
             index: index as u32,
             generation: structures.generations[index],
         })
+    }
+
+    /// A structure on `body` from links as they stood, strain and damage kept.
+    pub(crate) fn restore_structure(
+        &mut self,
+        body: BodyHandle,
+        links: Vec<Link>,
+    ) -> Result<StructureHandle, PhysicsError> {
+        let descs: Vec<LinkDesc> = links
+            .iter()
+            .map(|link| LinkDesc {
+                a: link.a,
+                b: link.b,
+                strength: link.strength,
+            })
+            .collect();
+        let handle = self.add_structure(body, &descs)?;
+        if let Some(Some(held)) = self.structures.slots.get_mut(handle.index as usize) {
+            held.links = links;
+        }
+        Ok(handle)
     }
 
     /// Ends `structure`, its bodies keep going as they are.

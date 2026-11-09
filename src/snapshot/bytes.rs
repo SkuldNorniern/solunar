@@ -68,7 +68,7 @@ impl Writer {
         self.f64(value.z);
     }
 
-    pub(super) fn position(&mut self, value: GridPosition) {
+    pub(crate) fn position(&mut self, value: GridPosition) {
         self.i32(value.cell.x);
         self.i32(value.cell.y);
         self.i32(value.cell.z);
@@ -157,7 +157,7 @@ impl Reader<'_> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
 
-    pub(super) fn position(&mut self) -> Result<GridPosition, SnapshotError> {
+    pub(crate) fn position(&mut self) -> Result<GridPosition, SnapshotError> {
         let cell = IVec3::new(self.i32()?, self.i32()?, self.i32()?);
         let position = GridPosition {
             cell,
@@ -176,7 +176,7 @@ impl Reader<'_> {
         })
     }
 
-    pub(super) fn quat(&mut self) -> Result<Quat, SnapshotError> {
+    pub(crate) fn quat(&mut self) -> Result<Quat, SnapshotError> {
         Ok(Quat::new(
             self.f32()?,
             self.f32()?,
