@@ -6,11 +6,13 @@ use algebrix::{DVec3, Quat, Vec3};
 
 pub use voronoi::{FracturePattern, MAX_CELLS, PatternBond, PatternPiece, voronoi_box};
 
-use crate::body::{BodyHandle, BodyKind, RigidBodyDesc};
+use crate::body::{Bodies, BodyHandle, BodyKind, RigidBodyDesc};
 use crate::compound::{CompoundChild, CompoundInfo};
 use crate::error::PhysicsError;
 use crate::material::Material;
 use crate::position::GridPosition;
+use crate::shape::Shape;
+use crate::snapshot::{Reader, SnapshotError, Writer};
 use crate::world::PhysicsWorld;
 
 /// Loads under this share of a bond's strength leave no mark.
@@ -116,6 +118,183 @@ pub(crate) struct Breakables {
 impl Breakables {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn save(&self, out: &mut Writer) {
+        out.len(self.slots.len());
+        for (slot, generation) in self.slots.iter().zip(&self.generations) {
+            out.u32(*generation);
+            match slot {
+                None => out.u8(0),
+                Some(breakable) => {
+                    out.u8(1);
+                    breakable.save(out);
+                }
+            }
+        }
+    }
+
+    /// Shapes are checked against the loaded world after, see [`Self::shapes`].
+    pub(crate) fn load(
+        reader: &mut Reader<'_>,
+        bodies: &Bodies,
+        max: usize,
+    ) -> Result<Self, SnapshotError> {
+        let count = reader.count(5, max)?;
+        let mut breakables = Self::default();
+        for _ in 0..count {
+            breakables.generations.push(reader.u32()?);
+            breakables.slots.push(match reader.u8()? {
+                0 => None,
+                1 => Some(Breakable::load(reader, bodies, max)?),
+                _ => return Err(SnapshotError::Invalid("breakable flag")),
+            });
+        }
+        Ok(breakables)
+    }
+
+    /// Every shape the breakables name.
+    pub(crate) fn shapes(&self) -> impl Iterator<Item = &Shape> + '_ {
+        self.slots.iter().flatten().flat_map(|breakable| {
+            let pieces = breakable.pieces.iter().map(|piece| &piece.info.shape);
+            let groups = breakable.groups.iter().map(|group| &group.info.shape);
+            pieces.chain(groups)
+        })
+    }
+}
+
+fn save_info(out: &mut Writer, info: &CompoundInfo) {
+    out.shape(&info.shape);
+    out.vec3(info.center);
+    out.quat(info.axes);
+}
+
+fn load_info(reader: &mut Reader<'_>) -> Result<CompoundInfo, SnapshotError> {
+    let info = CompoundInfo {
+        shape: reader.shape()?,
+        center: reader.vec3()?,
+        axes: reader.unit_quat()?,
+    };
+    if !info.center.is_finite() {
+        return Err(SnapshotError::Invalid("breakable placement"));
+    }
+    Ok(info)
+}
+
+impl Breakable {
+    fn save(&self, out: &mut Writer) {
+        out.material(&self.material);
+        out.len(self.pieces.len());
+        for piece in &self.pieces {
+            save_info(out, &piece.info);
+            out.f32(piece.volume);
+            out.vec3(piece.center);
+            out.u8(u8::from(piece.anchored));
+        }
+        out.len(self.bonds.len());
+        for bond in &self.bonds {
+            out.u32(bond.a);
+            out.u32(bond.b);
+            out.f32(bond.strength);
+            out.f32(bond.damage);
+            out.u8(u8::from(bond.broken));
+        }
+        out.len(self.groups.len());
+        for group in &self.groups {
+            out.body(group.body);
+            save_info(out, &group.info);
+            out.len(group.pieces.len());
+            for piece in &group.pieces {
+                out.u32(*piece);
+            }
+        }
+    }
+
+    fn load(reader: &mut Reader<'_>, bodies: &Bodies, max: usize) -> Result<Self, SnapshotError> {
+        let invalid = || SnapshotError::Invalid("breakable");
+        let flag = |value: u8| match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(SnapshotError::Invalid("breakable flag")),
+        };
+        let material = reader.material()?;
+        let count = reader.count(46, MAX_CELLS)?;
+        let mut pieces = Vec::with_capacity(count);
+        for _ in 0..count {
+            let info = load_info(reader)?;
+            let (volume, center) = (reader.f32()?, reader.vec3()?);
+            let anchored = flag(reader.u8()?)?;
+            if !matches!(info.shape, Shape::Convex(_))
+                || !volume.is_finite()
+                || volume <= 0.0
+                || !center.is_finite()
+            {
+                return Err(invalid());
+            }
+            pieces.push(Piece {
+                info,
+                volume,
+                center,
+                anchored,
+            });
+        }
+        let bonds_count = reader.count(17, MAX_CELLS * MAX_CELLS)?;
+        let mut bonds = Vec::with_capacity(bonds_count);
+        for _ in 0..bonds_count {
+            let (a, b) = (reader.u32()?, reader.u32()?);
+            let (strength, damage) = (reader.f32()?, reader.f32()?);
+            let broken = flag(reader.u8()?)?;
+            if a >= b
+                || b as usize >= count
+                || !strength.is_finite()
+                || strength <= 0.0
+                || !damage.is_finite()
+                || damage < 0.0
+            {
+                return Err(invalid());
+            }
+            bonds.push(Bond {
+                a,
+                b,
+                strength,
+                damage,
+                broken,
+            });
+        }
+        let groups_count = reader.count(48, max)?;
+        let mut groups = Vec::with_capacity(groups_count);
+        let mut placed = vec![false; count];
+        for _ in 0..groups_count {
+            let body = reader.handle()?;
+            let info = load_info(reader)?;
+            let members = reader.count(4, count)?;
+            let mut group_pieces = Vec::with_capacity(members);
+            for _ in 0..members {
+                let piece = reader.u32()? as usize;
+                if piece >= count || placed[piece] {
+                    return Err(invalid());
+                }
+                placed[piece] = true;
+                group_pieces.push(piece as u32);
+            }
+            if group_pieces.is_empty() || bodies.dense_index(body).is_err() {
+                return Err(invalid());
+            }
+            groups.push(Group {
+                body,
+                pieces: group_pieces,
+                info,
+            });
+        }
+        if placed.iter().any(|in_group| !in_group) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            pieces,
+            bonds,
+            groups,
+            material,
+        })
     }
 }
 
@@ -728,6 +907,41 @@ mod tests {
         // the ball went on through, it did not bounce back
         let z = world.body_state(ball).unwrap().position.to_dvec3().z;
         assert!(z > -0.5, "{z}");
+    }
+
+    #[test]
+    fn a_wall_breaks_on_the_same_after_a_snapshot() {
+        let (mut world, target) = world_and_wall();
+        shoot(&mut world, 40.0);
+        for _ in 0..12 {
+            world.step_fixed().unwrap();
+        }
+        let parts = world.breakable_bodies(target).len();
+        assert!(parts > 1, "{parts} parts at the save");
+        let mut loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(
+            loaded.breakable_bodies(target),
+            world.breakable_bodies(target)
+        );
+        // a second ball breaks more, from the damage already there
+        for world in [&mut world, &mut loaded] {
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::sphere(0.15))
+                        .density(7800.0)
+                        .local_position(Vec3::new(-0.8, 0.6, -2.0))
+                        .linear_velocity(Vec3::new(0.0, 0.0, 40.0)),
+                )
+                .unwrap();
+            for _ in 0..60 {
+                world.step_fixed().unwrap();
+            }
+        }
+        assert_eq!(loaded.state_hash(), world.state_hash());
+        assert_eq!(
+            loaded.breakable_bodies(target),
+            world.breakable_bodies(target)
+        );
     }
 
     #[test]

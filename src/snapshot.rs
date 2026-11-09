@@ -17,7 +17,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 5;
+pub const SNAPSHOT_VERSION: u32 = 6;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -269,6 +269,8 @@ impl PhysicsWorld {
             out.field(desc);
         }
 
+        self.breakables.save(&mut out);
+
         let checksum = fnv1a(&out.data);
         out.u64(checksum);
         out.data
@@ -354,6 +356,11 @@ impl PhysicsWorld {
         } else {
             Default::default()
         };
+        let breakables = if reader.version >= 6 {
+            crate::fracture::Breakables::load(&mut reader, &bodies, limits.max_slots)?
+        } else {
+            Default::default()
+        };
         if reader.at != reader.data.len() {
             return Err(SnapshotError::Invalid("trailing data"));
         }
@@ -363,6 +370,13 @@ impl PhysicsWorld {
         world.recheck_sleepers = recheck_sleepers;
         world.sensors = sensors;
         world.fields = fields;
+        if breakables
+            .shapes()
+            .any(|shape| world.bodies.assets.validate(shape).is_err())
+        {
+            return Err(SnapshotError::Invalid("breakable shape"));
+        }
+        world.breakables = breakables;
         // shapes and frames are the loaded world's, check the sensors against them
         for sensor in world.sensors.slots.iter().flatten() {
             let desc = &sensor.desc;
@@ -1014,7 +1028,7 @@ impl Writer {
         self.f64(value.z);
     }
 
-    fn material(&mut self, material: &Material) {
+    pub(crate) fn material(&mut self, material: &Material) {
         self.f32(material.density);
         self.f32(material.friction);
         self.f32(material.restitution);
@@ -1096,7 +1110,7 @@ impl Writer {
         self.u32(desc.frame.0);
     }
 
-    fn quat(&mut self, value: Quat) {
+    pub(crate) fn quat(&mut self, value: Quat) {
         for part in value.to_array() {
             self.f32(part);
         }
@@ -1185,7 +1199,7 @@ impl Writer {
         }
     }
 
-    fn shape(&mut self, shape: &Shape) {
+    pub(crate) fn shape(&mut self, shape: &Shape) {
         let (tag, values) = match *shape {
             Shape::Sphere { radius } => (0, [radius, 0.0, 0.0]),
             Shape::Cuboid { half_extents } => (1, [half_extents.x, half_extents.y, half_extents.z]),
@@ -1277,7 +1291,7 @@ impl Reader<'_> {
         Ok(DVec3::new(self.f64()?, self.f64()?, self.f64()?))
     }
 
-    fn material(&mut self) -> Result<Material, SnapshotError> {
+    pub(crate) fn material(&mut self) -> Result<Material, SnapshotError> {
         let combine =
             |tag| crate::Combine::from_tag(tag).ok_or(SnapshotError::Invalid("material combine"));
         let material = Material {
@@ -1378,7 +1392,7 @@ impl Reader<'_> {
         ))
     }
 
-    fn unit_quat(&mut self) -> Result<Quat, SnapshotError> {
+    pub(crate) fn unit_quat(&mut self) -> Result<Quat, SnapshotError> {
         let value = self.quat()?;
         let error = (value.length_squared() - 1.0).abs();
         if error.is_nan() || error >= 1e-3 {
@@ -1414,7 +1428,7 @@ impl Reader<'_> {
         Ok(JointAxis { limit, motor })
     }
 
-    fn shape(&mut self) -> Result<Shape, SnapshotError> {
+    pub(crate) fn shape(&mut self) -> Result<Shape, SnapshotError> {
         let tag = self.u8()?;
         let values = [self.f32()?, self.f32()?, self.f32()?];
         match tag {
@@ -1536,9 +1550,9 @@ mod tests {
             .position(|window| window == marker.as_slice())
             .unwrap();
         bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 2 + 4 * 3);
-        // and the sensor and field counts at the end, both empty
+        // and the sensor, field and breakable counts at the end, all empty
         let end = bytes.len() - CHECKSUM_BYTES;
-        bytes.drain(end - 2 * 4..end);
+        bytes.drain(end - 3 * 4..end);
         bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
         let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
         let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];
