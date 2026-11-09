@@ -668,7 +668,13 @@ pub(crate) fn poly_poly(a: &Poly<'_>, b: &Poly<'_>, margin: f32) -> Option<RawMa
             face_of_a = false;
         }
     }
-    let (best_edge, edge_normal) = if a.edge_faces.is_empty() || b.edge_faces.is_empty() {
+    // touching or in each other, no axis gives more than 0, and an edge axis must beat the best
+    // face by the bias: none can, so the edges are not tried. apart by less than the margin it
+    // stays a speculative face contact. that is pieces packed face to face, 256 shards of a broken
+    // cube spent 20 of their 21 us a pair in the edges
+    let (best_edge, edge_normal) = if best_face > -EDGE_BIAS {
+        (best_face, None)
+    } else if a.edge_faces.is_empty() || b.edge_faces.is_empty() {
         every_edge_pair(a, b, best_face, margin)?
     } else {
         minkowski_edges(a, b, best_face, margin)?
@@ -699,20 +705,28 @@ fn minkowski_edges(
 ) -> Option<(f32, Option<Vec3>)> {
     let mut best_edge = best_face;
     let mut edge_normal = None;
+    // b's arcs once, not once for each of a's edges: b's normals turned round, so its faces meet
+    // a's in the difference. two dots throw most pairs out, the other two only after
+    let mut arcs = [(Vec3::ZERO, Vec3::ZERO, Vec3::ZERO); MAX_EDGES];
+    let count = b.edge_faces.len().min(MAX_EDGES);
+    for (arc, edge_b) in arcs.iter_mut().zip(b.edge_faces) {
+        let face_b = -b.planes[edge_b[2] as usize].0;
+        let other_b = -b.planes[edge_b[3] as usize].0;
+        *arc = (face_b, other_b, other_b.cross(face_b));
+    }
     for edge_a in a.edge_faces {
         let start_a = a.vertices[edge_a[0] as usize];
         let along_a = a.vertices[edge_a[1] as usize] - start_a;
         let face_a = a.planes[edge_a[2] as usize].0;
         let other_a = a.planes[edge_a[3] as usize].0;
         let across_a = other_a.cross(face_a);
-        for edge_b in b.edge_faces {
-            // b's normals turned round, so its faces meet a's in the difference
-            let face_b = -b.planes[edge_b[2] as usize].0;
-            let other_b = -b.planes[edge_b[3] as usize].0;
-            let across_b = other_b.cross(face_b);
+        for (edge_b, (face_b, other_b, across_b)) in b.edge_faces.iter().zip(&arcs[..count]) {
             let (cba, dba) = (face_b.dot(across_a), other_b.dot(across_a));
-            let (adc, bdc) = (face_a.dot(across_b), other_a.dot(across_b));
-            if cba * dba >= 0.0 || adc * bdc >= 0.0 || cba * bdc <= 0.0 {
+            if cba * dba >= 0.0 {
+                continue;
+            }
+            let (adc, bdc) = (face_a.dot(*across_b), other_a.dot(*across_b));
+            if adc * bdc >= 0.0 || cba * bdc <= 0.0 {
                 continue;
             }
             let start_b = b.vertices[edge_b[0] as usize];
