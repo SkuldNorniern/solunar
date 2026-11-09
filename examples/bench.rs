@@ -24,7 +24,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 24] = [
+const SUITES: [(&str, Suite); 25] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
@@ -47,6 +47,7 @@ const SUITES: [(&str, Suite); 24] = [
     ("dam", dam_small),
     ("dam-fine", dam_medium),
     ("dam-dfsph", dam_dfsph),
+    ("floats", floats),
     ("shallow", shallow),
     ("sensors", sensors),
 ];
@@ -264,6 +265,58 @@ fn dam_with(spacing: f32, solver: FluidSolver) -> Result<Outcome> {
             squeeze * 100.0,
             fluid.state_hash()
         ),
+    })
+}
+
+/// Eight boxes, light to heavy, dropped into a 2.4 m square pool 0.6 m deep on 5 cm water, about
+/// 28k particles, timed per 60 hz tick with the water and the rigid step.
+fn floats() -> Result<Outcome> {
+    let mut fluid = FluidWorld::new(FluidSettings::default())?;
+    fluid.add_box_container(Vec3::ZERO, Vec3::new(2.4, 1.2, 2.4))?;
+    fluid.fill_box(Vec3::ZERO, Vec3::new(2.4, 0.6, 2.4))?;
+    let mut world = PhysicsWorld::new(PhysicsSettings::default())?;
+    world.spawn(
+        RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)))
+            .local_position(Vec3::new(1.2, -0.5, 1.2)),
+    )?;
+    let shape = Shape::cuboid(Vec3::new(0.15, 0.12, 0.2));
+    let mut boxes = Vec::new();
+    for index in 0..8 {
+        let at = Vec3::new(
+            0.4 + 0.55 * (index % 4) as f32,
+            0.9,
+            0.6 + 1.1 * (index / 4) as f32,
+        );
+        let body = world.spawn(
+            RigidBodyDesc::dynamic(shape)
+                .density(300.0 + 400.0 * index as f32)
+                .local_position(at),
+        )?;
+        fluid.couple(body, &shape)?;
+        boxes.push(body);
+    }
+    let mut times = Vec::new();
+    for _ in 0..180 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => fluid.step_with_bodies(1.0 / 60.0, &mut world, pool),
+            None => fluid.step_with_bodies(1.0 / 60.0, &mut world, &Sequential),
+        })?;
+        world.step_fixed()?;
+        times.push(started.elapsed());
+    }
+    let spin = boxes.iter().fold(0.0_f32, |most, body| {
+        most.max(
+            world
+                .body_state(*body)
+                .map_or(0.0, |state| state.angular_velocity.length()),
+        )
+    });
+    Ok(Outcome {
+        bodies: fluid.len(),
+        times,
+        unit: "ms",
+        check: format!("fastest spin at the end {spin:.3} rad/s"),
     })
 }
 
