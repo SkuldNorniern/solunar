@@ -2,6 +2,7 @@ use algebrix::Vec3;
 
 use super::FluidWorld;
 use crate::error::PhysicsError;
+use crate::snapshot::{Reader, SnapshotError, Writer};
 
 /// New water goes only where none is nearer than this share of a spacing.
 const CLEAR_SHARE: f32 = 0.9;
@@ -29,6 +30,57 @@ struct Flow {
 pub(super) struct Flows {
     list: Vec<Flow>,
     next: u32,
+}
+
+impl Flows {
+    pub(super) fn save(&self, out: &mut Writer) {
+        out.len(self.list.len());
+        for flow in &self.list {
+            out.u32(flow.id);
+            out.vec3(flow.low);
+            out.vec3(flow.high);
+            match flow.kind {
+                Kind::Emitter(velocity) => {
+                    out.u8(0);
+                    out.vec3(velocity);
+                }
+                Kind::Drain => out.u8(1),
+            }
+        }
+        out.u32(self.next);
+    }
+
+    pub(super) fn load(reader: &mut Reader<'_>, max: usize) -> Result<Self, SnapshotError> {
+        let count = reader.count(29, max)?;
+        let mut flows = Self::default();
+        for _ in 0..count {
+            let (id, low, high) = (reader.u32()?, reader.vec3()?, reader.vec3()?);
+            let kind = match reader.u8()? {
+                0 => Kind::Emitter(reader.vec3()?),
+                1 => Kind::Drain,
+                _ => return Err(SnapshotError::Invalid("fluid flow kind")),
+            };
+            let finite = match kind {
+                Kind::Emitter(velocity) => velocity.is_finite(),
+                Kind::Drain => true,
+            };
+            let inside_out = high.x <= low.x || high.y <= low.y || high.z <= low.z;
+            if !(low.is_finite() && high.is_finite() && finite) || inside_out {
+                return Err(SnapshotError::Invalid("fluid flow"));
+            }
+            flows.list.push(Flow {
+                id,
+                low,
+                high,
+                kind,
+            });
+        }
+        flows.next = reader.u32()?;
+        if flows.list.iter().any(|flow| flow.id >= flows.next) {
+            return Err(SnapshotError::Invalid("fluid flow id"));
+        }
+        Ok(flows)
+    }
 }
 
 impl FluidWorld {

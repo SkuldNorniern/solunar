@@ -5,6 +5,7 @@ use crate::body::BodyHandle;
 use crate::dispatch::JobDispatch;
 use crate::error::PhysicsError;
 use crate::shape::Shape;
+use crate::snapshot::{Reader, SnapshotError, Writer};
 use crate::world::PhysicsWorld;
 
 use super::step::FluidReport;
@@ -37,6 +38,48 @@ pub(super) struct Movers {
     /// Index into the coupled bodies.
     pub(super) owners: Vec<u32>,
     pub(super) grid: Grid,
+}
+
+impl Coupled {
+    pub(super) fn save(&self, out: &mut Writer) {
+        out.body(self.body);
+        out.len(self.points.len());
+        for point in &self.points {
+            out.vec3(*point);
+        }
+    }
+
+    pub(super) fn load(reader: &mut Reader<'_>, max: usize) -> Result<Self, SnapshotError> {
+        let body = reader.handle()?;
+        let count = reader.count(12, max)?;
+        let mut points = Vec::with_capacity(count);
+        for _ in 0..count {
+            let point = reader.vec3()?;
+            if !point.is_finite() {
+                return Err(SnapshotError::Invalid("fluid body point"));
+            }
+            points.push(point);
+        }
+        if points.is_empty() {
+            return Err(SnapshotError::Invalid("fluid body"));
+        }
+        Ok(Self {
+            body,
+            points,
+            center: Vec3::ZERO,
+            velocity: Vec3::ZERO,
+            impulse: (Vec3::ZERO, Vec3::ZERO),
+            moved: Vec3::ZERO,
+        })
+    }
+
+    pub(super) fn body(&self) -> BodyHandle {
+        self.body
+    }
+
+    pub(super) fn point_count(&self) -> usize {
+        self.points.len()
+    }
 }
 
 impl FluidWorld {
@@ -322,6 +365,19 @@ mod tests {
         let body = world.spawn(desc).unwrap();
         fluid.couple(body, &shape).unwrap();
         body
+    }
+
+    #[test]
+    fn a_floating_box_and_its_water_step_on_the_same_after_snapshots() {
+        let (mut fluid, mut world) = pool();
+        drop_box(&mut fluid, &mut world, 500.0);
+        run(&mut fluid, &mut world, 20);
+        let mut loaded_fluid = FluidWorld::load_snapshot(&fluid.save_snapshot()).unwrap();
+        let mut loaded_world = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        run(&mut fluid, &mut world, 30);
+        run(&mut loaded_fluid, &mut loaded_world, 30);
+        assert_eq!(loaded_fluid.state_hash(), fluid.state_hash());
+        assert_eq!(loaded_world.state_hash(), world.state_hash());
     }
 
     fn run(fluid: &mut FluidWorld, world: &mut PhysicsWorld, ticks: usize) -> f32 {

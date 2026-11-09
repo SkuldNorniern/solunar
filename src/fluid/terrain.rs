@@ -4,6 +4,7 @@ use super::boundary::BoundaryId;
 use super::{FluidWorld, Kernel};
 use crate::error::PhysicsError;
 use crate::sdf::SdfVolume;
+use crate::snapshot::{Reader, SnapshotError, Writer};
 
 /// Most lattice nodes one terrain region may sample, 64 MB of distances.
 const MAX_NODES: usize = 1 << 24;
@@ -40,6 +41,59 @@ pub(super) struct TerrainField {
 }
 
 impl TerrainField {
+    pub(super) fn save(&self, out: &mut Writer) {
+        out.u32(self.owner);
+        out.vec3(self.low);
+        for count in [self.nodes.0, self.nodes.1, self.nodes.2] {
+            out.len(count);
+        }
+        out.f32(self.step);
+        out.len(self.distances.len());
+        for distance in &self.distances {
+            out.f32(*distance);
+        }
+    }
+
+    pub(super) fn load(reader: &mut Reader<'_>) -> Result<Self, SnapshotError> {
+        let (owner, low) = (reader.u32()?, reader.vec3()?);
+        let nodes = (
+            reader.u32()? as usize,
+            reader.u32()? as usize,
+            reader.u32()? as usize,
+        );
+        let step = reader.f32()?;
+        let total = nodes
+            .0
+            .checked_mul(nodes.1)
+            .and_then(|n| n.checked_mul(nodes.2));
+        let count = reader.count(4, MAX_NODES)?;
+        if !low.is_finite()
+            || !step.is_finite()
+            || step <= 0.0
+            || nodes.0 < 2
+            || nodes.1 < 2
+            || nodes.2 < 2
+            || total != Some(count)
+        {
+            return Err(SnapshotError::Invalid("fluid terrain"));
+        }
+        let mut distances = Vec::with_capacity(count);
+        for _ in 0..count {
+            let distance = reader.f32()?;
+            if !distance.is_finite() {
+                return Err(SnapshotError::Invalid("fluid terrain distance"));
+            }
+            distances.push(distance);
+        }
+        Ok(Self {
+            owner,
+            low,
+            nodes,
+            step,
+            distances,
+        })
+    }
+
     fn index(&self, x: usize, y: usize, z: usize) -> usize {
         (y * self.nodes.2 + z) * self.nodes.0 + x
     }
@@ -332,6 +386,23 @@ mod tests {
         let mut fluid = FluidWorld::new(FluidSettings::default()).unwrap();
         fluid.add_terrain(&volume, origin, LOW, HIGH).unwrap();
         (fluid, volume, origin)
+    }
+
+    #[test]
+    fn terrain_fields_come_back_from_a_snapshot() {
+        let (mut fluid, _, _) = in_trench();
+        fluid
+            .fill_box(Vec3::new(0.6, 0.85, 0.8), Vec3::new(1.0, 1.2, 1.2))
+            .unwrap();
+        for _ in 0..10 {
+            fluid.step(1.0 / 60.0, &crate::Sequential).unwrap();
+        }
+        let mut loaded = FluidWorld::load_snapshot(&fluid.save_snapshot()).unwrap();
+        for _ in 0..20 {
+            fluid.step(1.0 / 60.0, &crate::Sequential).unwrap();
+            loaded.step(1.0 / 60.0, &crate::Sequential).unwrap();
+        }
+        assert_eq!(loaded.state_hash(), fluid.state_hash());
     }
 
     #[test]

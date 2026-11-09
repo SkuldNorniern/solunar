@@ -958,26 +958,26 @@ pub(crate) fn fnv1a(data: &[u8]) -> u64 {
     hash
 }
 
-struct Writer {
-    data: Vec<u8>,
+pub(crate) struct Writer {
+    pub(crate) data: Vec<u8>,
 }
 
 impl Writer {
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             data: Vec::with_capacity(capacity),
         }
     }
 
-    fn bytes(&mut self, value: &[u8]) {
+    pub(crate) fn bytes(&mut self, value: &[u8]) {
         self.data.extend_from_slice(value);
     }
 
-    fn u8(&mut self, value: u8) {
+    pub(crate) fn u8(&mut self, value: u8) {
         self.data.push(value);
     }
 
-    fn u32(&mut self, value: u32) {
+    pub(crate) fn u32(&mut self, value: u32) {
         self.bytes(&value.to_le_bytes());
     }
 
@@ -985,11 +985,11 @@ impl Writer {
         self.bytes(&value.to_le_bytes());
     }
 
-    fn u64(&mut self, value: u64) {
+    pub(crate) fn u64(&mut self, value: u64) {
         self.bytes(&value.to_le_bytes());
     }
 
-    fn f32(&mut self, value: f32) {
+    pub(crate) fn f32(&mut self, value: f32) {
         self.u32(value.to_bits());
     }
 
@@ -998,11 +998,11 @@ impl Writer {
     }
 
     // storage indexes are u32, so every length fits
-    fn len(&mut self, value: usize) {
+    pub(crate) fn len(&mut self, value: usize) {
         self.u32(value as u32);
     }
 
-    fn vec3(&mut self, value: Vec3) {
+    pub(crate) fn vec3(&mut self, value: Vec3) {
         self.f32(value.x);
         self.f32(value.y);
         self.f32(value.z);
@@ -1033,7 +1033,7 @@ impl Writer {
         self.vec3(value.local);
     }
 
-    fn body(&mut self, handle: BodyHandle) {
+    pub(crate) fn body(&mut self, handle: BodyHandle) {
         self.u32(handle.index);
         self.u32(handle.generation);
     }
@@ -1207,11 +1207,11 @@ impl Writer {
     }
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    at: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) at: usize,
     /// The snapshot's format version, what it holds depends on it.
-    version: u32,
+    pub(crate) version: u32,
 }
 
 impl Reader<'_> {
@@ -1225,11 +1225,11 @@ impl Reader<'_> {
         bytes.try_into().map_err(|_| SnapshotError::Truncated)
     }
 
-    fn u8(&mut self) -> Result<u8, SnapshotError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, SnapshotError> {
         Ok(self.take::<1>()?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, SnapshotError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, SnapshotError> {
         Ok(u32::from_le_bytes(self.take()?))
     }
 
@@ -1237,11 +1237,11 @@ impl Reader<'_> {
         Ok(i32::from_le_bytes(self.take()?))
     }
 
-    fn u64(&mut self) -> Result<u64, SnapshotError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, SnapshotError> {
         Ok(u64::from_le_bytes(self.take()?))
     }
 
-    fn f32(&mut self) -> Result<f32, SnapshotError> {
+    pub(crate) fn f32(&mut self) -> Result<f32, SnapshotError> {
         Ok(f32::from_bits(self.u32()?))
     }
 
@@ -1250,7 +1250,11 @@ impl Reader<'_> {
     }
 
     /// Reads a count, checks it against `max` and the bytes left before anything allocates.
-    fn count(&mut self, record_bytes: usize, max: usize) -> Result<usize, SnapshotError> {
+    pub(crate) fn count(
+        &mut self,
+        record_bytes: usize,
+        max: usize,
+    ) -> Result<usize, SnapshotError> {
         let count = self.u32()? as usize;
         if count > max {
             return Err(SnapshotError::Invalid("count over limit"));
@@ -1265,7 +1269,7 @@ impl Reader<'_> {
         Ok(count)
     }
 
-    fn vec3(&mut self) -> Result<Vec3, SnapshotError> {
+    pub(crate) fn vec3(&mut self) -> Result<Vec3, SnapshotError> {
         Ok(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
     }
 
@@ -1358,7 +1362,7 @@ impl Reader<'_> {
         })
     }
 
-    fn handle(&mut self) -> Result<BodyHandle, SnapshotError> {
+    pub(crate) fn handle(&mut self) -> Result<BodyHandle, SnapshotError> {
         Ok(BodyHandle {
             index: self.u32()?,
             generation: self.u32()?,

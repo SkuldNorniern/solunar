@@ -2,6 +2,7 @@ use algebrix::Vec3;
 
 use super::{CellKey, FluidWorld, Grid};
 use crate::error::PhysicsError;
+use crate::snapshot::{Reader, SnapshotError, Writer};
 
 /// Cell, owner and position bits, then where it was: a total order for the walls.
 type WallKey = (CellKey, u32, (u32, u32, u32), usize);
@@ -151,7 +152,7 @@ impl FluidWorld {
 
     /// Sorts the walls by cell. Walls do not move, so this only runs when one is added or taken
     /// away.
-    fn settle_walls(&mut self) {
+    pub(super) fn settle_walls(&mut self) {
         let walls = &mut self.walls;
         let radius = self.settings.radius();
         let cell = |at: Vec3| -> CellKey {
@@ -174,6 +175,55 @@ impl FluidWorld {
         walls.positions = order.iter().map(|item| walls.positions[item.3]).collect();
         walls.owners = order.iter().map(|item| item.1).collect();
         walls.grid = Grid::build(order.iter().map(|item| item.0));
+    }
+}
+
+impl Walls {
+    pub(super) fn save(&self, out: &mut Writer) {
+        out.len(self.positions.len());
+        for (at, owner) in self.positions.iter().zip(&self.owners) {
+            out.vec3(*at);
+            out.u32(*owner);
+        }
+        out.u32(self.next);
+        out.len(self.containers.len());
+        for (id, low, high) in &self.containers {
+            out.u32(*id);
+            out.vec3(*low);
+            out.vec3(*high);
+        }
+    }
+
+    pub(super) fn next(&self) -> u32 {
+        self.next
+    }
+
+    /// Without its grid, the world settles the walls once it has its settings.
+    pub(super) fn load(reader: &mut Reader<'_>, max: usize) -> Result<Self, SnapshotError> {
+        let count = reader.count(16, max)?;
+        let mut walls = Self::default();
+        for _ in 0..count {
+            let at = reader.vec3()?;
+            if !at.is_finite() {
+                return Err(SnapshotError::Invalid("fluid wall"));
+            }
+            walls.positions.push(at);
+            walls.owners.push(reader.u32()?);
+        }
+        walls.next = reader.u32()?;
+        let containers = reader.count(28, max)?;
+        for _ in 0..containers {
+            let (id, low, high) = (reader.u32()?, reader.vec3()?, reader.vec3()?);
+            if check_box(low, high).is_err() || id >= walls.next {
+                return Err(SnapshotError::Invalid("fluid container"));
+            }
+            walls.containers.push((id, low, high));
+        }
+        if walls.owners.iter().any(|owner| *owner >= walls.next) {
+            return Err(SnapshotError::Invalid("fluid wall owner"));
+        }
+        walls.bounds = union(&walls.containers);
+        Ok(walls)
     }
 }
 
