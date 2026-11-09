@@ -30,6 +30,10 @@ pub struct FrameDesc {
     pub linear_velocity: DVec3,
     pub angular_velocity: DVec3,
     pub motion: FrameMotion,
+    /// How far from its origin the frame holds bodies, meters, zero for no limit. A body
+    /// going out past it, with a tenth more so it does not flip back, goes to the parent. One in
+    /// the parent coming within nine tenths of it comes in.
+    pub reach: f64,
 }
 
 impl FrameDesc {
@@ -41,6 +45,7 @@ impl FrameDesc {
             linear_velocity: DVec3::ZERO,
             angular_velocity: DVec3::ZERO,
             motion: FrameMotion::default(),
+            reach: 0.0,
         }
     }
 }
@@ -122,6 +127,8 @@ impl Frames {
             || !finite(desc.linear_velocity)
             || !finite(desc.angular_velocity)
             || !desc.motion.is_valid()
+            || !desc.reach.is_finite()
+            || desc.reach < 0.0
         {
             return Err(PhysicsError::NonFinite("frame"));
         }

@@ -307,6 +307,43 @@ mod tests {
     }
 
     #[test]
+    fn a_ball_crossing_a_frame_goes_in_and_out_at_its_reach() {
+        let mut world = no_gravity();
+        let station = world
+            .add_frame(FrameDesc {
+                translation: DVec3::new(100.0, 0.0, 0.0),
+                rotation: DQuat::from_axis_angle(DVec3::Y, 0.7),
+                reach: 10.0,
+                ..FrameDesc::new(FrameId::ROOT)
+            })
+            .unwrap();
+        let body = ball(
+            &mut world,
+            FrameId::ROOT,
+            Vec3::new(80.0, 0.0, 0.0),
+            Vec3::X * 10.0,
+        );
+        let mut changes = Vec::new();
+        for step in 1..=240 {
+            world.step_fixed().unwrap();
+            for change in world.frame_changes() {
+                let x = in_root(&world, body).position.x;
+                changes.push((change.1, change.2, x));
+            }
+            // its path in the root goes on as if no frame were there, to f32 rounding over 900
+            // moves
+            let expected = 80.0 + 10.0 * f64::from(step) / 60.0;
+            let got = in_root(&world, body).position;
+            assert!((got.x - expected).abs() < 5e-3, "{step} {got:?} {expected}");
+        }
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert_eq!((changes[0].0, changes[0].1), (FrameId::ROOT, station));
+        assert!(changes[0].2 > 91.0 && changes[0].2 < 91.3, "{changes:?}");
+        assert_eq!((changes[1].0, changes[1].1), (station, FrameId::ROOT));
+        assert!(changes[1].2 > 111.0 && changes[1].2 < 111.3, "{changes:?}");
+    }
+
+    #[test]
     fn moving_frames_and_sources_continue_exactly_after_a_snapshot() {
         let mut world = no_gravity();
         let mu = 4.0e6;

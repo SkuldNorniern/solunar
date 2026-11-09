@@ -109,6 +109,11 @@ pub(super) fn read_frames(
         let rotation = DQuat::new(reader.f64()?, reader.f64()?, reader.f64()?, reader.f64()?);
         let linear_velocity = reader.dvec3()?;
         let angular_velocity = reader.dvec3()?;
+        let reach = if reader.version >= 10 {
+            reader.f64()?
+        } else {
+            0.0
+        };
         let motion = if reader.version >= 9 {
             let spin = reader.dvec3()?;
             let orbit = match reader.u8()? {
@@ -136,6 +141,7 @@ pub(super) fn read_frames(
                 linear_velocity,
                 angular_velocity,
                 motion,
+                reach,
             })
             .map_err(|_| SnapshotError::Invalid("frame"))?;
     }

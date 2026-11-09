@@ -13,7 +13,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 9;
+pub const SNAPSHOT_VERSION: u32 = 10;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -106,6 +106,7 @@ impl PhysicsWorld {
             out.f64(frame.rotation.w);
             out.dvec3(frame.linear_velocity);
             out.dvec3(frame.angular_velocity);
+            out.f64(frame.reach);
             out.dvec3(frame.motion.spin);
             match frame.motion.orbit {
                 None => out.u8(0),

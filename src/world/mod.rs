@@ -111,6 +111,7 @@ pub struct PhysicsWorld {
     pub(crate) sensors: Sensors,
     pub(crate) breakables: crate::fracture::Breakables,
     broken_joints: Vec<JointHandle>,
+    frame_changes: Vec<(BodyHandle, FrameId, FrameId)>,
     pub(crate) fields: Fields,
     failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
@@ -161,6 +162,7 @@ impl PhysicsWorld {
             sensors: Sensors::default(),
             breakables: crate::fracture::Breakables::default(),
             broken_joints: Vec::new(),
+            frame_changes: Vec::new(),
             fields: Fields::default(),
             failed_body: None,
             recheck_sleepers: false,
@@ -323,6 +325,11 @@ impl PhysicsWorld {
     /// Joints that broke at the end of the last step, their handles no longer good.
     pub fn broken_joints(&self) -> &[JointHandle] {
         &self.broken_joints
+    }
+
+    /// Bodies the last step moved between frames for their reach: body, from, to.
+    pub fn frame_changes(&self) -> &[(BodyHandle, FrameId, FrameId)] {
+        &self.frame_changes
     }
 
     /// Force and torque of the last step on body B.

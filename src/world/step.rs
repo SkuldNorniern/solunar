@@ -12,8 +12,8 @@ use crate::solver::{
     solve_substep,
 };
 use crate::{
-    BodyHandle, BodyKind, ContactEvent, GridPosition, JobDispatch, JointHandle, PhysicsError,
-    Sequential,
+    BodyHandle, BodyKind, ContactEvent, FrameId, GridPosition, JobDispatch, JointHandle,
+    PhysicsError, Sequential,
 };
 
 use super::{Advance, Integrated, Pairs, PhysicsWorld, finite};
@@ -211,6 +211,7 @@ impl PhysicsWorld {
         self.tick += 1;
         self.frames
             .advance_to(self.tick as f64 * f64::from(self.settings.fixed_timestep));
+        self.change_frames();
         self.update_sensors()?;
         self.update_breakables()?;
         lap(&mut phases.finish);
@@ -236,6 +237,54 @@ impl PhysicsWorld {
         for joint in over {
             if self.remove_joint(joint).is_ok() {
                 self.broken_joints.push(joint);
+            }
+        }
+    }
+
+    /// Bodies gone out of their frame's reach go to its parent, ones come into a child's reach
+    /// go in. Between steps, in body order. A body with joints stays, as does one whose move
+    /// fails, it is tried again next step.
+    fn change_frames(&mut self) {
+        self.frame_changes.clear();
+        let frames = &self.frames;
+        let reaching: Vec<FrameId> = (1..frames.len() as u32)
+            .map(FrameId)
+            .filter(|frame| frames.get(*frame).is_ok_and(|desc| desc.reach > 0.0))
+            .collect();
+        if reaching.is_empty() {
+            return;
+        }
+        let mut moves = Vec::new();
+        for dense in 0..self.bodies.len() {
+            if self.bodies.kind[dense] != BodyKind::Dynamic || self.bodies.asleep[dense] {
+                continue;
+            }
+            let frame = self.bodies.frame[dense];
+            let at = self.bodies.position(dense).to_dvec3();
+            let Ok(desc) = frames.get(frame) else {
+                continue;
+            };
+            let target = if desc.reach > 0.0 && at.length() > desc.reach * 1.1 {
+                Some(desc.parent)
+            } else {
+                reaching
+                    .iter()
+                    .filter_map(|child| {
+                        let inner = frames.get(*child).ok()?;
+                        let distance = (at - inner.translation).length();
+                        (inner.parent == frame && distance < inner.reach * 0.9)
+                            .then_some((distance, *child))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, child)| child)
+            };
+            if let Some(target) = target {
+                moves.push((self.bodies.handle_at(dense), frame, target));
+            }
+        }
+        for (body, from, to) in moves {
+            if self.transfer_to_frame(body, to).is_ok() {
+                self.frame_changes.push((body, from, to));
             }
         }
     }
