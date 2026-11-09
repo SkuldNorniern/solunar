@@ -814,21 +814,13 @@ impl PhysicsWorld {
         )?;
         lap(&mut phases.narrowphase);
         let mut woken = Vec::new();
+        // outside forces were worked out at the start of the step, so they go in whole before the
+        // first move. spread over substeps they would lag the motion and add energy
+        run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+            integrate_velocity(bodies, frame_gravity, awake[dense], dense, slot, (part, dt));
+        })?;
+        lap(&mut phases.integrate);
         for substep in 0..substeps {
-            // outside forces were worked out at the start of the step, so they go in whole before
-            // the first move. spread over substeps they would lag the motion and add energy
-            let push = if substep == 0 { dt } else { 0.0 };
-            run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-                integrate_velocity(
-                    bodies,
-                    frame_gravity,
-                    awake[dense],
-                    dense,
-                    slot,
-                    (part, push),
-                );
-            })?;
-            lap(&mut phases.integrate);
             if !hooks.is_empty() {
                 let mut view = crate::substep::SubstepBodies {
                     bodies,
@@ -850,8 +842,21 @@ impl PhysicsWorld {
                 (dispatch, part),
             );
             lap(&mut phases.solve);
+            // this substep's move and the next one's velocity in one pass, body by body as
+            // before, one dispatch fewer
+            let next = substep + 1 < substeps;
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
                 integrate_position(bodies, awake[dense], dense, slot, part);
+                if next {
+                    integrate_velocity(
+                        bodies,
+                        frame_gravity,
+                        awake[dense],
+                        dense,
+                        slot,
+                        (part, 0.0),
+                    );
+                }
             })?;
             lap(&mut phases.integrate);
         }
