@@ -37,14 +37,14 @@ pub(crate) struct QueryTree {
 /// Pending nodes of a walk, in place on the call stack. A median split tree of `u32` items is
 /// at most 32 deep, a walk holds at most two nodes a level, so the heap is never reached in
 /// practice. It still spills there rather than lose a node.
-struct Pending<T: Copy + Default> {
+pub(crate) struct Pending<T: Copy + Default> {
     held: [T; 64],
     len: usize,
     spilled: Vec<T>,
 }
 
 impl<T: Copy + Default> Pending<T> {
-    fn new(first: T) -> Self {
+    pub(crate) fn new(first: T) -> Self {
         let mut held = [T::default(); 64];
         held[0] = first;
         Self {
@@ -54,7 +54,7 @@ impl<T: Copy + Default> Pending<T> {
         }
     }
 
-    fn push(&mut self, item: T) {
+    pub(crate) fn push(&mut self, item: T) {
         if self.len < self.held.len() {
             self.held[self.len] = item;
             self.len += 1;
@@ -63,7 +63,7 @@ impl<T: Copy + Default> Pending<T> {
         }
     }
 
-    fn pop(&mut self) -> Option<T> {
+    pub(crate) fn pop(&mut self) -> Option<T> {
         if let Some(item) = self.spilled.pop() {
             return Some(item);
         }

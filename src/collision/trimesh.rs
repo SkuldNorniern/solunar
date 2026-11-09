@@ -224,7 +224,7 @@ impl TriMesh {
                 }
             }
             Lookup::Bvh { nodes, order } => {
-                let mut stack = vec![0_u32];
+                let mut stack = crate::collision::tree::Pending::new(0_u32);
                 while let Some(at) = stack.pop() {
                     let node = &nodes[at as usize];
                     if !node.bounds.overlaps(area) {
