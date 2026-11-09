@@ -273,6 +273,7 @@ impl PhysicsWorld {
                         best = Some((hit.0, handle, normal, point, index));
                     }
                 });
+                shortest.set(best.map_or(max, |found| found.0));
                 return;
             }
             assets.for_each_part(body.0, body.1, |index, part, at, turn| {
