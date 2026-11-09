@@ -23,7 +23,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 21] = [
+const SUITES: [(&str, Suite); 22] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -36,6 +36,7 @@ const SUITES: [(&str, Suite); 21] = [
     ("fan-nearest", fan_nearest),
     ("fan-blocked", fan_blocked),
     ("terrain-fan", terrain_fan),
+    ("terrain-casts", terrain_casts),
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
@@ -727,9 +728,8 @@ fn fan(from: Vec3, length: f32) -> Result<Vec<Ray>> {
     Ok(rays)
 }
 
-/// The fan nearest hits from 6 m over the middle of the tunnel hills, 60 m long: the down half
-/// lands on terrain triangles, the up half runs to its end.
-fn terrain_fan() -> Result<Outcome> {
+/// The tunnel hills alone.
+fn hills() -> Result<PhysicsWorld> {
     let mut world = world()?;
     SdfTerrain::new(
         &mut world,
@@ -748,6 +748,47 @@ fn terrain_fan() -> Result<Outcome> {
             material: Material::default(),
         },
     )?;
+    Ok(world)
+}
+
+/// 1,000 casts of a 0.3 m sphere along the `terrain-fan` directions, every tenth ray.
+fn terrain_casts() -> Result<Outcome> {
+    let world = hills()?;
+    let casts: Vec<ShapeCast> = fan(Vec3::new(64.0, 33.0, 64.0), 60.0)?
+        .into_iter()
+        .step_by(10)
+        .map(|ray| ShapeCast {
+            shape: Shape::sphere(0.3),
+            rotation: Quat::IDENTITY,
+            origin: ray.origin,
+            direction: ray.direction,
+            max_distance: ray.max_distance,
+        })
+        .collect();
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.shape_cast_batch(&casts, &filter, pool, &mut out),
+            None => world.shape_cast_batch(&casts, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let hits = out.iter().filter(|hit| matches!(hit, Ok(Some(_)))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{hits} of 1000 hit, per batch of 1000"),
+    })
+}
+
+/// The fan nearest hits from 6 m over the middle of the tunnel hills, 60 m long: the down half
+/// lands on terrain triangles, the up half runs to its end.
+fn terrain_fan() -> Result<Outcome> {
+    let world = hills()?;
     let rays = fan(Vec3::new(64.0, 33.0, 64.0), 60.0)?;
     let filter = QueryFilter::default();
     let mut out = Vec::new();
