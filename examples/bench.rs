@@ -23,7 +23,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 16] = [
+const SUITES: [(&str, Suite); 17] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("stacks", stacks),
@@ -31,6 +31,7 @@ const SUITES: [(&str, Suite); 16] = [
     ("net", net),
     ("compound", compound),
     ("queries", queries),
+    ("ray-batch", ray_batch),
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("commit", tunnel_commit),
@@ -635,6 +636,60 @@ fn compound() -> Result<Outcome> {
 }
 
 /// The falling pile at rest, then 10,000 rays and 1,000 sphere casts, timed one by one.
+/// The `queries` scene, 10,000 rays asked as one batch on the bench's workers, 100 times.
+fn ray_batch() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 60.0)?;
+    let shapes = [
+        Shape::sphere(0.4),
+        Shape::cuboid(Vec3::splat(0.4)),
+        Shape::capsule(0.3, 0.3),
+    ];
+    for i in 0..2000 {
+        let (x, z, y) = (i % 20, (i / 20) % 10, i / 200);
+        let at = Vec3::new(
+            x as f32 * 1.2 - 12.0,
+            1.0 + y as f32 * 1.2,
+            z as f32 * 1.2 - 6.0,
+        );
+        world.spawn(RigidBodyDesc::dynamic(shapes[i % 3]).local_position(at))?;
+    }
+    steps(&mut world, 300)?;
+    let mut seed = 0x9e37_79b9_u32;
+    let mut random = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1 << 24) as f32
+    };
+    let mut rays = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let origin = Vec3::new(random() * 30.0 - 15.0, 15.0, random() * 16.0 - 8.0);
+        let target = Vec3::new(random() * 24.0 - 12.0, 0.0, random() * 12.0 - 6.0);
+        rays.push(Ray {
+            origin: GridPosition::from_local(origin).ok_or(PhysicsError::OutOfRange)?,
+            direction: (target - origin).normalize(),
+            max_distance: 40.0,
+        });
+    }
+    let filter = QueryFilter::default();
+    let mut out = Vec::new();
+    let mut times = Vec::with_capacity(100);
+    for _ in 0..100 {
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => world.raycast_batch(&rays, &filter, pool, &mut out),
+            None => world.raycast_batch(&rays, &filter, &Sequential, &mut out),
+        });
+        times.push(started.elapsed());
+    }
+    let hits = out.iter().filter(|hit| matches!(hit, Ok(Some(_)))).count();
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{hits} of 10000 hit, per batch of 10000"),
+    })
+}
+
 fn queries() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;
