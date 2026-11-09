@@ -246,27 +246,7 @@ impl MovingPairs {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct Threads(usize);
-
-    impl JobDispatch for Threads {
-        fn parallelism(&self) -> usize {
-            self.0
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            let workers = self.0;
-            std::thread::scope(|scope| {
-                for worker in 0..workers {
-                    scope.spawn(move || {
-                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
-                            job(index);
-                        }
-                    });
-                }
-            });
-        }
-    }
+    use crate::dispatch::testing::Threads;
 
     #[test]
     fn a_sweep_on_threads_finds_the_pairs_one_thread_does() {

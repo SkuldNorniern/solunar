@@ -1296,6 +1296,7 @@ fn release(world: &mut PhysicsWorld, bodies: &[(BodyHandle, Shape)]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::{SkipsJobs, Threads};
     use std::collections::HashMap;
 
     use algebrix::Quat;
@@ -1568,54 +1569,19 @@ mod tests {
         assert_matches_reference(terrain.volume());
     }
 
-    /// Runs jobs backwards on scoped threads, so order or sharing bugs show.
-    struct Threads;
-
-    impl JobDispatch for Threads {
-        fn parallelism(&self) -> usize {
-            4
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            std::thread::scope(|scope| {
-                for worker in 0..4 {
-                    scope.spawn(move || {
-                        for index in (0..jobs).rev().filter(|index| index % 4 == worker) {
-                            job(index);
-                        }
-                    });
-                }
-            });
-        }
-    }
-
-    struct Lazy;
-
-    impl JobDispatch for Lazy {
-        fn parallelism(&self) -> usize {
-            1
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            for index in 1..jobs {
-                job(index);
-            }
-        }
-    }
-
     #[test]
     fn workers_give_the_same_ground_as_one_thread() {
         let (mut alone, mut shared) = (world(), world());
         let mut one = SdfTerrain::new(&mut alone, desc(hills())).unwrap();
-        let mut many = SdfTerrain::new_with(&mut shared, desc(hills()), &Threads).unwrap();
+        let mut many = SdfTerrain::new_with(&mut shared, desc(hills()), &Threads(4)).unwrap();
         for edit in edits() {
             let a = one.edit(&mut alone, edit).unwrap();
-            let b = many.edit_with(&mut shared, edit, &Threads).unwrap();
+            let b = many.edit_with(&mut shared, edit, &Threads(4)).unwrap();
             assert_eq!(a, b);
         }
         let tunnel = EditId(1);
         one.remove_tunnel(&mut alone, tunnel).unwrap();
-        many.remove_tunnel_with(&mut shared, tunnel, &Threads)
+        many.remove_tunnel_with(&mut shared, tunnel, &Threads(4))
             .unwrap();
         for key in all_keys(one.volume()) {
             assert_eq!(one.volume().brick_mesh(key), many.volume().brick_mesh(key));
@@ -1624,11 +1590,28 @@ mod tests {
 
         let revision = many.volume().revision();
         assert_eq!(
-            many.edit_with(&mut shared, edits()[0], &Lazy).map(|_| ()),
+            many.edit_with(
+                &mut shared,
+                edits()[0],
+                &SkipsJobs {
+                    parallelism: 1,
+                    skip: |index| index == 0
+                }
+            )
+            .map(|_| ()),
             Err(PhysicsError::DispatchIncomplete)
         );
         assert_eq!(many.volume().revision(), revision);
-        assert!(SdfVolume::new_with(desc(hills()), &Lazy).is_err());
+        assert!(
+            SdfVolume::new_with(
+                desc(hills()),
+                &SkipsJobs {
+                    parallelism: 1,
+                    skip: |index| index == 0
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1812,7 +1795,7 @@ mod tests {
         while let Some(job) = batch.next_job() {
             assert!(batch.job_out());
             assert!(batch.next_job().is_none());
-            let built = job.run(&Threads).unwrap();
+            let built = job.run(&Threads(4)).unwrap();
             batch.commit(&mut queued, built).unwrap();
             commits += 1;
         }
@@ -1854,7 +1837,7 @@ mod tests {
             .unwrap();
         let job = terrain.next_job().unwrap();
         // the world goes on while the job is out
-        let built = job.run(&Threads).unwrap();
+        let built = job.run(&Threads(4)).unwrap();
         for _ in 0..120 {
             world.step_fixed().unwrap();
         }
@@ -1920,7 +1903,11 @@ mod tests {
         terrain.queue_edit(dig_at(6.0, 6.0)).unwrap();
         let job = terrain.next_job().unwrap();
         assert_eq!(
-            job.run(&Lazy).map(|_| ()),
+            job.run(&SkipsJobs {
+                parallelism: 1,
+                skip: |index| index == 0
+            })
+            .map(|_| ()),
             Err(PhysicsError::DispatchIncomplete)
         );
         terrain.abandon();
@@ -1995,7 +1982,7 @@ mod tests {
     fn drain(terrain: &mut SdfTerrain, world: &mut PhysicsWorld) -> usize {
         let mut jobs = 0;
         while let Some(job) = terrain.next_job() {
-            let built = job.run(&Threads).unwrap();
+            let built = job.run(&Threads(4)).unwrap();
             terrain.commit(world, built).unwrap();
             jobs += 1;
         }
@@ -2081,7 +2068,7 @@ mod tests {
         terrain.queue_move_tunnel(tunnel, hole_at(10.0)).unwrap();
         assert_eq!(terrain.pending(), 2);
         terrain
-            .commit(&mut world, out.run(&Threads).unwrap())
+            .commit(&mut world, out.run(&Threads(4)).unwrap())
             .unwrap();
         drain(&mut terrain, &mut world);
         assert!(terrain.volume().distance(Vec3::new(10.0, 6.0, 12.0)) > 0.0);

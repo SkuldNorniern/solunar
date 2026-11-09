@@ -742,41 +742,7 @@ fn in_chunks_of<R: Send>(
 mod tests {
     use super::*;
     use crate::dispatch::Sequential;
-
-    struct Threads(usize);
-
-    impl JobDispatch for Threads {
-        fn parallelism(&self) -> usize {
-            self.0
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            let workers = self.0;
-            std::thread::scope(|scope| {
-                for worker in 0..workers {
-                    scope.spawn(move || {
-                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
-                            job(index);
-                        }
-                    });
-                }
-            });
-        }
-    }
-
-    struct Skips;
-
-    impl JobDispatch for Skips {
-        fn parallelism(&self) -> usize {
-            1
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            for index in 1..jobs {
-                job(index);
-            }
-        }
-    }
+    use crate::dispatch::testing::{SkipsJobs, Threads};
 
     fn world() -> FluidWorld {
         FluidWorld::new(FluidSettings::default()).unwrap()
@@ -996,7 +962,10 @@ mod tests {
             Err(PhysicsError::OutOfRange)
         );
         assert_eq!(
-            fluid.update_neighbors(&Skips),
+            fluid.update_neighbors(&SkipsJobs {
+                parallelism: 1,
+                skip: |index| index == 0
+            }),
             Err(PhysicsError::DispatchIncomplete)
         );
     }

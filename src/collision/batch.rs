@@ -71,31 +71,11 @@ impl PhysicsWorld {
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::Threads;
     use algebrix::{Quat, Vec3};
 
     use super::*;
     use crate::{GridPosition, PhysicsSettings, RigidBodyDesc, Sequential, Shape};
-
-    struct Threads(usize);
-
-    impl JobDispatch for Threads {
-        fn parallelism(&self) -> usize {
-            self.0
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            let workers = self.0;
-            std::thread::scope(|scope| {
-                for worker in 0..workers {
-                    scope.spawn(move || {
-                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
-                            job(index);
-                        }
-                    });
-                }
-            });
-        }
-    }
 
     #[test]
     fn batches_answer_as_single_queries_do_on_any_worker_count() {

@@ -239,9 +239,10 @@ pub(crate) fn update_sleep(
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::SkipsJobs;
     use crate::{
-        BodyHandle, Command, CommandBuffer, JobDispatch, PhysicsError, PhysicsSettings,
-        PhysicsWorld, RigidBodyDesc, Shape, Vec3,
+        BodyHandle, Command, CommandBuffer, PhysicsError, PhysicsSettings, PhysicsWorld,
+        RigidBodyDesc, Shape, Vec3,
     };
 
     fn world() -> PhysicsWorld {
@@ -615,16 +616,6 @@ mod tests {
         assert_eq!(loaded.state_hash(), world.state_hash());
     }
 
-    struct SkipsJobs;
-
-    impl JobDispatch for SkipsJobs {
-        fn parallelism(&self) -> usize {
-            2
-        }
-
-        fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
-    }
-
     #[test]
     fn failed_step_does_not_wake_anything() {
         let (mut world, _, boxes) = sleeping_stack(2);
@@ -641,7 +632,10 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            world.step_with(&SkipsJobs),
+            world.step_with(&SkipsJobs {
+                parallelism: 2,
+                skip: |_| true
+            }),
             Err(PhysicsError::DispatchIncomplete)
         );
         assert!(asleep(&world, boxes[0]));

@@ -1017,28 +1017,8 @@ mod tests {
     use super::*;
     use crate::body::RigidBodyDesc;
     use crate::dispatch::Sequential;
+    use crate::dispatch::testing::Threads;
     use crate::world::PhysicsSettings;
-
-    struct Threads(usize);
-
-    impl JobDispatch for Threads {
-        fn parallelism(&self) -> usize {
-            self.0
-        }
-
-        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-            let workers = self.0;
-            std::thread::scope(|scope| {
-                for worker in 0..workers {
-                    scope.spawn(move || {
-                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
-                            job(index);
-                        }
-                    });
-                }
-            });
-        }
-    }
 
     const TICK: f32 = 1.0 / 60.0;
 

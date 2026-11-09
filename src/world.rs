@@ -1157,6 +1157,7 @@ fn finite(value: Vec3, what: &'static str) -> Result<(), PhysicsError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::SkipsJobs;
     use std::thread;
 
     use algebrix::IVec3;
@@ -1203,16 +1204,6 @@ mod tests {
                 }
             });
         }
-    }
-
-    struct SkipsJobs;
-
-    impl JobDispatch for SkipsJobs {
-        fn parallelism(&self) -> usize {
-            2
-        }
-
-        fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
     }
 
     fn island_scene() -> PhysicsWorld {
@@ -1793,7 +1784,10 @@ mod tests {
         }
         let before = world.body_state(body).unwrap();
         assert_eq!(
-            world.step_with(&SkipsJobs),
+            world.step_with(&SkipsJobs {
+                parallelism: 2,
+                skip: |_| true
+            }),
             Err(PhysicsError::DispatchIncomplete)
         );
         assert_eq!(world.body_state(body).unwrap(), before);

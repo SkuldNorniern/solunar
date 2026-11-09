@@ -22,6 +22,50 @@ impl JobDispatch for Sequential {
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use super::JobDispatch;
+
+    /// Runs jobs backwards on scoped threads, so order or sharing bugs show.
+    pub(crate) struct Threads(pub(crate) usize);
+
+    impl JobDispatch for Threads {
+        fn parallelism(&self) -> usize {
+            self.0
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            let workers = self.0;
+            std::thread::scope(|scope| {
+                for worker in 0..workers {
+                    scope.spawn(move || {
+                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
+                            job(index);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    pub(crate) struct SkipsJobs {
+        pub(crate) parallelism: usize,
+        pub(crate) skip: fn(usize) -> bool,
+    }
+
+    impl JobDispatch for SkipsJobs {
+        fn parallelism(&self) -> usize {
+            self.parallelism
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            for index in (0..jobs).filter(|&index| !(self.skip)(index)) {
+                job(index);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

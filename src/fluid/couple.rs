@@ -635,23 +635,7 @@ mod tests {
 
     #[test]
     fn coupling_is_the_same_on_any_thread_count() {
-        struct Threads;
-        impl JobDispatch for Threads {
-            fn parallelism(&self) -> usize {
-                4
-            }
-            fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
-                std::thread::scope(|scope| {
-                    for worker in 0..4 {
-                        scope.spawn(move || {
-                            for index in (0..jobs).rev().filter(|index| index % 4 == worker) {
-                                job(index);
-                            }
-                        });
-                    }
-                });
-            }
-        }
+        use crate::dispatch::testing::Threads;
         let go = |dispatch: &dyn JobDispatch| {
             let (mut fluid, mut world) = pool();
             let body = drop_box(&mut fluid, &mut world, 800.0);
@@ -664,7 +648,7 @@ mod tests {
                 world.body_state(body).unwrap().position.local.y.to_bits(),
             )
         };
-        assert_eq!(go(&Sequential), go(&Threads));
+        assert_eq!(go(&Sequential), go(&Threads(4)));
     }
 
     #[test]

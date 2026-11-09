@@ -263,6 +263,7 @@ pub(crate) fn part_material(bodies: &Bodies, dense: usize, part: u32) -> Materia
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::SkipsJobs;
     use algebrix::IVec3;
 
     use crate::{
@@ -750,21 +751,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn a_dispatcher_skipping_contact_jobs_fails_and_leaves_state() {
-        struct Skips;
-        impl JobDispatch for Skips {
-            fn parallelism(&self) -> usize {
-                2
-            }
-
-            fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
-        }
         // under the size where integration dispatches, so contact finding is what skips
         let (mut world, _, _) = pyramid(40);
         assert!(world.body_count() < 1024);
         world.step_fixed().unwrap();
         let before = world.state_hash();
         assert_eq!(
-            world.step_with(&Skips),
+            world.step_with(&SkipsJobs {
+                parallelism: 2,
+                skip: |_| true
+            }),
             Err(crate::PhysicsError::DispatchIncomplete)
         );
         assert_eq!(world.state_hash(), before);

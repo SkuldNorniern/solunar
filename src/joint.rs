@@ -1067,6 +1067,7 @@ fn apply_row(pair: &mut Pair, row: &JointRow, impulse: f32) {
 
 #[cfg(test)]
 mod tests {
+    use crate::dispatch::testing::SkipsJobs;
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
     use super::*;
@@ -1983,16 +1984,6 @@ mod tests {
         assert_eq!(loaded.state_hash(), world.state_hash());
     }
 
-    struct SkipsJobs;
-
-    impl crate::JobDispatch for SkipsJobs {
-        fn parallelism(&self) -> usize {
-            2
-        }
-
-        fn run(&self, _jobs: usize, _job: &(dyn Fn(usize) + Sync)) {}
-    }
-
     #[test]
     fn failed_step_keeps_the_joint_impulses() {
         let mut world = world();
@@ -2011,7 +2002,14 @@ mod tests {
         }
         let before = world.joint_reaction(joint).unwrap();
         let bytes = world.save_snapshot();
-        assert!(world.step_with(&SkipsJobs).is_err());
+        assert!(
+            world
+                .step_with(&SkipsJobs {
+                    parallelism: 2,
+                    skip: |_| true
+                })
+                .is_err()
+        );
         assert_eq!(world.joint_reaction(joint).unwrap(), before);
         assert_eq!(world.save_snapshot(), bytes);
     }
