@@ -21,6 +21,7 @@ pub(crate) struct ConvexHull {
     face_starts: Vec<u32>,
     face_corners: Vec<u32>,
     edges: Vec<Vec3>,
+    edge_faces: Vec<EdgeFaces>,
     pub(crate) unit: MassProperties,
     pub(crate) radius: f32,
     pub(crate) box_center: Vec3,
@@ -33,6 +34,34 @@ struct RawHull {
     face_starts: Vec<u32>,
     face_corners: Vec<u32>,
     edges: Vec<Vec3>,
+    edge_faces: Vec<EdgeFaces>,
+}
+
+/// An edge's two corners and the two faces it joins.
+pub(crate) type EdgeFaces = [u32; 4];
+
+/// Each edge once with its two faces, empty when one is not on exactly two, as on a hull with a
+/// sliver face. The separating axis test then falls back to every pair of edge directions.
+fn pair_edges(face_starts: &[u32], face_corners: &[u32]) -> Vec<EdgeFaces> {
+    let mut sides: Vec<(u32, u32, u32)> = Vec::new();
+    for (face, range) in face_starts.windows(2).enumerate() {
+        let corners = &face_corners[range[0] as usize..range[1] as usize];
+        for (at, first) in corners.iter().enumerate() {
+            let second = corners[(at + 1) % corners.len()];
+            sides.push(((*first).min(second), (*first).max(second), face as u32));
+        }
+    }
+    sides.sort_unstable();
+    let mut paired = Vec::with_capacity(sides.len() / 2);
+    for pair in sides.chunks(2) {
+        match pair {
+            [one, two] if one.0 == two.0 && one.1 == two.1 => {
+                paired.push([one.0, one.1, one.2, two.2]);
+            }
+            _ => return Vec::new(),
+        }
+    }
+    paired
 }
 
 /// Every plane through three points with all points on one side is a face.
@@ -156,12 +185,14 @@ fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
         }
         face_starts.push(face_corners.len() as u32);
     }
+    let edge_faces = pair_edges(&face_starts, &face_corners);
     Ok(RawHull {
         vertices,
         planes,
         face_starts,
         face_corners,
         edges,
+        edge_faces,
     })
 }
 
@@ -254,6 +285,7 @@ impl ConvexHull {
             face_starts: hull.face_starts,
             face_corners: hull.face_corners,
             edges: hull.edges,
+            edge_faces: hull.edge_faces,
             unit,
             radius,
             box_center: (low + high) * 0.5,
@@ -363,8 +395,25 @@ pub(crate) struct Poly<'a> {
     edge_count: usize,
     face_starts: &'a [u32],
     face_corners: &'a [u32],
+    edge_faces: &'a [EdgeFaces],
     pub(crate) center: Vec3,
 }
+
+/// Corners by bits x 1, y 2, z 4, faces +x -x +y -y +z -z.
+const BOX_EDGE_FACES: [EdgeFaces; 12] = [
+    [0, 1, 3, 5],
+    [2, 3, 2, 5],
+    [4, 5, 3, 4],
+    [6, 7, 2, 4],
+    [0, 2, 1, 5],
+    [1, 3, 0, 5],
+    [4, 6, 1, 4],
+    [5, 7, 0, 4],
+    [0, 4, 1, 3],
+    [1, 5, 0, 3],
+    [2, 6, 1, 2],
+    [3, 7, 0, 2],
+];
 
 const BOX_STARTS: [u32; 7] = [0, 4, 8, 12, 16, 20, 24];
 const BOX_CORNERS: [u32; 24] = [
@@ -383,7 +432,7 @@ impl Poly<'static> {
             rotation.rotate_vec3(Vec3::Y),
             rotation.rotate_vec3(Vec3::Z),
         ];
-        let mut poly = Self::empty(&BOX_STARTS, &BOX_CORNERS, center);
+        let mut poly = Self::empty(&BOX_STARTS, &BOX_CORNERS, &BOX_EDGE_FACES, center);
         for index in 0..8 {
             let side = |bit: usize| {
                 if index >> bit & 1 == 1 { 1.0 } else { -1.0 }
@@ -408,7 +457,12 @@ impl Poly<'static> {
 }
 
 impl<'a> Poly<'a> {
-    fn empty(face_starts: &'a [u32], face_corners: &'a [u32], center: Vec3) -> Self {
+    fn empty(
+        face_starts: &'a [u32],
+        face_corners: &'a [u32],
+        edge_faces: &'a [EdgeFaces],
+        center: Vec3,
+    ) -> Self {
         Self {
             vertices: [Vec3::ZERO; MAX_CONVEX_POINTS],
             vertex_count: 0,
@@ -418,12 +472,18 @@ impl<'a> Poly<'a> {
             edge_count: 0,
             face_starts,
             face_corners,
+            edge_faces,
             center,
         }
     }
 
     pub(crate) fn of_hull(hull: &'a ConvexHull, rotation: Quat, center: Vec3) -> Self {
-        let mut poly = Self::empty(&hull.face_starts, &hull.face_corners, center);
+        let mut poly = Self::empty(
+            &hull.face_starts,
+            &hull.face_corners,
+            &hull.edge_faces,
+            center,
+        );
         poly.vertex_count = hull.vertices.len().min(MAX_CONVEX_POINTS);
         for (out, vertex) in poly.vertices.iter_mut().zip(&hull.vertices) {
             *out = center + rotation.rotate_vec3(*vertex);
@@ -608,6 +668,85 @@ pub(crate) fn poly_poly(a: &Poly<'_>, b: &Poly<'_>, margin: f32) -> Option<RawMa
             face_of_a = false;
         }
     }
+    let (best_edge, edge_normal) = if a.edge_faces.is_empty() || b.edge_faces.is_empty() {
+        every_edge_pair(a, b, best_face, margin)?
+    } else {
+        minkowski_edges(a, b, best_face, margin)?
+    };
+    if let Some(normal) = edge_normal {
+        let mut result = RawManifold::new(normal);
+        let on_a = a.support(normal);
+        let on_b = b.support(-normal);
+        result.push((on_a + on_b) * 0.5, -best_edge);
+        return Some(result);
+    }
+    if face_of_a {
+        face_contact(a, b, face_index, false, margin)
+    } else {
+        face_contact(b, a, face_index, true, margin)
+    }
+}
+
+/// The edge pair axes of two hulls, only for pairs whose faces' normals make a face of their
+/// Minkowski difference (their arcs on the unit sphere cross), each measured from the edges' own
+/// corners: any other pair's axis is never the deepest. The best gap past `best_face` and its
+/// axis, or none when an axis separates them by more than `margin`.
+fn minkowski_edges(
+    a: &Poly<'_>,
+    b: &Poly<'_>,
+    best_face: f32,
+    margin: f32,
+) -> Option<(f32, Option<Vec3>)> {
+    let mut best_edge = best_face;
+    let mut edge_normal = None;
+    for edge_a in a.edge_faces {
+        let start_a = a.vertices[edge_a[0] as usize];
+        let along_a = a.vertices[edge_a[1] as usize] - start_a;
+        let face_a = a.planes[edge_a[2] as usize].0;
+        let other_a = a.planes[edge_a[3] as usize].0;
+        let across_a = other_a.cross(face_a);
+        for edge_b in b.edge_faces {
+            // b's normals turned round, so its faces meet a's in the difference
+            let face_b = -b.planes[edge_b[2] as usize].0;
+            let other_b = -b.planes[edge_b[3] as usize].0;
+            let across_b = other_b.cross(face_b);
+            let (cba, dba) = (face_b.dot(across_a), other_b.dot(across_a));
+            let (adc, bdc) = (face_a.dot(across_b), other_a.dot(across_b));
+            if cba * dba >= 0.0 || adc * bdc >= 0.0 || cba * bdc <= 0.0 {
+                continue;
+            }
+            let start_b = b.vertices[edge_b[0] as usize];
+            let along_b = b.vertices[edge_b[1] as usize] - start_b;
+            let crossed = along_a.cross(along_b);
+            let length = crossed.length();
+            if length < 1e-3 * along_a.length() * along_b.length() {
+                continue;
+            }
+            let mut axis = crossed * length.recip();
+            if axis.dot(start_a - a.center) < 0.0 {
+                axis = -axis;
+            }
+            let gap = axis.dot(start_b - start_a);
+            if gap > margin {
+                return None;
+            }
+            // faces win ties, they give full manifolds
+            if gap > best_edge + EDGE_BIAS {
+                best_edge = gap;
+                edge_normal = Some(axis);
+            }
+        }
+    }
+    Some((best_edge, edge_normal))
+}
+
+/// Every pair of edge directions, each axis measured over all corners.
+fn every_edge_pair(
+    a: &Poly<'_>,
+    b: &Poly<'_>,
+    best_face: f32,
+    margin: f32,
+) -> Option<(f32, Option<Vec3>)> {
     let between = b.center - a.center;
     let mut best_edge = best_face;
     let mut edge_normal = None;
@@ -633,18 +772,7 @@ pub(crate) fn poly_poly(a: &Poly<'_>, b: &Poly<'_>, margin: f32) -> Option<RawMa
             }
         }
     }
-    if let Some(normal) = edge_normal {
-        let mut result = RawManifold::new(normal);
-        let on_a = a.support(normal);
-        let on_b = b.support(-normal);
-        result.push((on_a + on_b) * 0.5, -best_edge);
-        return Some(result);
-    }
-    if face_of_a {
-        face_contact(a, b, face_index, false, margin)
-    } else {
-        face_contact(b, a, face_index, true, margin)
-    }
+    Some((best_edge, edge_normal))
 }
 
 /// A sphere or capsule, as the hull's segment and radius, against a convex shape.
@@ -1192,6 +1320,70 @@ mod tests {
             }
         }
         assert!(touching > 500 && apart > 500, "{touching} {apart}");
+    }
+
+    #[test]
+    fn edge_pairs_on_the_gauss_map_give_what_every_pair_gives() {
+        let unit = MassProperties {
+            mass: 1.0,
+            inertia: Vec3::ONE,
+        };
+        let pattern = crate::voronoi_box(Vec3::new(0.4, 0.3, 0.05), 40, 9).unwrap();
+        let hulls: Vec<ConvexHull> = pattern
+            .pieces
+            .iter()
+            .map(|piece| {
+                let points: Vec<Vec3> = piece.points.iter().map(|p| *p - piece.center).collect();
+                ConvexHull::from_rebased(&points, unit).unwrap()
+            })
+            .collect();
+        assert!(hulls.iter().all(|hull| !hull.edge_faces.is_empty()));
+        let mut state = 0x1234_5678_9abc_def1_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 2000) as f32 / 1000.0 - 1.0
+        };
+        let deepest = |hit: &RawManifold| {
+            hit.points[..hit.count]
+                .iter()
+                .fold(f32::NEG_INFINITY, |most, point| most.max(point.depth))
+        };
+        let (mut touching, mut apart) = (0, 0);
+        for round in 0..20_000 {
+            let a = &hulls[round % hulls.len()];
+            let b = &hulls[(round * 7 + 3) % hulls.len()];
+            let turn_a = Quat::new(next(), next(), next(), next() + 2.0).normalize();
+            let turn_b = Quat::new(next(), next(), next(), next() + 2.0).normalize();
+            let center = Vec3::new(next(), next(), next()) * 0.25;
+            let poly_a = Poly::of_hull(a, turn_a, Vec3::ZERO);
+            let poly_b = Poly::of_hull(b, turn_b, center);
+            let mut every_a = Poly::of_hull(a, turn_a, Vec3::ZERO);
+            let mut every_b = Poly::of_hull(b, turn_b, center);
+            every_a.edge_faces = &[];
+            every_b.edge_faces = &[];
+            let pruned = poly_poly(&poly_a, &poly_b, 0.01);
+            let every = poly_poly(&every_a, &every_b, 0.01);
+            match (pruned, every) {
+                (None, None) => apart += 1,
+                (Some(pruned), Some(every)) => {
+                    // every pair turns each axis toward b's center, which deep in can point it
+                    // the wrong way and miss the shallowest. pruned turns it out of a's edge
+                    let (one, two) = (deepest(&pruned), deepest(&every));
+                    assert!(one <= two + 2e-3, "{round}: {one} {two}");
+                    if two < 0.02 {
+                        assert!((one - two).abs() < 2e-3, "{round}: {one} {two}");
+                    }
+                    touching += 1;
+                }
+                // apart, the gap over the faces of their difference can be less than over
+                // other edge pairs, so this keeps a speculative point every pair dropped
+                (Some(pruned), None) if deepest(&pruned) < 0.0 => apart += 1,
+                (one, two) => panic!("{round}: {one:?} against {two:?}"),
+            }
+        }
+        assert!(touching > 2000 && apart > 2000, "{touching} {apart}");
     }
 
     #[test]
