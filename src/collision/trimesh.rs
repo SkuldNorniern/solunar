@@ -247,6 +247,146 @@ impl TriMesh {
     }
 }
 
+impl TriMesh {
+    /// Nearest front face along unit `direction` from `origin`, in mesh axes, before `max`:
+    /// time, face normal and triangle. Equal times go to the lower triangle. With `first`, any
+    /// hit will do.
+    pub(crate) fn ray(
+        &self,
+        origin: DVec3,
+        direction: DVec3,
+        max: f64,
+        first: bool,
+    ) -> Option<(f64, DVec3, u32)> {
+        let (enter, leave) = slab(&self.bounds, origin, direction, max)?;
+        let mut best: Option<(f64, DVec3, u32)> = None;
+        let test = |index: u32, best: &mut Option<(f64, DVec3, u32)>| {
+            let limit = best.map_or(max, |found| found.0);
+            if let Some((time, normal)) =
+                ray_triangle(origin, direction, &self.triangle(index), limit)
+                && best.is_none_or(|found| (time, index) < (found.0, found.2))
+            {
+                *best = Some((time, normal, index));
+            }
+        };
+        match &self.lookup {
+            Lookup::Grid {
+                columns,
+                rows,
+                spacing_x,
+                spacing_z,
+            } => {
+                let (cells_x, cells_z) = (i64::from(*columns) - 1, i64::from(*rows) - 1);
+                let (size_x, size_z) = (f64::from(*spacing_x), f64::from(*spacing_z));
+                let at = origin + direction * enter;
+                let mut x = ((at.x / size_x).floor() as i64).clamp(0, cells_x - 1);
+                let mut z = ((at.z / size_z).floor() as i64).clamp(0, cells_z - 1);
+                // time to the next cell edge on an axis, and the time one cell takes
+                let walk = |cell: i64, size: f64, from: f64, along: f64| {
+                    if along > 0.0 {
+                        (((cell + 1) as f64 * size - from) / along, size / along, 1)
+                    } else if along < 0.0 {
+                        ((cell as f64 * size - from) / along, -size / along, -1)
+                    } else {
+                        (f64::INFINITY, f64::INFINITY, 0)
+                    }
+                };
+                let (mut next_x, step_x, by_x) = walk(x, size_x, origin.x, direction.x);
+                let (mut next_z, step_z, by_z) = walk(z, size_z, origin.z, direction.z);
+                loop {
+                    let cell = ((z * cells_x + x) * 2) as u32;
+                    test(cell, &mut best);
+                    test(cell + 1, &mut best);
+                    let exit = next_x.min(next_z);
+                    // a later cell only holds later times
+                    let shortest = best.map_or(leave, |found| found.0.min(leave));
+                    if exit > shortest || (first && best.is_some()) {
+                        break;
+                    }
+                    if next_x < next_z {
+                        x += by_x;
+                        next_x += step_x;
+                    } else {
+                        z += by_z;
+                        next_z += step_z;
+                    }
+                    if !(0..cells_x).contains(&x) || !(0..cells_z).contains(&z) {
+                        break;
+                    }
+                }
+            }
+            Lookup::Bvh { nodes, order } => {
+                let mut stack = crate::collision::tree::Pending::new((0_u32, enter));
+                while let Some((at, near)) = stack.pop() {
+                    if best.is_some_and(|found| near > found.0) {
+                        continue;
+                    }
+                    let node = &nodes[at as usize];
+                    if node.count > 0 {
+                        let range = node.first as usize..(node.first + node.count) as usize;
+                        for index in &order[range] {
+                            test(*index, &mut best);
+                        }
+                        if first && best.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let limit = best.map_or(max, |found| found.0);
+                    let (a, b) = (at + 1, node.first);
+                    let near_a = slab(&nodes[a as usize].bounds, origin, direction, limit);
+                    let near_b = slab(&nodes[b as usize].bounds, origin, direction, limit);
+                    // the nearer child goes on top
+                    match (near_a, near_b) {
+                        (Some((ta, _)), Some((tb, _))) if ta <= tb => {
+                            stack.push((b, tb));
+                            stack.push((a, ta));
+                        }
+                        (Some((ta, _)), Some((tb, _))) => {
+                            stack.push((a, ta));
+                            stack.push((b, tb));
+                        }
+                        (Some((ta, _)), None) => stack.push((a, ta)),
+                        (None, Some((tb, _))) => stack.push((b, tb)),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Where a ray is inside a box, between 0 and `max`, with some room for rounding.
+fn slab(bounds: &Aabb, origin: DVec3, direction: DVec3, max: f64) -> Option<(f64, f64)> {
+    let span = bounds.max - bounds.min;
+    let room = 1e-5 * (1.0 + f64::from(span.x.max(span.y).max(span.z)));
+    let (min, top) = (bounds.min.to_array(), bounds.max.to_array());
+    let (origin, direction) = (
+        [origin.x, origin.y, origin.z],
+        [direction.x, direction.y, direction.z],
+    );
+    let (mut near, mut far) = (0.0_f64, max);
+    for axis in 0..3 {
+        let (low, high) = (f64::from(min[axis]) - room, f64::from(top[axis]) + room);
+        let (from, along) = (origin[axis], direction[axis]);
+        if along.abs() < 1e-300 {
+            if from < low || from > high {
+                return None;
+            }
+            continue;
+        }
+        let inverse = along.recip();
+        let (a, b) = ((low - from) * inverse, (high - from) * inverse);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return None;
+        }
+    }
+    Some((near, far))
+}
+
 /// Smallest edge cross product a mesh triangle may have, twice its area.
 pub(crate) const MIN_TRIANGLE_CROSS: f32 = 1e-8;
 
@@ -703,6 +843,57 @@ mod tests {
             friction: 0.0,
             ..Material::default()
         }
+    }
+
+    #[test]
+    fn mesh_rays_answer_like_every_triangle_tried() {
+        let (columns, rows) = (17, 13);
+        let heights: Vec<f32> = (0..columns * rows)
+            .map(|i| ((i % columns) as f32 * 0.9).sin() * 1.5 + ((i / columns) as f32 * 0.6).cos())
+            .collect();
+        let grid = TriMesh::from_heights(columns, rows, 0.7, 1.3, &heights).unwrap();
+        let tree = TriMesh::from_triangles(grid.vertices.clone(), grid.triangles.clone()).unwrap();
+        let mut seed = 7_u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let mut hits = 0;
+        for i in 0..3000 {
+            let origin = DVec3::new(
+                random() * 16.0 - 2.0,
+                random() * 8.0 - 3.0,
+                random() * 20.0 - 2.0,
+            );
+            let direction = match i % 5 {
+                0 => DVec3::new(0.0, -1.0, 0.0),
+                1 => DVec3::new(random() - 0.5, 0.0, 0.0).normalize(),
+                _ => DVec3::new(random() - 0.5, random() - 0.5, random() - 0.5).normalize(),
+            };
+            let max = random() * 30.0;
+            let mut wanted: Option<(f64, u32)> = None;
+            for index in 0..grid.triangles.len() as u32 {
+                let limit = wanted.map_or(max, |found| found.0);
+                if let Some((time, _)) =
+                    ray_triangle(origin, direction, &grid.triangle(index), limit)
+                    && wanted.is_none_or(|found| (time, index) < found)
+                {
+                    wanted = Some((time, index));
+                }
+            }
+            hits += usize::from(wanted.is_some());
+            for mesh in [&grid, &tree] {
+                let found = mesh
+                    .ray(origin, direction, max, false)
+                    .map(|(time, _, index)| (time, index));
+                assert_eq!(found, wanted, "ray {i}");
+                let any = mesh.ray(origin, direction, max, true);
+                assert_eq!(any.is_some(), wanted.is_some(), "ray {i}");
+            }
+        }
+        assert!(hits > 500, "{hits} hits");
     }
 
     #[test]

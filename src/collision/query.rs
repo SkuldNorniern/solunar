@@ -3,7 +3,7 @@ use std::cell::Cell;
 use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use super::gjk::{Hull, distance};
-use super::trimesh::{Aabb, point_triangle, ray_triangle};
+use super::trimesh::{Aabb, point_triangle};
 use crate::{BodyHandle, FrameId, GridPosition, PhysicsError, PhysicsWorld, Shape};
 
 const MAX_CAST_ITERATIONS: usize = 64;
@@ -178,21 +178,9 @@ impl PhysicsWorld {
             let inverse = rotation.conjugate();
             let start = inverse.mul_vec3(offset);
             let along = inverse.mul_vec3(direction);
-            let tip = (start + along * limit).as_vec3();
-            let area = Aabb::around(start.as_vec3(), 0.0).union(Aabb::around(tip, 0.0));
-            mesh.for_each_near(area, |index| {
-                if first && nearest.is_some() {
-                    return;
-                }
-                let triangle = mesh.triangle(index);
-                if let Some((time, normal)) =
-                    ray_triangle(start, along, &triangle, shortest(&nearest))
-                    && nearest.is_none_or(|found| time < found.0)
-                {
-                    nearest = Some((time, rotation.mul_vec3(normal), index));
-                }
-            });
-            return nearest;
+            return mesh
+                .ray(start, along, limit, first)
+                .map(|(time, normal, index)| (time, rotation.mul_vec3(normal), index));
         }
         assets.for_each_part(body.0, body.1, |index, part, at, turn| {
             if first && nearest.is_some() {
