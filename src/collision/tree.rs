@@ -30,6 +30,8 @@ pub(crate) struct QueryTree {
     origin: GridPosition,
     nodes: Vec<Node>,
     items: Vec<u32>,
+    /// Each item's box, in the order of `items`, so a leaf tests its bodies before visiting.
+    boxes: Vec<Bounds>,
 }
 
 /// Pending nodes of a walk, in place on the call stack. A median split tree of `u32` items is
@@ -131,6 +133,7 @@ impl QueryTree {
             origin,
             nodes: Vec::with_capacity(count / 2 + 1),
             items: (0..count as u32).collect(),
+            boxes: Vec::new(),
         };
         if count > 0 {
             tree.nodes.push(Node {
@@ -141,6 +144,11 @@ impl QueryTree {
             });
             tree.split(0, 0, count, leaf, &boxes);
         }
+        tree.boxes = tree
+            .items
+            .iter()
+            .map(|item| boxes[*item as usize])
+            .collect();
         tree
     }
 
@@ -198,14 +206,15 @@ impl QueryTree {
     }
 
     /// Every body whose box, grown by `grow`, the path from `start` along unit `direction`
-    /// enters before `limit()`. `limit` is read again as it shrinks.
+    /// enters before `limit()`. `limit` is read again as it shrinks. `visit` returns true to end
+    /// the walk.
     pub(crate) fn along(
         &self,
         start: DVec3,
         direction: DVec3,
         grow: f64,
-        limit: &dyn Fn() -> f64,
-        visit: &mut dyn FnMut(usize),
+        limit: impl Fn() -> f64,
+        mut visit: impl FnMut(usize) -> bool,
     ) {
         if self.nodes.is_empty() {
             return;
@@ -214,10 +223,10 @@ impl QueryTree {
         // a component this small runs along its slab, checked by position instead
         let flat = toward.map(|component| component.abs() < 1e-300);
         let inverse = toward.map(f64::recip);
-        let enter = |node: &Node| {
+        let enter = |min: &[f64; 3], max: &[f64; 3]| {
             let (mut near, mut far) = (0.0_f64, f64::INFINITY);
             for axis in 0..3 {
-                let (low, high) = (node.min[axis] - grow, node.max[axis] + grow);
+                let (low, high) = (min[axis] - grow, max[axis] + grow);
                 if flat[axis] {
                     if from[axis] < low || from[axis] > high {
                         return None;
@@ -231,7 +240,8 @@ impl QueryTree {
             }
             (near <= far).then_some(near)
         };
-        let Some(root) = enter(&self.nodes[0]) else {
+        let node_enter = |node: &Node| enter(&node.min, &node.max);
+        let Some(root) = node_enter(&self.nodes[0]) else {
             return;
         };
         let mut stack = Pending::new((0_usize, root));
@@ -242,15 +252,18 @@ impl QueryTree {
             }
             let node = self.nodes[at];
             if node.count > 0 {
-                let first = node.first as usize;
-                for item in &self.items[first..first + node.count as usize] {
-                    visit(*item as usize);
+                let range = node.first as usize..(node.first + node.count) as usize;
+                for (item, (min, max)) in self.items[range.clone()].iter().zip(&self.boxes[range]) {
+                    let reached = enter(min, max).is_some_and(|near| near <= limit() + 1e-6);
+                    if reached && visit(*item as usize) {
+                        return;
+                    }
                 }
                 continue;
             }
             let (a, b) = (node.first as usize, node.first as usize + 1);
             // the nearer child goes on top
-            match (enter(&self.nodes[a]), enter(&self.nodes[b])) {
+            match (node_enter(&self.nodes[a]), node_enter(&self.nodes[b])) {
                 (Some(ta), Some(tb)) if ta <= tb => {
                     stack.push((b, tb));
                     stack.push((a, ta));
@@ -267,7 +280,7 @@ impl QueryTree {
     }
 
     /// Every body whose box comes within `radius` of `center` on each axis.
-    pub(crate) fn within(&self, center: DVec3, radius: f64, visit: &mut dyn FnMut(usize)) {
+    pub(crate) fn within(&self, center: DVec3, radius: f64, mut visit: impl FnMut(usize)) {
         if self.nodes.is_empty() {
             return;
         }
@@ -282,9 +295,14 @@ impl QueryTree {
                 continue;
             }
             if node.count > 0 {
-                let first = node.first as usize;
-                for item in &self.items[first..first + node.count as usize] {
-                    visit(*item as usize);
+                let range = node.first as usize..(node.first + node.count) as usize;
+                for (item, (min, max)) in self.items[range.clone()].iter().zip(&self.boxes[range]) {
+                    let apart = (0..3).any(|axis| {
+                        min[axis] > center[axis] + radius || max[axis] < center[axis] - radius
+                    });
+                    if !apart {
+                        visit(*item as usize);
+                    }
                 }
             } else {
                 stack.push(node.first as usize + 1);

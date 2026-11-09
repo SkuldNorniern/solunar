@@ -99,7 +99,16 @@ impl PhysicsWorld {
         };
         let tree = self.bodies.tree.get(&self.bodies);
         let start = tree.local(ray.origin);
-        tree.along(start, direction, 0.0, &|| shortest.get(), &mut visit);
+        tree.along(
+            start,
+            direction,
+            0.0,
+            || shortest.get(),
+            |dense| {
+                visit(dense);
+                false
+            },
+        );
         best.map(|(time, body, normal, part)| {
             let point = shifted(ray.origin, direction * time)?;
             Ok(CastHit {
@@ -122,7 +131,7 @@ impl PhysicsWorld {
         let direction = self.check_cast(ray.origin, ray.direction, ray.max_distance, filter)?;
         let max = f64::from(ray.max_distance);
         let blocked = Cell::new(false);
-        let mut visit = |dense: usize| {
+        let visit = |dense: usize| {
             if blocked.get() || !self.visible(dense, filter) {
                 return;
             }
@@ -137,7 +146,11 @@ impl PhysicsWorld {
         let start = tree.local(ray.origin);
         // once blocked, every node left is past the limit
         let limit = || if blocked.get() { -1.0 } else { max };
-        tree.along(start, direction, 0.0, &limit, &mut visit);
+        // the first hit ends the walk
+        tree.along(start, direction, 0.0, limit, |dense| {
+            visit(dense);
+            blocked.get()
+        });
         Ok(blocked.get())
     }
 
@@ -292,7 +305,16 @@ impl PhysicsWorld {
         };
         let tree = self.bodies.tree.get(&self.bodies);
         let start = tree.local(cast.origin);
-        tree.along(start, direction, own_reach, &|| shortest.get(), &mut visit);
+        tree.along(
+            start,
+            direction,
+            own_reach,
+            || shortest.get(),
+            |dense| {
+                visit(dense);
+                false
+            },
+        );
         best.map(|(time, body, normal, point, part)| {
             Ok(CastHit {
                 body,
@@ -461,7 +483,7 @@ impl PhysicsWorld {
     fn near_bodies(&self, at: GridPosition, reach: f64) -> Vec<usize> {
         let tree = self.bodies.tree.get(&self.bodies);
         let mut found = Vec::new();
-        tree.within(tree.local(at), reach, &mut |dense| found.push(dense));
+        tree.within(tree.local(at), reach, |dense| found.push(dense));
         found.sort_unstable();
         found
     }
