@@ -4,7 +4,8 @@ use crate::PhysicsError;
 
 mod motion;
 
-pub use motion::{FrameMotion, Orbit};
+pub use crate::orbit::Orbit;
+pub use motion::FrameMotion;
 
 pub const MAX_FRAME_DEPTH: usize = 64;
 
