@@ -1625,7 +1625,7 @@ fn contact_manifold(
 
 /// The material a contact on this part of the body touches: a compound part's own when it has
 /// one, the body's otherwise.
-fn part_material(bodies: &Bodies, dense: usize, part: u32) -> Material {
+pub(crate) fn part_material(bodies: &Bodies, dense: usize, part: u32) -> Material {
     let own = bodies.material[dense];
     let Shape::Compound(id) = bodies.shape[dense] else {
         return own;

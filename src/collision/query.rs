@@ -53,6 +53,9 @@ pub struct CastHit {
     pub distance: f32,
     pub point: GridPosition,
     pub normal: Vec3,
+    /// Which part was hit: a compound's child, a mesh's triangle, 0 for a plain shape. With
+    /// [`PhysicsWorld::surface_at`] it gives the material there.
+    pub part: u32,
 }
 
 /// `distance` is negative inside the body. `point` is on its surface.
@@ -76,33 +79,35 @@ impl PhysicsWorld {
     ) -> Result<Option<CastHit>, PhysicsError> {
         let direction = self.check_cast(ray.origin, ray.direction, ray.max_distance, filter)?;
         let max = f64::from(ray.max_distance);
-        let mut best: Option<(f64, BodyHandle, DVec3)> = None;
+        let mut best: Option<(f64, BodyHandle, DVec3, u32)> = None;
         let shortest = Cell::new(max);
         let mut visit = |dense: usize| {
             if !self.visible(dense, filter) {
                 return;
             }
             let limit = best.map_or(max, |found| found.0);
-            let Some((time, normal)) = self.ray_body(dense, ray.origin, direction, limit, false)
+            let Some((time, normal, part)) =
+                self.ray_body(dense, ray.origin, direction, limit, false)
             else {
                 return;
             };
             let handle = self.bodies.handle_at(dense);
             if best.is_none_or(|found| (time, handle) < (found.0, found.1)) {
-                best = Some((time, handle, normal));
+                best = Some((time, handle, normal, part));
             }
             shortest.set(best.map_or(max, |found| found.0));
         };
         let tree = self.bodies.tree.get(&self.bodies);
         let start = tree.local(ray.origin);
         tree.along(start, direction, 0.0, &|| shortest.get(), &mut visit);
-        best.map(|(time, body, normal)| {
+        best.map(|(time, body, normal, part)| {
             let point = shifted(ray.origin, direction * time)?;
             Ok(CastHit {
                 body,
                 distance: time as f32,
                 point,
                 normal: normal.as_vec3().normalize(),
+                part,
             })
         })
         .transpose()
@@ -145,7 +150,7 @@ impl PhysicsWorld {
         direction: DVec3,
         limit: f64,
         first: bool,
-    ) -> Option<(f64, DVec3)> {
+    ) -> Option<(f64, DVec3, u32)> {
         let offset = origin.offset_from(self.bodies.position(dense));
         let assets = &self.bodies.assets;
         let reach = f64::from(assets.bounding_radius(&self.bodies.shape[dense]));
@@ -153,8 +158,8 @@ impl PhysicsWorld {
             return None;
         }
         let body = (&self.bodies.shape[dense], self.bodies.rotation[dense]);
-        let mut nearest: Option<(f64, DVec3)> = None;
-        let shortest = |nearest: &Option<(f64, DVec3)>| nearest.map_or(limit, |found| found.0);
+        let mut nearest: Option<(f64, DVec3, u32)> = None;
+        let shortest = |nearest: &Option<(f64, DVec3, u32)>| nearest.map_or(limit, |found| found.0);
         if let Some(mesh) = assets.mesh(body.0) {
             let rotation = DQuat::from_quat(body.1);
             let inverse = rotation.conjugate();
@@ -171,12 +176,12 @@ impl PhysicsWorld {
                     ray_triangle(start, along, &triangle, shortest(&nearest))
                     && nearest.is_none_or(|found| time < found.0)
                 {
-                    nearest = Some((time, rotation.mul_vec3(normal)));
+                    nearest = Some((time, rotation.mul_vec3(normal), index));
                 }
             });
             return nearest;
         }
-        assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+        assets.for_each_part(body.0, body.1, |index, part, at, turn| {
             if first && nearest.is_some() {
                 return;
             }
@@ -191,10 +196,20 @@ impl PhysicsWorld {
             if let Some((time, normal)) = found
                 && nearest.is_none_or(|found| time < found.0)
             {
-                nearest = Some((time, rotation.mul_vec3(normal)));
+                nearest = Some((time, rotation.mul_vec3(normal), index));
             }
         });
         nearest
+    }
+
+    /// The material where a query hit: a compound part's own surface if it has one, else the
+    /// body's.
+    ///
+    /// # Errors
+    /// Fails on a stale body.
+    pub fn surface_at(&self, body: BodyHandle, part: u32) -> Result<crate::Material, PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        Ok(crate::solver::part_material(&self.bodies, dense, part))
     }
 
     /// Nearest hit along the sweep, the lower handle wins a tie.
@@ -217,7 +232,7 @@ impl PhysicsWorld {
             .hull_of(&cast.shape, rotation, DVec3::ZERO);
         let own_reach = f64::from(self.bodies.assets.bounding_radius(&cast.shape));
         let max = f64::from(cast.max_distance);
-        let mut best: Option<(f64, BodyHandle, DVec3, DVec3)> = None;
+        let mut best: Option<(f64, BodyHandle, DVec3, DVec3, u32)> = None;
         let shortest = Cell::new(max);
         let mut visit = |dense: usize| {
             if !self.visible(dense, filter) {
@@ -255,12 +270,12 @@ impl PhysicsWorld {
                     {
                         let normal = rotation.mul_vec3(hit.1);
                         let point = rotation.mul_vec3(hit.2) + center;
-                        best = Some((hit.0, handle, normal, point));
+                        best = Some((hit.0, handle, normal, point, index));
                     }
                 });
                 return;
             }
-            assets.for_each_part(body.0, body.1, |_, part, at, turn| {
+            assets.for_each_part(body.0, body.1, |index, part, at, turn| {
                 let limit = best.map_or(max, |found| found.0);
                 let (target, target_radius) =
                     assets.hull_of(part, turn, center + DVec3::from_vec3(at));
@@ -269,7 +284,7 @@ impl PhysicsWorld {
                     return;
                 };
                 if best.is_none_or(|found| (hit.0, handle) < (found.0, found.1)) {
-                    best = Some((hit.0, handle, hit.1, hit.2));
+                    best = Some((hit.0, handle, hit.1, hit.2, index));
                 }
             });
             shortest.set(best.map_or(max, |found| found.0));
@@ -277,12 +292,13 @@ impl PhysicsWorld {
         let tree = self.bodies.tree.get(&self.bodies);
         let start = tree.local(cast.origin);
         tree.along(start, direction, own_reach, &|| shortest.get(), &mut visit);
-        best.map(|(time, body, normal, point)| {
+        best.map(|(time, body, normal, point, part)| {
             Ok(CastHit {
                 body,
                 distance: time as f32,
                 point: shifted(cast.origin, point)?,
                 normal: normal.as_vec3().normalize(),
+                part,
             })
         })
         .transpose()
@@ -1406,6 +1422,69 @@ mod tests {
             }
         }
         assert!(hits > 200 && misses > 200, "{hits} {misses}");
+    }
+
+    #[test]
+    fn hits_name_the_part_and_its_surface() {
+        let mut world = world();
+        let rubber = crate::Material {
+            friction: 1.2,
+            restitution: 0.8,
+            ..crate::Material::DEFAULT
+        };
+        let info = world
+            .add_compound(&[
+                crate::CompoundChild::new(Shape::sphere(1.0), Vec3::new(-3.0, 0.0, 0.0)),
+                crate::CompoundChild {
+                    surface: Some(rubber),
+                    ..crate::CompoundChild::new(
+                        Shape::cuboid(Vec3::splat(1.0)),
+                        Vec3::new(3.0, 0.0, 0.0),
+                    )
+                },
+            ])
+            .unwrap();
+        let (place, turn) = info.placed(Vec3::new(0.0, 5.0, 0.0), Quat::IDENTITY);
+        let body = world
+            .spawn(
+                RigidBodyDesc::fixed(info.shape)
+                    .local_position(place)
+                    .rotation(turn),
+            )
+            .unwrap();
+        let filter = QueryFilter::default();
+        let down = |x: f32| {
+            world
+                .raycast(&ray(at(x, 20.0, 0.0), -Vec3::Y), &filter)
+                .unwrap()
+                .unwrap()
+        };
+        let (plain, boxed) = (down(-3.0), down(3.0));
+        assert_eq!((plain.body, boxed.body), (body, body));
+        assert_ne!(plain.part, boxed.part);
+        let own = world.surface_at(body, plain.part).unwrap();
+        assert_eq!(own, crate::Material::DEFAULT);
+        assert_eq!(world.surface_at(body, boxed.part).unwrap(), rubber);
+        // a mesh floor names the triangle under the ray
+        let vertices = [
+            Vec3::new(-10.0, 0.0, -10.0),
+            Vec3::new(10.0, 0.0, -10.0),
+            Vec3::new(-10.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, 10.0),
+        ];
+        let floor = world.add_mesh(&vertices, &[[0, 2, 1], [1, 2, 3]]).unwrap();
+        world
+            .spawn(RigidBodyDesc::fixed(floor).local_position(Vec3::new(0.0, -20.0, 0.0)))
+            .unwrap();
+        let near_corner = world
+            .raycast(&ray(at(-8.0, -10.0, -8.0), -Vec3::Y), &filter)
+            .unwrap()
+            .unwrap();
+        let far_corner = world
+            .raycast(&ray(at(8.0, -10.0, 8.0), -Vec3::Y), &filter)
+            .unwrap()
+            .unwrap();
+        assert_eq!((near_corner.part, far_corner.part), (0, 1));
     }
 
     #[test]
