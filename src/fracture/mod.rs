@@ -296,7 +296,7 @@ impl PhysicsWorld {
         if self.breakables.is_empty() {
             return Ok(());
         }
-        let part_dt = self.settings.fixed_timestep / self.settings.substeps as f32;
+        let dt = self.settings.fixed_timestep;
         // by handle, a split moves dense indexes
         let before: HashMap<BodyHandle, Vec3> = self
             .breakables
@@ -314,7 +314,7 @@ impl PhysicsWorld {
                 index: index as u32,
                 generation: self.breakables.generations[index],
             };
-            let result = self.load_and_split(handle, &mut breakable, part_dt, &before);
+            let result = self.load_and_split(handle, &mut breakable, dt, &before);
             self.breakables.slots[index] = Some(breakable);
             result?;
         }
@@ -325,7 +325,7 @@ impl PhysicsWorld {
         &mut self,
         handle: BreakableHandle,
         breakable: &mut Breakable,
-        part_dt: f32,
+        dt: f32,
         before: &HashMap<BodyHandle, Vec3>,
     ) -> Result<(), PhysicsError> {
         // force on each piece, and the body that pushed hardest on it
@@ -344,7 +344,7 @@ impl PhysicsWorld {
                 };
                 let load: f32 = entry.points[..entry.count]
                     .iter()
-                    .map(|point| point.impulse.x.max(0.0) / part_dt)
+                    .map(|point| point.pushed / dt)
                     .sum();
                 force[piece as usize] += load;
                 let best = &mut hitter[piece as usize];
