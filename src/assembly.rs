@@ -41,7 +41,7 @@ impl PhysicsWorld {
         children: &[CompoundChild],
     ) -> Result<(), PhysicsError> {
         let dense = self.editable(body)?;
-        let info = self.add_compound(children)?;
+        let info = self.add_owned_compound(children)?;
         let (rotation, position) = (self.bodies.rotation[dense], self.bodies.position(dense));
         let shift = rotation.rotate_vec3(info.center);
         let moved = position
@@ -81,7 +81,7 @@ impl PhysicsWorld {
         let gone: Vec<CompoundChild> = gone.into_iter().map(|(child, _)| *child).collect();
         let (rotation, position) = (self.bodies.rotation[dense], self.bodies.position(dense));
         let (linear, angular) = (self.bodies.linear[dense], self.bodies.angular[dense]);
-        let info = self.add_compound(&gone)?;
+        let info = self.add_owned_compound(&gone)?;
         let shift = rotation.rotate_vec3(info.center);
         let mut desc = RigidBodyDesc::new(self.bodies.kind[dense], info.shape)
             .material(self.bodies.material[dense])
@@ -172,7 +172,7 @@ impl PhysicsWorld {
         let momentum = spin_of(a, -middle, mass_a) + spin_of(b, offset - middle, mass_b);
         self.despawn(other)?;
         let a = self.bodies.dense_index(body)?;
-        let info = self.add_compound(&children)?;
+        let info = self.add_owned_compound(&children)?;
         let shift = turn_a.rotate_vec3(info.center);
         let moved = self
             .bodies
@@ -208,9 +208,10 @@ impl PhysicsWorld {
         (position, rotation): (crate::GridPosition, Quat),
         (linear, angular): (Vec3, Vec3),
     ) {
+        let old = std::mem::replace(&mut self.bodies.shape[dense], shape);
+        self.free_owned(old);
         let bodies = &mut self.bodies;
         let kind = bodies.kind[dense];
-        bodies.shape[dense] = shape;
         if kind == BodyKind::Dynamic {
             let mass = bodies
                 .assets
@@ -380,6 +381,74 @@ mod tests {
             state.position
         );
         assert!(state.linear_velocity.length() < 0.05);
+    }
+
+    fn live(world: &PhysicsWorld) -> usize {
+        world
+            .bodies
+            .assets
+            .compounds
+            .iter()
+            .filter(|compound| compound.life != crate::compound::Life::Freed)
+            .count()
+    }
+
+    #[test]
+    fn edits_free_the_compounds_they_replace_but_never_a_users() {
+        let mut world = no_gravity();
+        let body = rod(&mut world);
+        let first = world.bodies.shape[world.bodies.dense_index(body).unwrap()];
+        assert_eq!(live(&world), 1);
+        let children = world.compound_children(body).unwrap();
+        world.reshape_compound(body, &children[..3]).unwrap();
+        world.reshape_compound(body, &children[..2]).unwrap();
+        // the user's first and the last edit's
+        assert_eq!(live(&world), 2);
+        assert!(
+            world
+                .bodies
+                .assets
+                .compound(match first {
+                    Shape::Compound(id) => id,
+                    _ => unreachable!(),
+                })
+                .is_some()
+        );
+        let piece = world.split_compound(body, &[0]).unwrap();
+        world.merge_bodies(body, piece).unwrap();
+        assert_eq!(live(&world), 2);
+        world.despawn(body).unwrap();
+        assert_eq!(live(&world), 1);
+        // the user's own goes when asked, and its id finds nothing after
+        world.remove_compound(first).unwrap();
+        assert_eq!(live(&world), 0);
+        assert!(world.remove_compound(first).is_err());
+        assert!(world.spawn(RigidBodyDesc::dynamic(first)).is_err());
+    }
+
+    #[test]
+    fn a_compound_in_use_is_not_removed_and_freed_slots_survive_snapshots() {
+        let mut world = no_gravity();
+        let body = rod(&mut world);
+        let shape = world.bodies.shape[world.bodies.dense_index(body).unwrap()];
+        assert_eq!(world.remove_compound(shape), Err(PhysicsError::ShapeInUse));
+        let children = world.compound_children(body).unwrap();
+        world.reshape_compound(body, &children[1..]).unwrap();
+        world.reshape_compound(body, &children[2..]).unwrap();
+        world.remove_compound(shape).unwrap();
+        for _ in 0..10 {
+            world.step_fixed().unwrap();
+        }
+        let mut loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(
+            loaded.bodies.assets.compounds,
+            world.bodies.assets.compounds
+        );
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+            loaded.step_fixed().unwrap();
+        }
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
     }
 
     #[test]

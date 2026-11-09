@@ -74,8 +74,20 @@ impl CompoundInfo {
     }
 }
 
+/// Who a compound belongs to. One the world made for a body of its own, a fracture group or an
+/// edited assembly, goes with that body. One added by [`PhysicsWorld::add_compound`] stays until
+/// [`PhysicsWorld::remove_compound`]: more bodies may be spawned of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Life {
+    User,
+    Engine,
+    /// Its slot is never given out again, an old id finds nothing.
+    Freed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Compound {
+    pub(crate) life: Life,
     pub(crate) children: Vec<CompoundChild>,
     /// At density 1.
     pub(crate) unit: MassProperties,
@@ -113,12 +125,27 @@ impl Compound {
             return Err(PhysicsError::InvalidShape);
         }
         Ok(Self {
+            life: Life::User,
             children,
             unit,
             box_center: (low + high) * 0.5,
             box_half: (high - low) * 0.5,
             radius,
         })
+    }
+
+    pub(crate) fn freed() -> Self {
+        Self {
+            life: Life::Freed,
+            children: Vec::new(),
+            unit: MassProperties {
+                mass: 0.0,
+                inertia: Vec3::ZERO,
+            },
+            box_center: Vec3::ZERO,
+            box_half: Vec3::ZERO,
+            radius: 0.0,
+        }
     }
 }
 
@@ -184,7 +211,9 @@ pub(crate) struct ShapeAssets {
 
 impl ShapeAssets {
     pub(crate) fn compound(&self, id: CompoundId) -> Option<&Compound> {
-        self.compounds.get(id.0 as usize)
+        self.compounds
+            .get(id.0 as usize)
+            .filter(|compound| compound.life != Life::Freed)
     }
 
     pub(crate) fn mesh(&self, shape: &Shape) -> Option<&TriMesh> {
@@ -837,6 +866,47 @@ impl PhysicsWorld {
             center,
             axes,
         })
+    }
+
+    /// [`Self::add_compound`] for one body the world makes itself, freed with it.
+    pub(crate) fn add_owned_compound(
+        &mut self,
+        children: &[CompoundChild],
+    ) -> Result<CompoundInfo, PhysicsError> {
+        let info = self.add_compound(children)?;
+        if let Shape::Compound(id) = info.shape {
+            self.bodies.assets.compounds[id.0 as usize].life = Life::Engine;
+        }
+        Ok(info)
+    }
+
+    /// Frees `shape` if the world made it for a body that no longer has it.
+    pub(crate) fn free_owned(&mut self, shape: Shape) {
+        if let Shape::Compound(id) = shape
+            && let Some(compound) = self.bodies.assets.compounds.get_mut(id.0 as usize)
+            && compound.life == Life::Engine
+        {
+            *compound = Compound::freed();
+        }
+    }
+
+    /// Frees a compound from [`Self::add_compound`]. Its id finds nothing after, it is never
+    /// given out again.
+    ///
+    /// # Errors
+    /// Fails when `shape` is not a live compound, or a body still uses it.
+    pub fn remove_compound(&mut self, shape: Shape) -> Result<(), PhysicsError> {
+        let Shape::Compound(id) = shape else {
+            return Err(PhysicsError::InvalidShape);
+        };
+        if self.bodies.assets.compound(id).is_none() {
+            return Err(PhysicsError::InvalidShape);
+        }
+        if self.bodies.shape.contains(&shape) {
+            return Err(PhysicsError::ShapeInUse);
+        }
+        self.bodies.assets.compounds[id.0 as usize] = Compound::freed();
+        Ok(())
     }
 }
 

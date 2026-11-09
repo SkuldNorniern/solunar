@@ -4,6 +4,7 @@ mod parts;
 use std::error::Error;
 use std::fmt;
 
+use crate::compound::Life;
 use crate::{BodyHandle, PhysicsSettings, PhysicsWorld};
 
 pub(crate) use bytes::{Reader, Writer, fnv1a};
@@ -13,7 +14,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 10;
+pub const SNAPSHOT_VERSION: u32 = 11;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -142,6 +143,14 @@ impl PhysicsWorld {
 
         out.len(self.bodies.assets.compounds.len());
         for compound in &self.bodies.assets.compounds {
+            out.u8(match compound.life {
+                Life::User => 0,
+                Life::Engine => 1,
+                Life::Freed => 2,
+            });
+            if compound.life == Life::Freed {
+                continue;
+            }
             out.f32(compound.unit.mass);
             out.vec3(compound.unit.inertia);
             out.len(compound.children.len());

@@ -282,7 +282,9 @@ impl PhysicsWorld {
     /// # Errors
     /// Fails on a stale handle.
     pub fn despawn(&mut self, body: BodyHandle) -> Result<(), PhysicsError> {
+        let shape = self.bodies.shape[self.bodies.dense_index(body)?];
         self.bodies.remove(body)?;
+        self.free_owned(shape);
         self.wake_contacts_of(body);
         let attached: Vec<JointHandle> = self.joints.touching(body).collect();
         for joint in attached {

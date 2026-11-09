@@ -623,7 +623,7 @@ impl PhysicsWorld {
                     }
                 })
                 .collect();
-            self.add_compound(&children)?
+            self.add_owned_compound(&children)?
         };
         let center = turn.rotate_vec3(info.center);
         let position = at
@@ -1201,6 +1201,31 @@ mod tests {
             BreakableDesc::of(&FractureMaterial::GLASS, Vec3::ONE, at(0.0, 3.0, 0.0), 2).unwrap();
         bad.crack_spread = 1.5;
         assert!(world.add_breakable(bad).is_err());
+    }
+
+    #[test]
+    fn broken_groups_leave_no_compounds_behind() {
+        let (mut world, cube) = world_with_cube(4.0, 2.0e5);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        let groups = world.breakable_bodies(cube);
+        assert!(groups.len() > 2, "{}", groups.len());
+        let held = groups
+            .iter()
+            .filter(|body| {
+                let dense = world.bodies.dense_index(**body).unwrap();
+                matches!(world.bodies.shape[dense], Shape::Compound(_))
+            })
+            .count();
+        let live = world
+            .bodies
+            .assets
+            .compounds
+            .iter()
+            .filter(|compound| compound.life != crate::compound::Life::Freed)
+            .count();
+        assert_eq!(live, held);
     }
 
     #[test]

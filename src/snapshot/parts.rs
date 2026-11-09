@@ -8,7 +8,7 @@ use crate::body::{Bodies, Slot, inverse_mass_properties, validate_desc};
 use crate::collision::MAX_CONTACTS;
 use crate::collision::convex::{ConvexHull, MAX_CONVEX_POINTS};
 use crate::collision::trimesh::{MAX_TRIANGLES, TriMesh};
-use crate::compound::{Compound, MAX_COMPOUND_CHILDREN, MeshSlot};
+use crate::compound::{Compound, Life, MAX_COMPOUND_CHILDREN, MeshSlot};
 use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
@@ -182,10 +182,30 @@ pub(super) fn read_bodies(
     limits: &SnapshotLimits,
 ) -> Result<Bodies, SnapshotError> {
     let mut bodies = Bodies::default();
-    let compound_count = reader.count(COMPOUND_BYTES, limits.max_slots)?;
+    // a freed one is its tag alone
+    let least = if reader.version >= 11 {
+        1
+    } else {
+        COMPOUND_BYTES
+    };
+    let compound_count = reader.count(least, limits.max_slots)?;
     let mut compounds = Vec::with_capacity(compound_count);
     for _ in 0..compound_count {
-        compounds.push(read_compound(reader)?);
+        let life = if reader.version >= 11 {
+            match reader.u8()? {
+                0 => Life::User,
+                1 => Life::Engine,
+                2 => Life::Freed,
+                _ => return Err(SnapshotError::Invalid("compound life")),
+            }
+        } else {
+            Life::User
+        };
+        compounds.push(if life == Life::Freed {
+            None
+        } else {
+            Some((life, read_compound(reader)?))
+        });
     }
     let convex_count = reader.count(4 + 12 + 4, limits.max_slots)?;
     bodies.assets.convexes.reserve(convex_count);
@@ -194,9 +214,16 @@ pub(super) fn read_bodies(
     }
     // compounds come first in the data, their hull parts after
     bodies.assets.compounds.reserve(compound_count);
-    for (children, unit) in compounds {
-        let compound = Compound::from_rebased(children, unit, &bodies.assets.convexes)
-            .map_err(|_| SnapshotError::Invalid("compound"))?;
+    for stored in compounds {
+        let compound = match stored {
+            None => Compound::freed(),
+            Some((life, (children, unit))) => {
+                let mut compound = Compound::from_rebased(children, unit, &bodies.assets.convexes)
+                    .map_err(|_| SnapshotError::Invalid("compound"))?;
+                compound.life = life;
+                compound
+            }
+        };
         bodies.assets.compounds.push(compound);
     }
     let mesh_count = reader.count(5, limits.max_slots)?;
