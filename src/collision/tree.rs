@@ -32,6 +32,47 @@ pub(crate) struct QueryTree {
     items: Vec<u32>,
 }
 
+/// Pending nodes of a walk, in place on the call stack. A median split tree of `u32` items is
+/// at most 32 deep, a walk holds at most two nodes a level, so the heap is never reached in
+/// practice. It still spills there rather than lose a node.
+struct Pending<T: Copy + Default> {
+    held: [T; 64],
+    len: usize,
+    spilled: Vec<T>,
+}
+
+impl<T: Copy + Default> Pending<T> {
+    fn new(first: T) -> Self {
+        let mut held = [T::default(); 64];
+        held[0] = first;
+        Self {
+            held,
+            len: 1,
+            spilled: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, item: T) {
+        if self.len < self.held.len() {
+            self.held[self.len] = item;
+            self.len += 1;
+        } else {
+            self.spilled.push(item);
+        }
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        if let Some(item) = self.spilled.pop() {
+            return Some(item);
+        }
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.held[self.len])
+    }
+}
+
 /// Derived from the bodies, never part of what two worlds compare as.
 #[derive(Debug, Default)]
 pub(crate) struct TreeCache(OnceLock<QueryTree>);
@@ -164,18 +205,21 @@ impl QueryTree {
             return;
         }
         let (from, toward) = (axes(start), axes(direction));
+        // a component this small runs along its slab, checked by position instead
+        let flat = toward.map(|component| component.abs() < 1e-300);
+        let inverse = toward.map(f64::recip);
         let enter = |node: &Node| {
             let (mut near, mut far) = (0.0_f64, f64::INFINITY);
             for axis in 0..3 {
                 let (low, high) = (node.min[axis] - grow, node.max[axis] + grow);
-                if toward[axis].abs() < 1e-300 {
+                if flat[axis] {
                     if from[axis] < low || from[axis] > high {
                         return None;
                     }
                     continue;
                 }
-                let a = (low - from[axis]) / toward[axis];
-                let b = (high - from[axis]) / toward[axis];
+                let a = (low - from[axis]) * inverse[axis];
+                let b = (high - from[axis]) * inverse[axis];
                 near = near.max(a.min(b));
                 far = far.min(a.max(b));
             }
@@ -184,7 +228,7 @@ impl QueryTree {
         let Some(root) = enter(&self.nodes[0]) else {
             return;
         };
-        let mut stack = vec![(0_usize, root)];
+        let mut stack = Pending::new((0_usize, root));
         while let Some((at, near)) = stack.pop() {
             // some room past the limit, the exact tests decide
             if near > limit() + 1e-6 {
@@ -222,7 +266,7 @@ impl QueryTree {
             return;
         }
         let center = axes(center);
-        let mut stack = vec![0_usize];
+        let mut stack = Pending::new(0_usize);
         while let Some(at) = stack.pop() {
             let node = self.nodes[at];
             let apart = (0..3).any(|axis| {
