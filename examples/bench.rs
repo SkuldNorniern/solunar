@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use solunar::{
     Base, BodyKind, BreakableDesc, CompoundChild, Edit, EditOp, EditShape, FluidSettings,
     FluidSolver, FluidWorld, FractureMaterial, GridPosition, JobDispatch, JointDesc, JointHandle,
-    Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray,
-    RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
+    LinkDesc, Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter,
+    Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
     ShapeCast, Vec3, voronoi_box,
 };
 
@@ -24,13 +24,14 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 27] = [
+const SUITES: [(&str, Suite); 28] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
     ("moving-rays", moving_rays),
     ("fracture", fracture_wall),
     ("gallery", gallery),
+    ("ship", ship),
     ("stacks", stacks),
     ("chains", chains),
     ("net", net),
@@ -768,6 +769,71 @@ fn gallery() -> Result<Outcome> {
             worst.1,
             worst.0.as_secs_f64() * 1e3
         ),
+    })
+}
+
+/// A ship of 2000 half meter blocks, 10 by 10 by 20, each welded to its neighbours, about
+/// 5400 links, coasting while a thruster on one corner pushes it round. Timed per step with its
+/// loads.
+fn ship() -> Result<Outcome> {
+    let mut world = PhysicsWorld::new(PhysicsSettings {
+        gravity: Vec3::ZERO,
+        ..PhysicsSettings::default()
+    })?;
+    let size = (10_u32, 10_u32, 20_u32);
+    let index = |x: u32, y: u32, z: u32| (z * size.1 + y) * size.0 + x;
+    let mut parts = Vec::new();
+    for z in 0..size.2 {
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                parts.push(CompoundChild::new(
+                    Shape::cuboid(Vec3::splat(0.25)),
+                    Vec3::new(x as f32, y as f32, z as f32) * 0.5,
+                ));
+            }
+        }
+    }
+    let info = world.add_compound(&parts)?;
+    let (center, turn) = info.placed(Vec3::ZERO, Quat::IDENTITY);
+    let body = world.spawn(
+        RigidBodyDesc::dynamic(info.shape)
+            .local_position(center)
+            .rotation(turn)
+            .linear_velocity(Vec3::new(0.0, 0.0, 30.0)),
+    )?;
+    let mut links = Vec::new();
+    for z in 0..size.2 {
+        for y in 0..size.1 {
+            for x in 0..size.0 {
+                let here = index(x, y, z);
+                for (dx, dy, dz) in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+                    let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                    if nx < size.0 && ny < size.1 && nz < size.2 {
+                        links.push(LinkDesc {
+                            a: here,
+                            b: index(nx, ny, nz),
+                            strength: 1.0e9,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let structure = world.add_structure(body, &links)?;
+    let mut times = Vec::with_capacity(300);
+    for _ in 0..300 {
+        world.push_part(structure, 0, Vec3::new(2.0e5, 0.0, 0.0))?;
+        times.extend(steps(&mut world, 1)?);
+    }
+    let most = world
+        .structure_links(structure)?
+        .iter()
+        .fold(0.0_f32, |most, link| most.max(link.load));
+    Ok(Outcome {
+        bodies: links.len(),
+        times,
+        unit: "ms",
+        check: format!("most loaded link {most:.0} N"),
     })
 }
 
