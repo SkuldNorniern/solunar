@@ -1,9 +1,10 @@
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use algebrix::{DVec3, Quat, Vec3};
+use algebrix::{Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity};
+use crate::gravity::StepGravity;
 use crate::profile::PhaseTimes;
 use crate::sleep::{is_slow, plan_wakes, update_sleep};
 use crate::solver::{
@@ -11,8 +12,8 @@ use crate::solver::{
     solve_substep,
 };
 use crate::{
-    BodyHandle, BodyKind, ContactEvent, FrameId, GridPosition, JobDispatch, JointHandle,
-    PhysicsError, Sequential,
+    BodyHandle, BodyKind, ContactEvent, GridPosition, JobDispatch, JointHandle, PhysicsError,
+    Sequential,
 };
 
 use super::{Advance, Integrated, Pairs, PhysicsWorld, finite};
@@ -75,7 +76,8 @@ impl PhysicsWorld {
     ) -> Result<(), PhysicsError> {
         let started = Instant::now();
         self.failed_body = None;
-        self.prepare_frame_gravity()?;
+        self.gravity
+            .prepare(self.settings.gravity, &self.frames, &self.gravity_sources)?;
         self.remember_velocities();
         self.apply_fields();
         self.joints.refresh_exclusions();
@@ -117,7 +119,7 @@ impl PhysicsWorld {
             count.div_ceil(dispatch.parallelism().max(1))
         };
         let bodies = &self.bodies;
-        let frame_gravity = &self.frame_gravity;
+        let gravity = &self.gravity;
         let awake = self.sleep.awake();
         let substeps = self.settings.substeps;
         let part = dt / substeps as f32;
@@ -140,7 +142,7 @@ impl PhysicsWorld {
         // outside forces were worked out at the start of the step, so they go in whole before the
         // first move. spread over substeps they would lag the motion and add energy
         run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
-            integrate_velocity(bodies, frame_gravity, awake[dense], dense, slot, (part, dt));
+            integrate_velocity(bodies, gravity, awake[dense], dense, slot, (part, dt));
         })?;
         lap(&mut phases.integrate);
         for substep in 0..substeps {
@@ -171,14 +173,7 @@ impl PhysicsWorld {
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
                 integrate_position(bodies, awake[dense], dense, slot, part);
                 if next {
-                    integrate_velocity(
-                        bodies,
-                        frame_gravity,
-                        awake[dense],
-                        dense,
-                        slot,
-                        (part, 0.0),
-                    );
+                    integrate_velocity(bodies, gravity, awake[dense], dense, slot, (part, 0.0));
                 }
             })?;
             lap(&mut phases.integrate);
@@ -214,6 +209,8 @@ impl PhysicsWorld {
         }
         self.recheck_sleepers = false;
         self.tick += 1;
+        self.frames
+            .advance_to(self.tick as f64 * f64::from(self.settings.fixed_timestep));
         self.update_sensors()?;
         self.update_breakables()?;
         lap(&mut phases.finish);
@@ -241,17 +238,6 @@ impl PhysicsWorld {
                 self.broken_joints.push(joint);
             }
         }
-    }
-
-    fn prepare_frame_gravity(&mut self) -> Result<(), PhysicsError> {
-        self.frame_gravity.clear();
-        let gravity = DVec3::from_vec3(self.settings.gravity);
-        for index in 0..self.frames.len() {
-            let rotation = self.frames.root_rotation(FrameId(index as u32))?;
-            self.frame_gravity
-                .push(rotation.conjugate().mul_vec3(gravity).as_vec3());
-        }
-        Ok(())
     }
 
     fn commit(&mut self) -> Result<(), PhysicsError> {
@@ -350,7 +336,7 @@ fn starting_state(bodies: &Bodies, dense: usize) -> Integrated {
 
 fn integrate_velocity(
     bodies: &Bodies,
-    frame_gravity: &[Vec3],
+    gravity: &StepGravity,
     awake: bool,
     dense: usize,
     slot: &mut Integrated,
@@ -361,9 +347,20 @@ fn integrate_velocity(
     if bodies.kind[dense] != BodyKind::Dynamic || !awake {
         return;
     }
-    let gravity = frame_gravity[bodies.frame[dense].0 as usize];
+    let frame = bodies.frame[dense];
+    let spin = gravity.spin(frame);
+    let pull = gravity.without_coriolis(frame, slot.position);
     slot.momentum += bodies.torque[dense] * push;
-    slot.linear += gravity * dt + bodies.force[dense] * (bodies.inverse_mass[dense] * push);
+    slot.linear += bodies.force[dense] * (bodies.inverse_mass[dense] * push);
+    if spin == Vec3::ZERO {
+        slot.linear += pull * dt;
+    } else {
+        // half the pull, coriolis as the exact turn it is, the other half. pushed once, a body
+        // still in the root drifted 4.6 cm in 4 s seen from a frame turning at 0.7 rad/s, now 1.6
+        let rate = spin.length();
+        let turn = Quat::from_axis_angle(spin / rate, -2.0 * rate * dt);
+        slot.linear = turn.rotate_vec3(slot.linear + pull * (0.5 * dt)) + pull * (0.5 * dt);
+    }
     slot.angular = apply_diagonal(slot.rotation, bodies.inverse_inertia[dense], slot.momentum);
 }
 

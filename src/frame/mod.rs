@@ -2,6 +2,10 @@ use algebrix::{DQuat, DVec3};
 
 use crate::PhysicsError;
 
+mod motion;
+
+pub use motion::{FrameMotion, Orbit};
+
 pub const MAX_FRAME_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -15,7 +19,9 @@ impl FrameId {
     }
 }
 
-/// Pose and motion of a frame in its parent. `angular_velocity` is in parent axes.
+/// Pose and motion of a frame in its parent. `angular_velocity` is in parent axes. With a
+/// `motion` the pose is where it starts at time 0, and the frame moves on from there: a body in it
+/// feels that. Without one the velocities only describe it, for transfers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameDesc {
     pub parent: FrameId,
@@ -23,6 +29,7 @@ pub struct FrameDesc {
     pub rotation: DQuat,
     pub linear_velocity: DVec3,
     pub angular_velocity: DVec3,
+    pub motion: FrameMotion,
 }
 
 impl FrameDesc {
@@ -33,6 +40,7 @@ impl FrameDesc {
             rotation: DQuat::IDENTITY,
             linear_velocity: DVec3::ZERO,
             angular_velocity: DVec3::ZERO,
+            motion: FrameMotion::default(),
         }
     }
 }
@@ -47,8 +55,12 @@ pub struct FrameState {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frames {
+    /// Each frame as it is at `time`.
     descs: Vec<FrameDesc>,
+    /// As added, at time 0.
+    bases: Vec<FrameDesc>,
     depths: Vec<u32>,
+    time: f64,
 }
 
 impl Default for Frames {
@@ -61,7 +73,9 @@ impl Frames {
     pub fn new() -> Self {
         Self {
             descs: vec![FrameDesc::new(FrameId::ROOT)],
+            bases: vec![FrameDesc::new(FrameId::ROOT)],
             depths: vec![0],
+            time: 0.0,
         }
     }
 
@@ -107,17 +121,65 @@ impl Frames {
         if !finite(desc.translation)
             || !finite(desc.linear_velocity)
             || !finite(desc.angular_velocity)
+            || !desc.motion.is_valid()
         {
             return Err(PhysicsError::NonFinite("frame"));
         }
         let id = u32::try_from(self.descs.len()).map_err(|_| PhysicsError::OutOfRange)?;
-        self.descs.push(desc);
+        self.descs.push(desc.motion.moved(&desc, self.time));
+        self.bases.push(desc);
         self.depths.push(depth);
         Ok(FrameId(id))
     }
 
-    pub(crate) fn descs(&self) -> &[FrameDesc] {
-        &self.descs
+    /// Frames as added, at time 0.
+    pub(crate) fn bases(&self) -> &[FrameDesc] {
+        &self.bases
+    }
+
+    /// Seconds of world time the frames are at.
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
+    /// Moves every frame with a motion to where it is at `time`.
+    pub(crate) fn advance_to(&mut self, time: f64) {
+        self.time = time;
+        for (desc, base) in self.descs.iter_mut().zip(&self.bases).skip(1) {
+            if !base.motion.is_still() {
+                *desc = base.motion.moved(base, time);
+            }
+        }
+    }
+
+    /// Whether `frame` or one it sits in moves.
+    pub(crate) fn moves(&self, frame: FrameId) -> bool {
+        let mut current = frame;
+        while current != FrameId::ROOT {
+            let base = &self.bases[current.0 as usize];
+            if !base.motion.is_still() {
+                return true;
+            }
+            current = base.parent;
+        }
+        false
+    }
+
+    /// Where `frame`'s origin is in the root and how it moves there, at `time`.
+    pub(crate) fn origin_at(&self, frame: FrameId, time: f64) -> FrameState {
+        let mut state = FrameState {
+            position: DVec3::ZERO,
+            rotation: DQuat::IDENTITY,
+            linear_velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
+        };
+        let mut current = frame;
+        while current != FrameId::ROOT {
+            let base = &self.bases[current.0 as usize];
+            state = to_parent(&base.motion.moved(base, time), state);
+            current = base.parent;
+        }
+        state
     }
 
     pub fn root_rotation(&self, frame: FrameId) -> Result<DQuat, PhysicsError> {

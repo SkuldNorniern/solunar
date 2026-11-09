@@ -10,6 +10,7 @@ mod field;
 mod fluid;
 mod fracture;
 mod frame;
+mod gravity;
 mod inspect;
 mod joint;
 mod material;
@@ -44,7 +45,8 @@ pub use fracture::{
     BreakableDesc, BreakableHandle, FractureEvent, FractureMaterial, FracturePattern, Grain,
     MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };
-pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
+pub use frame::{FrameDesc, FrameId, FrameMotion, FrameState, Frames, MAX_FRAME_DEPTH, Orbit};
+pub use gravity::{GravityId, GravitySource, MAX_GRAVITY_SOURCES};
 pub use inspect::{ContactEvent, ContactView, IslandStats};
 pub use joint::{
     JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,

@@ -4,6 +4,7 @@ use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{Bodies, apply_diagonal, momentum_from_velocity, validate_desc};
 use crate::field::Fields;
+use crate::gravity::{GravityId, GravitySource, MAX_GRAVITY_SOURCES, StepGravity};
 use crate::joint::JointKind;
 use crate::profile::{PhaseTimes, StepTimes};
 use crate::sensor::Sensors;
@@ -117,7 +118,8 @@ pub struct PhysicsWorld {
     pub(crate) contact_scratch: ContactScratch,
     sleep: SleepScratch,
     scratch: Vec<Integrated>,
-    pub(crate) frame_gravity: Vec<Vec3>,
+    pub(crate) gravity: StepGravity,
+    pub(crate) gravity_sources: Vec<Option<GravitySource>>,
     times: StepTimes,
     phases: PhaseTimes,
 }
@@ -138,11 +140,12 @@ impl PhysicsWorld {
 
     pub(crate) fn from_parts(
         settings: PhysicsSettings,
-        frames: Frames,
+        mut frames: Frames,
         bodies: Bodies,
         tick: u64,
         accumulator: f64,
     ) -> Self {
+        frames.advance_to(tick as f64 * f64::from(settings.fixed_timestep));
         Self {
             settings,
             frames,
@@ -164,7 +167,8 @@ impl PhysicsWorld {
             contact_scratch: ContactScratch::default(),
             sleep: SleepScratch::default(),
             scratch: Vec::new(),
-            frame_gravity: Vec::new(),
+            gravity: StepGravity::default(),
+            gravity_sources: Vec::new(),
             times: StepTimes::default(),
             phases: PhaseTimes::default(),
         }
@@ -210,6 +214,47 @@ impl PhysicsWorld {
     /// Fails on an unknown parent, a too deep chain or non finite values.
     pub fn add_frame(&mut self, desc: FrameDesc) -> Result<FrameId, PhysicsError> {
         self.frames.add(desc)
+    }
+
+    /// # Errors
+    /// Fails on an unknown frame, a non finite center, mass or radius, or too many sources.
+    pub fn add_gravity(&mut self, source: GravitySource) -> Result<GravityId, PhysicsError> {
+        if !self.frames.contains(source.frame) || !source.is_valid() {
+            return Err(PhysicsError::InvalidSettings);
+        }
+        let free = self.gravity_sources.iter().position(Option::is_none);
+        let index = match free {
+            Some(index) => index,
+            None if self.gravity_sources.len() < MAX_GRAVITY_SOURCES => {
+                self.gravity_sources.push(None);
+                self.gravity_sources.len() - 1
+            }
+            None => return Err(PhysicsError::OutOfRange),
+        };
+        self.gravity_sources[index] = Some(source);
+        Ok(GravityId(index as u32))
+    }
+
+    /// Returns false for a source that was not there.
+    pub fn remove_gravity(&mut self, id: GravityId) -> bool {
+        self.gravity_sources
+            .get_mut(id.0 as usize)
+            .and_then(Option::take)
+            .is_some()
+    }
+
+    pub fn gravity_source(&self, id: GravityId) -> Option<&GravitySource> {
+        self.gravity_sources.get(id.0 as usize)?.as_ref()
+    }
+
+    /// What a body in `frame` at `position` moving at `velocity` falls with, in that frame's axes:
+    /// uniform gravity, the sources and the frame's own motion. As of the last step.
+    pub fn gravity_at(&self, frame: FrameId, position: GridPosition, velocity: Vec3) -> Vec3 {
+        if self.frames.contains(frame) && self.gravity.covers(frame) {
+            self.gravity.at(frame, position, velocity)
+        } else {
+            self.settings.gravity
+        }
     }
 
     /// # Errors

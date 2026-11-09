@@ -8,11 +8,12 @@ use crate::{BodyHandle, PhysicsSettings, PhysicsWorld};
 
 pub(crate) use bytes::{Reader, Writer, fnv1a};
 use parts::{
-    kind_tag, read_bodies, read_contacts, read_fields, read_frames, read_joints, read_sensors,
+    kind_tag, read_bodies, read_contacts, read_fields, read_frames, read_gravity, read_joints,
+    read_sensors,
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 8;
+pub const SNAPSHOT_VERSION: u32 = 9;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -94,7 +95,7 @@ impl PhysicsWorld {
         out.f64(self.accumulator);
         out.u8(u8::from(self.recheck_sleepers));
 
-        let frames = &self.frames.descs()[1..];
+        let frames = &self.frames.bases()[1..];
         out.len(frames.len());
         for frame in frames {
             out.u32(frame.parent.index());
@@ -105,6 +106,37 @@ impl PhysicsWorld {
             out.f64(frame.rotation.w);
             out.dvec3(frame.linear_velocity);
             out.dvec3(frame.angular_velocity);
+            out.dvec3(frame.motion.spin);
+            match frame.motion.orbit {
+                None => out.u8(0),
+                Some(orbit) => {
+                    out.u8(1);
+                    for value in [
+                        orbit.mu,
+                        orbit.semi_major_axis,
+                        orbit.eccentricity,
+                        orbit.inclination,
+                        orbit.ascending_node,
+                        orbit.periapsis,
+                        orbit.mean_anomaly,
+                    ] {
+                        out.f64(value);
+                    }
+                }
+            }
+        }
+        out.len(self.gravity_sources.len());
+        for source in &self.gravity_sources {
+            match source {
+                None => out.u8(0),
+                Some(source) => {
+                    out.u8(1);
+                    out.u32(source.frame.index());
+                    out.dvec3(source.center);
+                    out.f64(source.mu);
+                    out.f64(source.radius);
+                }
+            }
         }
 
         out.len(self.bodies.assets.compounds.len());
@@ -344,6 +376,11 @@ impl PhysicsWorld {
         };
 
         let frames = read_frames(&mut reader, limits)?;
+        let gravity_sources = if reader.version >= 9 {
+            read_gravity(&mut reader, &frames)?
+        } else {
+            Vec::new()
+        };
         let bodies = read_bodies(&mut reader, &frames, limits)?;
         let contact_cache = read_contacts(&mut reader, limits)?;
         let joints = read_joints(&mut reader, &bodies, limits)?;
@@ -364,6 +401,7 @@ impl PhysicsWorld {
             return Err(SnapshotError::Invalid("trailing data"));
         }
         let mut world = Self::from_parts(settings, frames, bodies, tick, accumulator);
+        world.gravity_sources = gravity_sources;
         world.contact_cache = contact_cache;
         world.joints = joints;
         world.recheck_sleepers = recheck_sleepers;
@@ -487,6 +525,44 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_gravity_source_or_orbit_fails() {
+        use crate::{FrameMotion, GravitySource, Orbit};
+        use algebrix::DVec3;
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        let mu = 123_456.75_f64;
+        world
+            .add_frame(FrameDesc {
+                motion: FrameMotion {
+                    spin: DVec3::ZERO,
+                    orbit: Some(Orbit::circular(mu, 50.0)),
+                },
+                ..FrameDesc::new(FrameId::ROOT)
+            })
+            .unwrap();
+        world
+            .add_gravity(GravitySource::point(FrameId::ROOT, DVec3::ZERO, mu))
+            .unwrap();
+        let bytes = world.save_snapshot();
+        let marker = mu.to_le_bytes();
+        let found: Vec<usize> = bytes
+            .windows(8)
+            .enumerate()
+            .filter(|(_, window)| *window == marker)
+            .map(|(at, _)| at)
+            .collect();
+        // the orbit's then the source's
+        assert_eq!(found.len(), 2);
+        for at in found {
+            for bad in [-1.0_f64, 0.0, f64::NAN] {
+                let mut broken = bytes.clone();
+                broken[at..at + 8].copy_from_slice(&bad.to_le_bytes());
+                assert!(PhysicsWorld::load_snapshot(&resealed(broken)).is_err());
+            }
+        }
+        assert!(PhysicsWorld::load_snapshot(&bytes).is_ok());
+    }
+
+    #[test]
     fn a_version_2_snapshot_still_loads_with_material_defaults() {
         let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
         let material = Material {
@@ -511,6 +587,9 @@ mod tests {
         // and the sensor, field and breakable counts at the end, all empty
         let end = bytes.len() - CHECKSUM_BYTES;
         bytes.drain(end - 3 * 4..end);
+        // and the gravity source count after the frame count, both empty
+        assert_eq!(bytes[49..57], [0; 8]);
+        bytes.drain(53..57);
         bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
         let loaded = PhysicsWorld::load_snapshot(&resealed(bytes)).unwrap();
         let read = loaded.bodies.material[loaded.bodies.dense_index(body).unwrap()];

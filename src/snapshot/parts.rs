@@ -13,8 +13,9 @@ use crate::joint::{JOINT_IMPULSES, JointSlot, JointState};
 use crate::solver::{CachedManifold, CachedPoint};
 use crate::{
     BodyHandle, BodyKind, CollisionFilter, CompoundChild, CompoundId, ConvexId, FrameDesc, FrameId,
-    Frames, GridPosition, JointAxis, JointDesc, JointKind, JointLimit, JointMotor, Joints,
-    MassProperties, Material, MeshId, RigidBodyDesc, Shape,
+    FrameMotion, Frames, GravitySource, GridPosition, JointAxis, JointDesc, JointKind, JointLimit,
+    JointMotor, Joints, MAX_GRAVITY_SOURCES, MassProperties, Material, MeshId, Orbit,
+    RigidBodyDesc, Shape,
 };
 
 pub(super) fn read_sensors(
@@ -108,6 +109,25 @@ pub(super) fn read_frames(
         let rotation = DQuat::new(reader.f64()?, reader.f64()?, reader.f64()?, reader.f64()?);
         let linear_velocity = reader.dvec3()?;
         let angular_velocity = reader.dvec3()?;
+        let motion = if reader.version >= 9 {
+            let spin = reader.dvec3()?;
+            let orbit = match reader.u8()? {
+                0 => None,
+                1 => Some(Orbit {
+                    mu: reader.f64()?,
+                    semi_major_axis: reader.f64()?,
+                    eccentricity: reader.f64()?,
+                    inclination: reader.f64()?,
+                    ascending_node: reader.f64()?,
+                    periapsis: reader.f64()?,
+                    mean_anomaly: reader.f64()?,
+                }),
+                _ => return Err(SnapshotError::Invalid("frame orbit")),
+            };
+            FrameMotion { spin, orbit }
+        } else {
+            FrameMotion::default()
+        };
         frames
             .restore(FrameDesc {
                 parent,
@@ -115,10 +135,39 @@ pub(super) fn read_frames(
                 rotation,
                 linear_velocity,
                 angular_velocity,
+                motion,
             })
             .map_err(|_| SnapshotError::Invalid("frame"))?;
     }
     Ok(frames)
+}
+
+pub(super) fn read_gravity(
+    reader: &mut Reader<'_>,
+    frames: &Frames,
+) -> Result<Vec<Option<GravitySource>>, SnapshotError> {
+    let count = reader.count(1, MAX_GRAVITY_SOURCES)?;
+    let mut sources = Vec::with_capacity(count);
+    for _ in 0..count {
+        let source = match reader.u8()? {
+            0 => None,
+            1 => {
+                let source = GravitySource {
+                    frame: FrameId(reader.u32()?),
+                    center: reader.dvec3()?,
+                    mu: reader.f64()?,
+                    radius: reader.f64()?,
+                };
+                if !frames.contains(source.frame) || !source.is_valid() {
+                    return Err(SnapshotError::Invalid("gravity source"));
+                }
+                Some(source)
+            }
+            _ => return Err(SnapshotError::Invalid("gravity source")),
+        };
+        sources.push(source);
+    }
+    Ok(sources)
 }
 
 pub(super) fn read_bodies(

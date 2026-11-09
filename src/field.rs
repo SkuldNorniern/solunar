@@ -287,7 +287,7 @@ impl PhysicsWorld {
             let (velocity, spin) = (bodies.linear[dense], bodies.angular[dense]);
             let shape = &bodies.shape[dense];
             let frame = bodies.frame[dense];
-            let up = (-self.frame_gravity[frame.0 as usize]).normalize_or(Vec3::Y);
+            let up = (-self.gravity.at(frame, position, Vec3::ZERO)).normalize_or(Vec3::Y);
             let (mut force, mut torque) = (Vec3::ZERO, Vec3::ZERO);
             for desc in self.fields.slots.iter().flatten() {
                 if desc.frame != frame
