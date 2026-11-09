@@ -12,6 +12,7 @@ mod boundary;
 mod couple;
 mod dfsph;
 mod flow;
+mod handoff;
 mod save;
 mod shallow;
 mod step;
@@ -22,6 +23,7 @@ use boundary::Walls;
 use couple::{Coupled, Movers};
 pub use flow::FlowId;
 use flow::Flows;
+pub use handoff::{Handoff, HandoffReport, hand_off};
 pub use save::{FLUID_SNAPSHOT_VERSION, MAX_FLUID_SNAPSHOT_BYTES};
 pub use shallow::{Erosion, ShallowReport, ShallowSettings, ShallowWater};
 pub use step::FluidReport;
@@ -415,6 +417,27 @@ impl FluidWorld {
         self.velocities.push(velocity);
         self.densities.push(0.0);
         Ok(id)
+    }
+
+    /// Drops every particle whose `keep` is false, the rest stay in order.
+    pub(super) fn keep_only(&mut self, keep: &[bool]) {
+        let mut index = 0;
+        self.ids.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
+        for list in [&mut self.positions, &mut self.velocities] {
+            let mut index = 0;
+            list.retain(|_| {
+                index += 1;
+                keep[index - 1]
+            });
+        }
+        let mut index = 0;
+        self.densities.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
     }
 
     /// Fills the box from `low` to `high` with particles on the rest lattice, half a spacing in

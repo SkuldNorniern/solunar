@@ -113,18 +113,18 @@ pub struct ShallowReport {
 /// cells run dry and wet again without going below zero. Edges of the grid are walls.
 #[derive(Debug, Clone)]
 pub struct ShallowWater {
-    settings: ShallowSettings,
+    pub(super) settings: ShallowSettings,
     /// Corner of cell (0, 0), its y is unused.
-    origin: Vec3,
-    size: (usize, usize),
+    pub(super) origin: Vec3,
+    pub(super) size: (usize, usize),
     bed: Vec<f32>,
-    depth: Vec<f32>,
+    pub(super) depth: Vec<f32>,
     /// Depth times velocity, along x and along z.
-    flow_x: Vec<f32>,
-    flow_z: Vec<f32>,
+    pub(super) flow_x: Vec<f32>,
+    pub(super) flow_z: Vec<f32>,
     /// The bed raised to the top of any body standing on it, this step. Water over a low body
     /// runs over it, a tall one holds it back, one that falls in lifts the water.
-    floor: Vec<f32>,
+    pub(super) floor: Vec<f32>,
     /// Lowest the bed washes down to, the bed itself where it does not wash at all.
     hard: Vec<f32>,
     held: Vec<Held>,
@@ -289,7 +289,7 @@ impl ShallowWater {
         &self.depth
     }
 
-    fn index(&self, x: usize, z: usize) -> usize {
+    pub(super) fn index(&self, x: usize, z: usize) -> usize {
         z * self.size.0 + x
     }
 

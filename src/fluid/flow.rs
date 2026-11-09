@@ -162,24 +162,7 @@ impl FluidWorld {
             let gone = keep.iter().filter(|kept| !**kept).count();
             if gone > 0 {
                 drained += gone as u32;
-                let mut index = 0;
-                let mut take = |_: &u32| {
-                    index += 1;
-                    keep[index - 1]
-                };
-                self.ids.retain(&mut take);
-                for list in [&mut self.positions, &mut self.velocities] {
-                    let mut index = 0;
-                    list.retain(|_| {
-                        index += 1;
-                        keep[index - 1]
-                    });
-                }
-                let mut index = 0;
-                self.densities.retain(|_| {
-                    index += 1;
-                    keep[index - 1]
-                });
+                self.keep_only(&keep);
             }
         }
         let mut emitted = 0;

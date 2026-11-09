@@ -36,7 +36,8 @@ pub use error::PhysicsError;
 pub use field::{FieldDesc, FieldHandle, FieldRegion, ForceField};
 pub use fluid::{
     BoundaryId, Erosion, FLUID_SNAPSHOT_VERSION, FlowId, FluidReport, FluidSettings, FluidSolver,
-    FluidWorld, Kernel, MAX_FLUID_SNAPSHOT_BYTES, ShallowReport, ShallowSettings, ShallowWater,
+    FluidWorld, Handoff, HandoffReport, Kernel, MAX_FLUID_SNAPSHOT_BYTES, ShallowReport,
+    ShallowSettings, ShallowWater, hand_off,
 };
 pub use fracture::{
     BreakableDesc, BreakableHandle, FractureEvent, FracturePattern, MAX_CELLS, PatternBond,
