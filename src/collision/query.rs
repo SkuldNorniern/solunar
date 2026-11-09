@@ -255,25 +255,32 @@ impl PhysicsWorld {
                 let along = inverse.mul_vec3(direction);
                 let (local, local_radius) =
                     assets.hull_of(&cast.shape, body.1.conjugate() * rotation_in, start);
-                let tip = (start + along * limit).as_vec3();
-                let area = Aabb::around(start.as_vec3(), own_reach as f32)
-                    .union(Aabb::around(tip, own_reach as f32));
-                mesh.for_each_near(area, |index| {
-                    let limit = best.map_or(max, |found| found.0);
-                    let [a, b, c] = mesh.triangle(index);
-                    let triangle = Hull::Triangle(
-                        DVec3::from_vec3(a),
-                        DVec3::from_vec3(b),
-                        DVec3::from_vec3(c),
-                    );
-                    if let Some(hit) = sweep(&local, local_radius, &triangle, 0.0, along, limit)
-                        && best.is_none_or(|found| (hit.0, handle) < (found.0, found.1))
-                    {
-                        let normal = rotation.mul_vec3(hit.1);
-                        let point = rotation.mul_vec3(hit.2) + center;
-                        best = Some((hit.0, handle, normal, point, index));
-                    }
-                });
+                let reach = Cell::new(limit);
+                mesh.along(
+                    start,
+                    along,
+                    own_reach,
+                    || reach.get(),
+                    |index| {
+                        let limit = best.map_or(max, |found| found.0);
+                        let [a, b, c] = mesh.triangle(index);
+                        let triangle = Hull::Triangle(
+                            DVec3::from_vec3(a),
+                            DVec3::from_vec3(b),
+                            DVec3::from_vec3(c),
+                        );
+                        if let Some(hit) = sweep(&local, local_radius, &triangle, 0.0, along, limit)
+                            && best.is_none_or(|found| {
+                                (hit.0, handle, index) < (found.0, found.1, found.4)
+                            })
+                        {
+                            let normal = rotation.mul_vec3(hit.1);
+                            let point = rotation.mul_vec3(hit.2) + center;
+                            best = Some((hit.0, handle, normal, point, index));
+                            reach.set(hit.0);
+                        }
+                    },
+                );
                 shortest.set(best.map_or(max, |found| found.0));
                 return;
             }

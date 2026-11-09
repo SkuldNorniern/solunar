@@ -357,6 +357,86 @@ impl TriMesh {
     }
 }
 
+impl TriMesh {
+    /// Every triangle whose box, grown by `grow`, the path from `origin` along unit `direction`
+    /// meets before `limit()`, read again as it shrinks. Near first in a tree, piece by piece
+    /// in a grid, where a triangle may come twice.
+    pub(crate) fn along(
+        &self,
+        origin: DVec3,
+        direction: DVec3,
+        grow: f64,
+        limit: impl Fn() -> f64,
+        mut visit: impl FnMut(u32),
+    ) {
+        let grown = |bounds: &Aabb| Aabb {
+            min: bounds.min - Vec3::splat(grow as f32),
+            max: bounds.max + Vec3::splat(grow as f32),
+        };
+        let Some((enter, _)) = slab(&grown(&self.bounds), origin, direction, limit()) else {
+            return;
+        };
+        match &self.lookup {
+            Lookup::Grid {
+                spacing_x,
+                spacing_z,
+                ..
+            } => {
+                // pieces a few cells long, each asks for what its own grown box holds
+                let piece = (f64::from(spacing_x.max(*spacing_z)) * 4.0).max(grow * 2.0);
+                let mut from = enter;
+                while from <= limit() {
+                    let to = (from + piece).min(limit());
+                    let a = (origin + direction * from).as_vec3();
+                    let b = (origin + direction * to).as_vec3();
+                    let area = Aabb::around(a, grow as f32).union(Aabb::around(b, grow as f32));
+                    self.for_each_near(area, &mut visit);
+                    if to >= limit() {
+                        break;
+                    }
+                    from = to;
+                }
+            }
+            Lookup::Bvh { nodes, order } => {
+                let mut stack = crate::collision::tree::Pending::new((0_u32, enter));
+                while let Some((at, near)) = stack.pop() {
+                    if near > limit() {
+                        continue;
+                    }
+                    let node = &nodes[at as usize];
+                    if node.count > 0 {
+                        let range = node.first as usize..(node.first + node.count) as usize;
+                        for index in &order[range] {
+                            let triangle = grown(&Aabb::of_triangle(&self.triangle(*index)));
+                            if slab(&triangle, origin, direction, limit()).is_some() {
+                                visit(*index);
+                            }
+                        }
+                        continue;
+                    }
+                    let reach = limit();
+                    let (a, b) = (at + 1, node.first);
+                    let near_a = slab(&grown(&nodes[a as usize].bounds), origin, direction, reach);
+                    let near_b = slab(&grown(&nodes[b as usize].bounds), origin, direction, reach);
+                    match (near_a, near_b) {
+                        (Some((ta, _)), Some((tb, _))) if ta <= tb => {
+                            stack.push((b, tb));
+                            stack.push((a, ta));
+                        }
+                        (Some((ta, _)), Some((tb, _))) => {
+                            stack.push((a, ta));
+                            stack.push((b, tb));
+                        }
+                        (Some((ta, _)), None) => stack.push((a, ta)),
+                        (None, Some((tb, _))) => stack.push((b, tb)),
+                        (None, None) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Where a ray is inside a box, between 0 and `max`, with some room for rounding.
 fn slab(bounds: &Aabb, origin: DVec3, direction: DVec3, max: f64) -> Option<(f64, f64)> {
     let span = bounds.max - bounds.min;
@@ -815,6 +895,7 @@ mod tests {
         GridPosition, Material, PhysicsSettings, PhysicsWorld, QueryFilter, Ray, RigidBodyDesc,
         ShapeCast,
     };
+    use std::collections::HashSet;
 
     fn world() -> PhysicsWorld {
         PhysicsWorld::new(PhysicsSettings::default()).unwrap()
@@ -894,6 +975,55 @@ mod tests {
             }
         }
         assert!(hits > 500, "{hits} hits");
+    }
+
+    #[test]
+    fn mesh_walks_meet_every_triangle_the_grown_path_does() {
+        let (columns, rows) = (17, 13);
+        let heights: Vec<f32> = (0..columns * rows)
+            .map(|i| ((i % columns) as f32 * 0.9).sin() * 1.5 + ((i / columns) as f32 * 0.6).cos())
+            .collect();
+        let grid = TriMesh::from_heights(columns, rows, 0.7, 1.3, &heights).unwrap();
+        let tree = TriMesh::from_triangles(grid.vertices.clone(), grid.triangles.clone()).unwrap();
+        let mut seed = 11_u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        for i in 0..500 {
+            let origin = DVec3::new(
+                random() * 16.0 - 2.0,
+                random() * 8.0 - 3.0,
+                random() * 20.0 - 2.0,
+            );
+            let direction = DVec3::new(random() - 0.5, random() - 0.5, random() - 0.5).normalize();
+            let (grow, max) = (random() * 1.5, random() * 30.0);
+            let wanted: Vec<u32> = (0..grid.triangles.len() as u32)
+                .filter(|index| {
+                    let mut bounds = Aabb::of_triangle(&grid.triangle(*index));
+                    bounds.min -= Vec3::splat(grow as f32 * 0.999);
+                    bounds.max += Vec3::splat(grow as f32 * 0.999);
+                    slab(&bounds, origin, direction, max * 0.999).is_some()
+                })
+                .collect();
+            for mesh in [&grid, &tree] {
+                let mut seen = HashSet::new();
+                mesh.along(
+                    origin,
+                    direction,
+                    grow,
+                    || max,
+                    |index| {
+                        seen.insert(index);
+                    },
+                );
+                for index in &wanted {
+                    assert!(seen.contains(index), "ray {i} skipped triangle {index}");
+                }
+            }
+        }
     }
 
     #[test]
