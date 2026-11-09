@@ -6,7 +6,7 @@ use super::{FluidSettings, FluidSolver, FluidWorld};
 use crate::snapshot::{Reader, SnapshotError, Writer, fnv1a};
 
 const MAGIC: [u8; 4] = *b"SLFL";
-pub const FLUID_SNAPSHOT_VERSION: u32 = 1;
+pub const FLUID_SNAPSHOT_VERSION: u32 = 2;
 const CHECKSUM_BYTES: usize = 8;
 /// Largest fluid snapshot read.
 pub const MAX_FLUID_SNAPSHOT_BYTES: usize = 1 << 30;
@@ -55,6 +55,14 @@ impl FluidWorld {
         for terrain in &self.terrains {
             terrain.save(&mut out);
         }
+        match self.domain {
+            None => out.u8(0),
+            Some((low, high)) => {
+                out.u8(1);
+                out.vec3(low);
+                out.vec3(high);
+            }
+        }
         let checksum = fnv1a(&out.data);
         out.u64(checksum);
         out.data
@@ -89,7 +97,7 @@ impl FluidWorld {
             version: 0,
         };
         let version = reader.u32()?;
-        if version != FLUID_SNAPSHOT_VERSION {
+        if !(1..=FLUID_SNAPSHOT_VERSION).contains(&version) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         reader.version = version;
@@ -169,6 +177,16 @@ impl FluidWorld {
             }
             fluid.terrains.push(terrain);
         }
+        if version >= 2 {
+            let domain = match reader.u8()? {
+                0 => None,
+                1 => Some((reader.vec3()?, reader.vec3()?)),
+                _ => return Err(SnapshotError::Invalid("fluid domain flag")),
+            };
+            fluid
+                .set_domain(domain)
+                .map_err(|_| SnapshotError::Invalid("fluid domain"))?;
+        }
         if reader.at != body.len() {
             return Err(SnapshotError::Invalid("trailing bytes"));
         }
@@ -214,6 +232,27 @@ mod tests {
         for _ in 0..count {
             fluid.step(TICK, &Sequential).unwrap();
         }
+    }
+
+    #[test]
+    fn water_past_the_domain_is_taken_out_and_the_domain_kept() {
+        let mut fluid = pool();
+        // the pool's water is 0.5 m deep, the domain ends at 0.3 m
+        let (low, high) = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(2.0, 0.3, 2.0));
+        fluid.set_domain(Some((low, high))).unwrap();
+        let before = fluid.len();
+        let report = fluid.step(TICK, &Sequential).unwrap();
+        assert!(report.lost > 0);
+        assert!(fluid.positions().iter().all(|at| at.y <= 0.3));
+        assert!(fluid.len() + report.lost as usize <= before + report.emitted as usize);
+        let loaded = FluidWorld::load_snapshot(&fluid.save_snapshot()).unwrap();
+        assert_eq!(loaded.domain(), Some((low, high)));
+        assert!(fluid.set_domain(Some((high, low))).is_err());
+        assert!(
+            fluid
+                .set_domain(Some((low, Vec3::splat(f32::NAN))))
+                .is_err()
+        );
     }
 
     #[test]

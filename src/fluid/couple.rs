@@ -368,6 +368,41 @@ mod tests {
     }
 
     #[test]
+    fn a_ball_faster_than_the_water_sound_speed_does_not_blow_it_apart() {
+        let (mut fluid, mut world) = pool();
+        // open above, so the splash may fly, taken out past the domain
+        fluid
+            .set_domain(Some((Vec3::splat(-5.0), Vec3::splat(6.0))))
+            .unwrap();
+        let shape = Shape::sphere(0.1);
+        let speed = 24.0;
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(shape)
+                    .density(7800.0)
+                    .local_position(Vec3::new(0.5, 0.75, 0.5))
+                    .linear_velocity(Vec3::new(0.0, -speed, 0.0)),
+            )
+            .unwrap();
+        fluid.couple(ball, &shape).unwrap();
+        assert!(FluidSettings::default().sound_speed < speed);
+        let (mut fastest, mut squeeze, mut louder) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for _ in 0..30 {
+            let report = fluid
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+            fastest = fastest.max(report.max_speed);
+            squeeze = squeeze.max(report.max_compression);
+            louder = louder.max(report.sound_speed);
+        }
+        // measured before the sound speed followed the hit: 0.6 squeeze, water at 2.75 times the ball
+        assert!(louder >= 4.0 * speed, "{louder}");
+        assert!(squeeze < 0.2, "{squeeze}");
+        assert!(fastest < 2.0 * speed, "{fastest}");
+    }
+
+    #[test]
     fn a_floating_box_and_its_water_step_on_the_same_after_snapshots() {
         let (mut fluid, mut world) = pool();
         drop_box(&mut fluid, &mut world, 500.0);

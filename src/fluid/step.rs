@@ -15,6 +15,9 @@ const WALL_DAMPING: f32 = 1.0;
 /// water into a slosh that grew. Short ones never reach it.
 const STABLE_WALL_DAMPING: f32 = 0.25;
 const STABLE_VISCOSITY: f32 = 0.05;
+/// Under a hit the sound speed is at least this many times the fastest water or body, so water
+/// squeezes about 1 / 4^2, 6%.
+const IMPACT_SOUND: f32 = 4.0;
 
 /// What one [`FluidWorld::step`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -34,6 +37,10 @@ pub struct FluidReport {
     /// Particles emitters added and drains took after the step.
     pub emitted: u32,
     pub drained: u32,
+    /// Particles that left the domain and were taken out.
+    pub lost: u32,
+    /// The speed of sound this step used, the settings' or more under a fast hit.
+    pub sound_speed: f32,
 }
 
 impl FluidWorld {
@@ -67,6 +74,7 @@ impl FluidWorld {
             report.drained = drained;
         }
         flowed?;
+        report.lost = self.keep_in_domain();
         report.max_speed = self.fastest();
         let rest = self.settings.rest_density;
         report.max_compression = self
@@ -82,7 +90,26 @@ impl FluidWorld {
             .fold(0.0_f32, |most, velocity| most.max(velocity.length()))
     }
 
+    /// Weakly compressible water squeezes about (flow / sound speed)^2, so under a hit faster
+    /// than its sound speed it squeezes past half and its pressure throws water far faster than
+    /// the hit. For the step the sound speed is raised to [`IMPACT_SOUND`] times the fastest
+    /// water or body, the substeps follow it, calm water is untouched.
     fn wcsph(
+        &mut self,
+        dt: f32,
+        dispatch: &dyn JobDispatch,
+        report: &mut FluidReport,
+    ) -> Result<(), PhysicsError> {
+        let fastest = self.fastest().max(self.fastest_mover());
+        let configured = self.settings.sound_speed;
+        self.settings.sound_speed = configured.max(IMPACT_SOUND * fastest);
+        report.sound_speed = self.settings.sound_speed;
+        let result = self.wcsph_steps(dt, dispatch, report);
+        self.settings.sound_speed = configured;
+        result
+    }
+
+    fn wcsph_steps(
         &mut self,
         dt: f32,
         dispatch: &dyn JobDispatch,

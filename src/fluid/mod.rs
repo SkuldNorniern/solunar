@@ -331,6 +331,9 @@ pub struct FluidWorld {
     flows: Flows,
     terrains: Vec<TerrainField>,
     ground_sites: GroundSites,
+    /// Water outside this box after a step is taken out, so a splash flung far away does not
+    /// fly on for ever, setting every step's substeps by its speed.
+    domain: Option<(Vec3, Vec3)>,
 }
 
 impl FluidWorld {
@@ -360,6 +363,7 @@ impl FluidWorld {
             mover_neighbors: Lists::default(),
             flows: Flows::default(),
             terrains: Vec::new(),
+            domain: None,
         })
     }
 
@@ -417,6 +421,45 @@ impl FluidWorld {
         self.velocities.push(velocity);
         self.densities.push(0.0);
         Ok(id)
+    }
+
+    /// Water that leaves this box is taken out after each step, counted in
+    /// [`FluidReport::lost`]. `None` keeps all water wherever it goes.
+    ///
+    /// # Errors
+    /// Fails on a non finite or inside out box.
+    pub fn set_domain(&mut self, domain: Option<(Vec3, Vec3)>) -> Result<(), PhysicsError> {
+        if let Some((low, high)) = domain {
+            if !low.is_finite() || !high.is_finite() {
+                return Err(PhysicsError::NonFinite("fluid domain"));
+            }
+            if high.x <= low.x || high.y <= low.y || high.z <= low.z {
+                return Err(PhysicsError::OutOfRange);
+            }
+        }
+        self.domain = domain;
+        Ok(())
+    }
+
+    pub fn domain(&self) -> Option<(Vec3, Vec3)> {
+        self.domain
+    }
+
+    /// Takes out water outside the domain. Returns how much.
+    pub(super) fn keep_in_domain(&mut self) -> u32 {
+        let Some((low, high)) = self.domain else {
+            return 0;
+        };
+        let keep: Vec<bool> = self
+            .positions
+            .iter()
+            .map(|at| at.clamp(low, high) == *at)
+            .collect();
+        let lost = keep.iter().filter(|kept| !**kept).count();
+        if lost > 0 {
+            self.keep_only(&keep);
+        }
+        lost as u32
     }
 
     /// Drops every particle whose `keep` is false, the rest stay in order.
