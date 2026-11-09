@@ -41,8 +41,8 @@ pub use fluid::{
     ShallowReport, ShallowSettings, ShallowWater, hand_off,
 };
 pub use fracture::{
-    BreakableDesc, BreakableHandle, FractureEvent, FracturePattern, MAX_CELLS, PatternBond,
-    PatternPiece, voronoi_box,
+    BreakableDesc, BreakableHandle, FractureEvent, FractureMaterial, FracturePattern, Grain,
+    MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
 pub use inspect::{ContactEvent, ContactView, IslandStats};

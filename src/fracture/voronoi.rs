@@ -32,6 +32,8 @@ pub struct PatternBond {
     pub a: u32,
     pub b: u32,
     pub area: f32,
+    /// Unit normal of the shared face, from `a` toward `b`.
+    pub normal: Vec3,
 }
 
 /// A face and what is on its other side: `None` the box's outside, else that cell.
@@ -130,10 +132,32 @@ fn next(state: &mut u64) -> f64 {
 /// # Errors
 /// Fails on a box that is not finite and positive, or no cells, or more than [`MAX_CELLS`].
 pub fn voronoi_box(half: Vec3, cells: usize, seed: u64) -> Result<FracturePattern, PhysicsError> {
-    if !half.is_finite() || half.min_element() <= 0.0 || cells == 0 || cells > MAX_CELLS {
+    voronoi_box_stretched(half, cells, seed, Vec3::ONE)
+}
+
+/// [`voronoi_box`] with cells drawn out `stretch` times along each axis, as wood's along its
+/// grain. The cells are cut in a box squeezed by `stretch` and stretched back, so they still tile
+/// the box with no gap or overlap.
+///
+/// # Errors
+/// As [`voronoi_box`], and on a stretch that is not finite and positive.
+pub fn voronoi_box_stretched(
+    half: Vec3,
+    cells: usize,
+    seed: u64,
+    stretch: Vec3,
+) -> Result<FracturePattern, PhysicsError> {
+    if !half.is_finite()
+        || half.min_element() <= 0.0
+        || cells == 0
+        || cells > MAX_CELLS
+        || !stretch.is_finite()
+        || stretch.min_element() <= 0.0
+    {
         return Err(PhysicsError::InvalidShape);
     }
-    let h = DVec3::from_vec3(half);
+    let grow = DVec3::from_vec3(stretch);
+    let h = DVec3::from_vec3(half / stretch);
     let merge = MERGE * h.length();
     let mut state = seed;
     let seeds: Vec<DVec3> = (0..cells)
@@ -214,6 +238,18 @@ pub fn voronoi_box(half: Vec3, cells: usize, seed: u64) -> Result<FracturePatter
         if faces.len() < 4 {
             return Err(PhysicsError::InvalidShape);
         }
+        // back out of the squeezed box
+        let faces: Vec<Face> = faces
+            .into_iter()
+            .map(|(face, other)| {
+                let face = face
+                    .into_iter()
+                    .map(|p| DVec3::new(p.x * grow.x, p.y * grow.y, p.z * grow.z))
+                    .collect();
+                (face, other)
+            })
+            .collect();
+        let merge = merge * grow.x.max(grow.y).max(grow.z);
         let (volume, center) = measure(&faces);
         let mut points: Vec<DVec3> = Vec::new();
         for (face, _) in &faces {
@@ -233,6 +269,7 @@ pub fn voronoi_box(half: Vec3, cells: usize, seed: u64) -> Result<FracturePatter
         });
         faces_of.push(faces);
     }
+    let merge = merge * grow.x.max(grow.y).max(grow.z);
     let mut bonds = Vec::new();
     for (i, faces) in faces_of.iter().enumerate() {
         for (face, other) in faces {
@@ -241,10 +278,19 @@ pub fn voronoi_box(half: Vec3, cells: usize, seed: u64) -> Result<FracturePatter
             };
             let face_area = area(face);
             if (j as usize) > i && face_area > merge * merge {
+                let mut normal = DVec3::ZERO;
+                for k in 1..face.len() - 1 {
+                    normal += (face[k] - face[0]).cross(face[k + 1] - face[0]);
+                }
+                let toward = DVec3::from_vec3(pieces[j as usize].center - pieces[i].center);
+                if normal.dot(toward) < 0.0 {
+                    normal = -normal;
+                }
                 bonds.push(PatternBond {
                     a: i as u32,
                     b: j,
                     area: face_area as f32,
+                    normal: normal.normalize().as_vec3(),
                 });
             }
         }
@@ -259,6 +305,46 @@ pub fn voronoi_box(half: Vec3, cells: usize, seed: u64) -> Result<FracturePatter
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stretched_pieces_tile_the_box_drawn_out_along_the_grain() {
+        let half = Vec3::new(0.08, 1.0, 0.08);
+        let plain = voronoi_box(half, 40, 3).unwrap();
+        let grain = voronoi_box_stretched(half, 40, 3, Vec3::new(1.0, 5.0, 1.0)).unwrap();
+        let whole = 8.0 * f64::from(half.x * half.y * half.z);
+        let sum: f64 = grain.pieces.iter().map(|p| f64::from(p.volume)).sum();
+        assert!((sum - whole).abs() < whole * 1e-4, "{sum} of {whole}");
+        // how much longer than wide a piece is, on average
+        let shape = |pattern: &FracturePattern| {
+            let ratios: Vec<f32> = pattern
+                .pieces
+                .iter()
+                .map(|piece| {
+                    let low = piece
+                        .points
+                        .iter()
+                        .fold(Vec3::splat(f32::MAX), |m, p| m.min(*p));
+                    let high = piece
+                        .points
+                        .iter()
+                        .fold(Vec3::splat(f32::MIN), |m, p| m.max(*p));
+                    let size = high - low;
+                    size.y / size.x.max(size.z)
+                })
+                .collect();
+            ratios.iter().sum::<f32>() / ratios.len() as f32
+        };
+        assert!(
+            shape(&grain) > 1.8 * shape(&plain),
+            "{} {}",
+            shape(&grain),
+            shape(&plain)
+        );
+        for bond in &grain.bonds {
+            assert!((bond.normal.length() - 1.0).abs() < 1e-4);
+        }
+        assert!(voronoi_box_stretched(half, 8, 1, Vec3::new(1.0, 0.0, 1.0)).is_err());
+    }
 
     #[test]
     fn pieces_tile_the_box_and_bond_where_they_touch() {

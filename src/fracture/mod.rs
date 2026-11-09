@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use algebrix::{DVec3, Quat, Vec3};
 
-pub use voronoi::{FracturePattern, MAX_CELLS, PatternBond, PatternPiece, voronoi_box};
+pub use voronoi::{
+    FracturePattern, MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
+};
 
 use crate::body::{Bodies, BodyHandle, BodyKind, RigidBodyDesc};
 use crate::compound::{CompoundChild, CompoundInfo};
@@ -43,8 +45,22 @@ pub struct BreakableDesc {
     /// Per piece, for a fixed one. Empty means the pieces on the pattern's bottom face.
     pub anchored: Vec<bool>,
     pub material: Material,
-    /// Pascals a face takes before it tears, about 2e6 for concrete, 3e7 for glass.
+    /// Pascals a face takes before it tears. The load is the step's push over the face, so
+    /// these are game scale, see [`FractureMaterial`].
     pub strength: f32,
+    /// Damage a face that breaks hands each face around its two pieces, 0 to 1. High for glass,
+    /// whose cracks run on and shatter it, low for wood.
+    pub crack_spread: f32,
+    pub grain: Option<Grain>,
+}
+
+/// A direction a material is stronger across than along, as wood's fibres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Grain {
+    /// In the pattern's axes.
+    pub axis: Vec3,
+    /// Strength of a face lying along the grain, as a share of one across it, 0 to 1.
+    pub split: f32,
 }
 
 impl BreakableDesc {
@@ -57,8 +73,139 @@ impl BreakableDesc {
             anchored: Vec::new(),
             material: Material::default(),
             strength: 2.0e6,
+            crack_spread: 0.0,
+            grain: None,
         }
     }
+
+    /// A box of `half` extents of `kind`, cut into pieces as small as the material breaks. Wood
+    /// takes its grain along the box's longest side.
+    ///
+    /// # Errors
+    /// Fails on a bad box.
+    pub fn of(
+        kind: &FractureMaterial,
+        half: Vec3,
+        position: GridPosition,
+        seed: u64,
+    ) -> Result<Self, PhysicsError> {
+        let volume = 8.0 * half.x * half.y * half.z;
+        let cells = ((volume * kind.pieces_per_cubic_meter).round() as usize)
+            .clamp(kind.fewest_pieces, MAX_CELLS);
+        let longest = if half.x >= half.y && half.x >= half.z {
+            Vec3::X
+        } else if half.y >= half.z {
+            Vec3::Y
+        } else {
+            Vec3::Z
+        };
+        let stretch = Vec3::ONE + longest * (kind.grain_stretch - 1.0);
+        let pattern = voronoi_box_stretched(half, cells, seed, stretch)?;
+        Ok(Self {
+            material: Material {
+                density: kind.density,
+                friction: kind.friction,
+                restitution: kind.restitution,
+                ..Material::default()
+            },
+            strength: kind.strength,
+            crack_spread: kind.crack_spread,
+            grain: (kind.grain_split < 1.0).then_some(Grain {
+                axis: longest,
+                split: kind.grain_split,
+            }),
+            ..Self::new(pattern, position)
+        })
+    }
+}
+
+/// How a material breaks, game scale: strengths are tuned so a 190 kg steel ball at 32 m/s
+/// breaks a 24 cm concrete wall, not measured tensile strengths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FractureMaterial {
+    pub density: f32,
+    pub strength: f32,
+    pub crack_spread: f32,
+    /// Strength along the grain as a share of across it, 1 for none.
+    pub grain_split: f32,
+    /// How drawn out pieces are along the grain, 1 for none.
+    pub grain_stretch: f32,
+    pub pieces_per_cubic_meter: f32,
+    pub fewest_pieces: usize,
+    pub friction: f32,
+    pub restitution: f32,
+}
+
+impl FractureMaterial {
+    /// Shatters into many shards, cracks run on.
+    pub const GLASS: Self = Self {
+        density: 2500.0,
+        strength: 1.5e5,
+        crack_spread: 0.6,
+        grain_split: 1.0,
+        grain_stretch: 1.0,
+        pieces_per_cubic_meter: 4000.0,
+        fewest_pieces: 24,
+        friction: 0.4,
+        restitution: 0.1,
+    };
+    pub const CERAMIC: Self = Self {
+        density: 2300.0,
+        strength: 1.2e5,
+        crack_spread: 0.45,
+        grain_split: 1.0,
+        grain_stretch: 1.0,
+        pieces_per_cubic_meter: 1500.0,
+        fewest_pieces: 12,
+        friction: 0.5,
+        restitution: 0.1,
+    };
+    pub const ICE: Self = Self {
+        density: 917.0,
+        strength: 8.0e4,
+        crack_spread: 0.35,
+        grain_split: 1.0,
+        grain_stretch: 1.0,
+        pieces_per_cubic_meter: 600.0,
+        fewest_pieces: 12,
+        friction: 0.05,
+        restitution: 0.1,
+    };
+    /// Breaks in chunks.
+    pub const CONCRETE: Self = Self {
+        density: 2400.0,
+        strength: 2.0e5,
+        crack_spread: 0.2,
+        grain_split: 1.0,
+        grain_stretch: 1.0,
+        pieces_per_cubic_meter: 60.0,
+        fewest_pieces: 12,
+        friction: 0.7,
+        restitution: 0.05,
+    };
+    pub const STONE: Self = Self {
+        density: 2600.0,
+        strength: 4.0e5,
+        crack_spread: 0.15,
+        grain_split: 1.0,
+        grain_stretch: 1.0,
+        pieces_per_cubic_meter: 40.0,
+        fewest_pieces: 8,
+        friction: 0.7,
+        restitution: 0.05,
+    };
+    /// Splits along its grain into long splinters, cracks stay local.
+    pub const WOOD: Self = Self {
+        density: 600.0,
+        strength: 3.0e5,
+        crack_spread: 0.05,
+        grain_split: 0.15,
+        grain_stretch: 5.0,
+        pieces_per_cubic_meter: 300.0,
+        fewest_pieces: 10,
+        friction: 0.6,
+        restitution: 0.15,
+    };
 }
 
 /// A part of a breakable that came apart in the last step and is a body now.
@@ -104,6 +251,7 @@ pub(crate) struct Breakable {
     bonds: Vec<Bond>,
     groups: Vec<Group>,
     material: Material,
+    spread: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,6 +311,15 @@ impl Breakables {
     }
 }
 
+/// A face lying along the grain holds `split` of a face across it, between them by the cosine.
+fn grain_factor(grain: Option<Grain>, normal: Vec3) -> f32 {
+    let Some(grain) = grain else {
+        return 1.0;
+    };
+    let across = normal.dot(grain.axis.normalize()).abs();
+    grain.split + (1.0 - grain.split) * across
+}
+
 fn save_info(out: &mut Writer, info: &CompoundInfo) {
     out.shape(&info.shape);
     out.vec3(info.center);
@@ -184,6 +341,7 @@ fn load_info(reader: &mut Reader<'_>) -> Result<CompoundInfo, SnapshotError> {
 impl Breakable {
     fn save(&self, out: &mut Writer) {
         out.material(&self.material);
+        out.f32(self.spread);
         out.len(self.pieces.len());
         for piece in &self.pieces {
             save_info(out, &piece.info);
@@ -218,6 +376,14 @@ impl Breakable {
             _ => Err(SnapshotError::Invalid("breakable flag")),
         };
         let material = reader.material()?;
+        let spread = if reader.version >= 7 {
+            reader.f32()?
+        } else {
+            0.0
+        };
+        if !(0.0..=1.0).contains(&spread) {
+            return Err(SnapshotError::Invalid("breakable spread"));
+        }
         let count = reader.count(46, MAX_CELLS)?;
         let mut pieces = Vec::with_capacity(count);
         for _ in 0..count {
@@ -294,6 +460,7 @@ impl Breakable {
             bonds,
             groups,
             material,
+            spread,
         })
     }
 }
@@ -315,9 +482,18 @@ impl PhysicsWorld {
     /// an `anchored` list of the wrong length.
     pub fn add_breakable(&mut self, desc: BreakableDesc) -> Result<BreakableHandle, PhysicsError> {
         let count = desc.pattern.pieces.len();
+        let grain_ok = desc.grain.is_none_or(|grain| {
+            grain.axis.is_finite()
+                && grain.axis.length() > 1e-6
+                && grain.split.is_finite()
+                && grain.split > 0.0
+                && grain.split <= 1.0
+        });
         if count == 0
             || !desc.strength.is_finite()
             || desc.strength <= 0.0
+            || !(0.0..=1.0).contains(&desc.crack_spread)
+            || !grain_ok
             || !(desc.anchored.is_empty() || desc.anchored.len() == count)
         {
             return Err(PhysicsError::InvalidShape);
@@ -353,7 +529,7 @@ impl PhysicsWorld {
             .map(|bond| Bond {
                 a: bond.a,
                 b: bond.b,
-                strength: bond.area * desc.strength,
+                strength: bond.area * desc.strength * grain_factor(desc.grain, bond.normal),
                 damage: 0.0,
                 broken: false,
             })
@@ -363,6 +539,7 @@ impl PhysicsWorld {
             bonds,
             groups: Vec::new(),
             material: desc.material,
+            spread: desc.crack_spread,
         };
         let all: Vec<u32> = (0..count as u32).collect();
         let kind = if desc.fixed {
@@ -537,8 +714,13 @@ impl PhysicsWorld {
             held[bond.a as usize] += bond.strength;
             held[bond.b as usize] += bond.strength;
         }
-        let mut broke = false;
-        for bond in breakable.bonds.iter_mut().filter(|bond| !bond.broken) {
+        let mut broke = Vec::new();
+        for (index, bond) in breakable
+            .bonds
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, bond)| !bond.broken)
+        {
             // a piece's push shared over its faces by how much each holds
             let share = |piece: u32| {
                 let total = held[piece as usize];
@@ -555,11 +737,24 @@ impl PhysicsWorld {
             }
             if ratio >= 1.0 || bond.damage >= 1.0 {
                 bond.broken = true;
-                broke = true;
+                broke.push(index);
             }
         }
-        if !broke {
+        if broke.is_empty() {
             return Ok(());
+        }
+        // the crack runs on: faces around each broken one's pieces take damage, breaking next
+        // step past 1, so a brittle thing shatters over a few steps from where it was hit
+        if breakable.spread > 0.0 {
+            let mut hit = vec![0.0_f32; breakable.pieces.len()];
+            for index in &broke {
+                let bond = breakable.bonds[*index];
+                hit[bond.a as usize] += breakable.spread;
+                hit[bond.b as usize] += breakable.spread;
+            }
+            for bond in breakable.bonds.iter_mut().filter(|bond| !bond.broken) {
+                bond.damage += hit[bond.a as usize].max(hit[bond.b as usize]);
+            }
         }
         let groups = std::mem::take(&mut breakable.groups);
         for group in groups {
@@ -942,6 +1137,65 @@ mod tests {
             loaded.breakable_bodies(target),
             world.breakable_bodies(target)
         );
+    }
+
+    /// A fixed 2 m by 1.6 m panel of `kind`, 6 cm thick, shot once at 32 m/s, and how many
+    /// parts it ends in.
+    fn shot_panel(kind: &FractureMaterial, spread: Option<f32>) -> usize {
+        let mut world = world();
+        let mut desc =
+            BreakableDesc::of(kind, Vec3::new(1.0, 0.8, 0.03), at(0.0, 0.8, 0.0), 4).unwrap();
+        desc.fixed = true;
+        if let Some(spread) = spread {
+            desc.crack_spread = spread;
+        }
+        let panel = world.add_breakable(desc).unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.12))
+                    .density(7800.0)
+                    .local_position(Vec3::new(0.1, 0.9, -1.5))
+                    .linear_velocity(Vec3::new(0.0, 0.0, 32.0)),
+            )
+            .unwrap();
+        for _ in 0..90 {
+            world.step_fixed().unwrap();
+        }
+        world.breakable_bodies(panel).len()
+    }
+
+    #[test]
+    fn glass_shatters_where_concrete_breaks_in_chunks() {
+        let glass = shot_panel(&FractureMaterial::GLASS, None);
+        let concrete = shot_panel(&FractureMaterial::CONCRETE, None);
+        assert!(
+            glass > 3 * concrete.max(1),
+            "glass {glass}, concrete {concrete}"
+        );
+        // its cracks running on is what shatters it
+        let calm = shot_panel(&FractureMaterial::GLASS, Some(0.0));
+        assert!(glass > calm, "spread {glass}, none {calm}");
+    }
+
+    #[test]
+    fn a_material_and_its_spread_survive_a_snapshot() {
+        let mut world = world();
+        let desc = BreakableDesc::of(
+            &FractureMaterial::WOOD,
+            Vec3::new(0.1, 1.0, 0.1),
+            at(0.0, 3.0, 0.0),
+            2,
+        )
+        .unwrap();
+        assert!(desc.grain.is_some_and(|grain| grain.axis == Vec3::Y));
+        let post = world.add_breakable(desc).unwrap();
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.breakable_bodies(post), world.breakable_bodies(post));
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+        let mut bad =
+            BreakableDesc::of(&FractureMaterial::GLASS, Vec3::ONE, at(0.0, 3.0, 0.0), 2).unwrap();
+        bad.crack_spread = 1.5;
+        assert!(world.add_breakable(bad).is_err());
     }
 
     #[test]
