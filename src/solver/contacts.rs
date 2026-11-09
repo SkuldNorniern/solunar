@@ -155,6 +155,8 @@ pub(crate) struct ContactScratch {
     pub(super) joint_points: Vec<JointPoint>,
     pub(super) joint_rows: Vec<JointRow>,
     pub(super) joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
+    /// Each joint's force and torque impulse on B, over the substeps so far.
+    pub(super) joint_loads: Vec<(Vec3, Vec3)>,
     pub(super) islands: Islands,
     pub(super) colors: Colors,
     pub(super) motions: Vec<Motion>,
@@ -178,6 +180,10 @@ impl ContactScratch {
 
     pub(crate) fn joint_parts(&self) -> (&[JointPoint], &[JointRow], &[[f32; JOINT_IMPULSES]]) {
         (&self.joint_points, &self.joint_rows, &self.joint_impulses)
+    }
+
+    pub(crate) fn joint_loads(&self) -> &[(Vec3, Vec3)] {
+        &self.joint_loads
     }
 
     /// Dense pairs that made contact in the last solve.

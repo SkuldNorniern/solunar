@@ -179,12 +179,14 @@ impl Joints {
     }
 
     /// Runs after the step commits, so a failed step keeps the old impulses.
+    /// Warm start impulses for next step, and each solved joint's force and torque on B over
+    /// the whole `step`.
     pub(crate) fn store(
         &mut self,
         impulses: &[[f32; JOINT_IMPULSES]],
-        points: &[JointPoint],
-        rows: &[JointRow],
-        dt: f32,
+        (points, rows): (&[JointPoint], &[JointRow]),
+        loads: &[(Vec3, Vec3)],
+        step: f32,
     ) {
         for (slot, working) in self.slots.iter_mut().zip(impulses) {
             if let Some(state) = slot.state.as_mut() {
@@ -196,26 +198,14 @@ impl Joints {
             .map(|point| point.joint)
             .chain(rows.iter().map(|row| row.joint));
         for joint in touched {
-            if let Some(state) = self.slots[joint as usize].state.as_mut() {
-                state.force = Vec3::ZERO;
-                state.torque = Vec3::ZERO;
-            }
-        }
-        for point in points {
-            let Some(state) = self.slots[point.joint as usize].state.as_mut() else {
+            let (Some(state), Some(load)) = (
+                self.slots[joint as usize].state.as_mut(),
+                loads.get(joint as usize),
+            ) else {
                 continue;
             };
-            state.force += point.impulse * dt.recip();
-        }
-        for row in rows {
-            let Some(state) = self.slots[row.joint as usize].state.as_mut() else {
-                continue;
-            };
-            if row.linear == Vec3::ZERO {
-                state.torque += row.ang_b * (row.impulse / dt);
-            } else {
-                state.force += row.linear * (row.impulse / dt);
-            }
+            state.force = load.0 / step;
+            state.torque = load.1 / step;
         }
     }
 }

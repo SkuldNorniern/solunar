@@ -103,6 +103,27 @@ impl JointPoint {
     }
 }
 
+/// Each joint's push on body B this substep, added to what earlier substeps pushed: force and
+/// torque impulses. A push that comes in whole at the first substep, an outside force, is all
+/// taken there, the last substep alone showed none of it and a joint never felt what broke it.
+pub(crate) fn add_joint_loads(
+    points: &[JointPoint],
+    rows: &[JointRow],
+    loads: &mut [(Vec3, Vec3)],
+) {
+    for point in points {
+        loads[point.joint as usize].0 += point.impulse;
+    }
+    for row in rows {
+        let load = &mut loads[row.joint as usize];
+        if row.linear == Vec3::ZERO {
+            load.1 += row.ang_b * row.impulse;
+        } else {
+            load.0 += row.linear * row.impulse;
+        }
+    }
+}
+
 pub(crate) fn capture_impulses(
     points: &[JointPoint],
     rows: &[JointRow],

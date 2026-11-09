@@ -7,7 +7,7 @@ use algebrix::Vec3;
 
 use crate::body::Bodies;
 use crate::collision::find_pairs;
-use crate::joint::{JOINT_IMPULSES, Joints, build_rows, capture_impulses};
+use crate::joint::{JOINT_IMPULSES, Joints, add_joint_loads, build_rows, capture_impulses};
 use crate::material::Material;
 use crate::world::Integrated;
 use crate::{BodyKind, JobDispatch, PhysicsError, Shape};
@@ -160,6 +160,10 @@ pub(crate) fn prepare_contacts(
             slot.state
                 .map_or([0.0; JOINT_IMPULSES], |live| live.impulses)
         }));
+    scratch.joint_loads.clear();
+    scratch
+        .joint_loads
+        .resize(joints.slots.len(), (Vec3::ZERO, Vec3::ZERO));
     Ok(())
 }
 
@@ -240,6 +244,11 @@ pub(crate) fn solve_substep(
         &scratch.joint_points,
         &scratch.joint_rows,
         &mut scratch.joint_impulses,
+    );
+    add_joint_loads(
+        &scratch.joint_points,
+        &scratch.joint_rows,
+        &mut scratch.joint_loads,
     );
     for (frame, point) in scratch.frames.iter_mut().zip(&scratch.points) {
         frame.pushed += point.impulse.x.max(0.0);

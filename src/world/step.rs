@@ -196,7 +196,8 @@ impl PhysicsWorld {
         );
         self.spare_cache = std::mem::replace(&mut self.contact_cache, next_cache);
         let (points, rows, impulses) = self.contact_scratch.joint_parts();
-        self.joints.store(impulses, points, rows, part);
+        let loads = self.contact_scratch.joint_loads();
+        self.joints.store(impulses, (points, rows), loads, dt);
         self.break_joints();
         update_sleep(
             &mut self.bodies,

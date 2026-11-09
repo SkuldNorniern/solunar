@@ -6,7 +6,7 @@ mod rows;
 mod store;
 
 pub(crate) use rows::{
-    JointPoint, JointRow, MOTOR_SLOT, build_rows, capture_impulses, solve_point,
+    JointPoint, JointRow, MOTOR_SLOT, add_joint_loads, build_rows, capture_impulses, solve_point,
     solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
 };
 pub use store::Joints;
@@ -722,6 +722,37 @@ mod tests {
             )
             .unwrap();
         (world, joint, weight)
+    }
+
+    #[test]
+    fn a_joint_feels_an_outside_force_that_comes_in_at_the_first_substep() {
+        // two equal free boxes locked together, one pulled: the lock carries half the pull
+        let mut world = PhysicsWorld::new(crate::PhysicsSettings {
+            gravity: Vec3::ZERO,
+            ..crate::PhysicsSettings::default()
+        })
+        .unwrap();
+        let box_at = |world: &mut PhysicsWorld, x: f32| {
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))
+                        .can_sleep(false)
+                        .local_position(Vec3::new(x, 0.0, 0.0)),
+                )
+                .unwrap()
+        };
+        let (a, b) = (box_at(&mut world, 0.0), box_at(&mut world, 1.0));
+        let joint = world
+            .add_joint(
+                JointDesc::fixed(a, b).anchors(Vec3::new(0.5, 0.0, 0.0), Vec3::new(-0.5, 0.0, 0.0)),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            world.apply_force(b, Vec3::new(1000.0, 0.0, 0.0)).unwrap();
+            world.step_fixed().unwrap();
+        }
+        let force = world.joint_reaction(joint).unwrap().force;
+        assert!((force.x.abs() - 500.0).abs() < 5.0, "{force:?}");
     }
 
     #[test]
