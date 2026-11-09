@@ -6,7 +6,7 @@ use super::{FluidSettings, FluidSolver, FluidWorld};
 use crate::snapshot::{Reader, SnapshotError, Writer, fnv1a};
 
 const MAGIC: [u8; 4] = *b"SLFL";
-pub const FLUID_SNAPSHOT_VERSION: u32 = 2;
+pub const FLUID_SNAPSHOT_VERSION: u32 = 3;
 const CHECKSUM_BYTES: usize = 8;
 /// Largest fluid snapshot read.
 pub const MAX_FLUID_SNAPSHOT_BYTES: usize = 1 << 30;
@@ -158,7 +158,7 @@ impl FluidWorld {
         let coupled = reader.count(12, MAX_PARTS)?;
         let mut room = max_particles;
         for _ in 0..coupled {
-            let part = Coupled::load(&mut reader, room)?;
+            let part = Coupled::load(&mut reader, room, fluid.settings.spacing)?;
             room -= part.point_count();
             fluid.coupled.push(part);
         }

@@ -9,18 +9,23 @@ use crate::snapshot::{Reader, SnapshotError, Writer};
 use crate::substep::{SubstepBodies, SubstepHook, SubstepPose};
 use crate::world::PhysicsWorld;
 
+use super::lift::MAX_PROBES;
 use super::step::FluidReport;
 
 /// A body the water and the rigid world share. Its points are frozen water on its own lattice,
-/// as deep under its surface as the kernel reaches, in body axes about its center.
+/// as deep under its surface as the kernel reaches, in body axes about its center: the water
+/// feels it through them as a wall. It feels the water through `probes`, a lattice through its
+/// whole volume, see `lift.rs`.
 #[derive(Debug, Clone)]
 pub(super) struct Coupled {
     body: BodyHandle,
     points: Vec<Vec3>,
+    pub(super) probes: Vec<Vec3>,
+    pub(super) probe_spacing: f32,
     /// Where the body was at the start of this step and how fast it went, for torque.
-    pub(super) center: Vec3,
+    center: Vec3,
     velocity: Vec3,
-    /// What the water did to it this step: impulse and angular impulse about `center`.
+    /// What the water's damping did to it this step: impulse and angular impulse about `center`.
     pub(super) impulse: (Vec3, Vec3),
     /// How far the center has gone this step.
     moved: Vec3,
@@ -44,34 +49,42 @@ pub(super) struct Movers {
 impl Coupled {
     pub(super) fn save(&self, out: &mut Writer) {
         out.body(self.body);
-        out.len(self.points.len());
-        for point in &self.points {
-            out.vec3(*point);
-        }
+        save_points(out, &self.points);
+        out.f32(self.probe_spacing);
+        save_points(out, &self.probes);
     }
 
-    pub(super) fn load(reader: &mut Reader<'_>, max: usize) -> Result<Self, SnapshotError> {
+    /// A body saved before probes stands on its wall points, at the water's spacing.
+    pub(super) fn load(
+        reader: &mut Reader<'_>,
+        max: usize,
+        spacing: f32,
+    ) -> Result<Self, SnapshotError> {
         let body = reader.handle()?;
-        let count = reader.count(12, max)?;
-        let mut points = Vec::with_capacity(count);
-        for _ in 0..count {
-            let point = reader.vec3()?;
-            if !point.is_finite() {
-                return Err(SnapshotError::Invalid("fluid body point"));
+        let points = load_points(reader, max)?;
+        let (probe_spacing, probes) = if reader.version >= 3 {
+            let probe_spacing = reader.f32()?;
+            if !probe_spacing.is_finite() || probe_spacing <= 0.0 {
+                return Err(SnapshotError::Invalid("fluid body probes"));
             }
-            points.push(point);
-        }
-        if points.is_empty() {
-            return Err(SnapshotError::Invalid("fluid body"));
-        }
-        Ok(Self {
+            (probe_spacing, load_points(reader, MAX_PROBES)?)
+        } else {
+            (spacing, points.clone())
+        };
+        Ok(Self::new(body, points, probes, probe_spacing))
+    }
+
+    fn new(body: BodyHandle, points: Vec<Vec3>, probes: Vec<Vec3>, probe_spacing: f32) -> Self {
+        Self {
             body,
             points,
+            probes,
+            probe_spacing,
             center: Vec3::ZERO,
             velocity: Vec3::ZERO,
             impulse: (Vec3::ZERO, Vec3::ZERO),
             moved: Vec3::ZERO,
-        })
+        }
     }
 
     pub(super) fn body(&self) -> BodyHandle {
@@ -85,8 +98,7 @@ impl Coupled {
 
 /// The water as a [`SubstepHook`]: each rigid substep it steps the substep's time with the
 /// bodies where the substep has them, and pushes them before that substep's solve, so the
-/// tick's lag of [`FluidWorld::step_with_bodies`] goes. Not ready: a body held only by water
-/// spins more this way, see the tests.
+/// tick's lag of [`FluidWorld::step_with_bodies`] goes.
 pub struct FluidHook<'a> {
     fluid: &'a mut FluidWorld,
     /// What the water did over the rigid step so far, substeps added, highs kept.
@@ -129,6 +141,12 @@ impl SubstepHook for FluidHook<'_> {
         total.drained += step.drained;
         total.lost += step.lost;
         total.sound_speed = total.sound_speed.max(step.sound_speed);
+        for lift in fluid.lifts(dt, |body| bodies.pose(body)) {
+            if bodies.is_dynamic(lift.body) {
+                bodies.push(lift.body, lift.impulse, lift.angular)?;
+                fluid.give_back(&lift);
+            }
+        }
         for known in &mut fluid.coupled {
             let (impulse, angular) = std::mem::take(&mut known.impulse);
             bodies.push(known.body, impulse, angular)?;
@@ -162,15 +180,21 @@ impl FluidWorld {
         if points.len() > room {
             return Err(PhysicsError::FluidFull);
         }
+        // coarser probes for a big body, each standing for its share of the volume
+        let mut probe_spacing = settings.spacing;
+        let probes = loop {
+            match shape_points(shape, probe_spacing, f32::INFINITY, MAX_PROBES) {
+                Err(PhysicsError::FluidFull) => probe_spacing *= 1.25,
+                Ok(probes) if probes.is_empty() => {
+                    probe_spacing = settings.spacing;
+                    break points.clone();
+                }
+                found => break found?,
+            }
+        };
         self.coupled.retain(|known| known.body != body);
-        self.coupled.push(Coupled {
-            body,
-            points,
-            center: Vec3::ZERO,
-            velocity: Vec3::ZERO,
-            impulse: (Vec3::ZERO, Vec3::ZERO),
-            moved: Vec3::ZERO,
-        });
+        self.coupled
+            .push(Coupled::new(body, points, probes, probe_spacing));
         self.coupled.sort_by_key(|known| known.body);
         Ok(())
     }
@@ -206,9 +230,15 @@ impl FluidWorld {
         self.movers = Movers::default();
         let report = report?;
         if dt > 0.0 {
+            for lift in self.lifts(dt, |body| pose_in(world, body)) {
+                // a fixed or kinematic body pushes water but is not pushed back
+                if world.apply_force(lift.body, lift.impulse / dt).is_ok() {
+                    world.apply_torque(lift.body, lift.angular / dt)?;
+                    self.give_back(&lift);
+                }
+            }
             for known in &mut self.coupled {
                 let (impulse, angular) = std::mem::take(&mut known.impulse);
-                // a fixed or kinematic body pushes water but is not pushed back
                 if world.apply_force(known.body, impulse / dt).is_ok() {
                     world.apply_torque(known.body, angular / dt)?;
                 }
@@ -218,15 +248,7 @@ impl FluidWorld {
     }
 
     fn place_movers(&mut self, world: &PhysicsWorld) {
-        self.place_movers_at(|body| {
-            let state = world.body_state(body).ok()?;
-            Some(SubstepPose {
-                position: state.position,
-                rotation: state.rotation,
-                linear_velocity: state.linear_velocity,
-                angular_velocity: state.angular_velocity,
-            })
-        });
+        self.place_movers_at(|body| pose_in(world, body));
     }
 
     /// Body points where `pose` says their bodies are. A body it does not know is uncoupled.
@@ -304,7 +326,12 @@ impl FluidWorld {
     }
 
     /// Pressure and damping between particle `index` and the body points near it. Adds what the
-    /// particle feels to `push`, and what each body feels to `bodies`.
+    /// particle feels to `push`, and the damping's opposite to `bodies`. The pressure's opposite
+    /// is not taken point by point: thousands of noisy pushes held a body up on a layer of water
+    /// and spun it, so a body feels the water's pressure as a field, see `lift.rs`. The damping
+    /// it takes only from a point running into the water faster than water settles: what stops
+    /// a fast hit. Taken at any speed, the jitter of water under a floating box added up to lift
+    /// it 7 cm.
     pub(super) fn mover_push(
         &self,
         index: usize,
@@ -322,6 +349,7 @@ impl FluidWorld {
         let density = self.densities[index];
         let radius = self.settings.radius();
         let soften = 0.01 * radius * radius;
+        let settles = self.settings.gravity.length() * self.settings.spacing;
         for &point in near {
             let point = point as usize;
             let offset = at - self.movers.positions[point];
@@ -332,10 +360,12 @@ impl FluidWorld {
             } else {
                 0.0
             };
-            let part = -self.kernel.gradient(offset) * (self.mass * (mirrored + damp));
-            *push += part;
-            // the body gets the opposite of what this particle got
-            let force = -part * self.mass;
+            let gradient = self.kernel.gradient(offset) * self.mass;
+            *push -= gradient * (mirrored + damp);
+            if toward * toward < settles * offset.length_squared() {
+                continue;
+            }
+            let force = gradient * (damp * self.mass);
             let owner = self.movers.owners[point] as usize;
             let known = &self.coupled[owner];
             let arm = self.movers.positions[point] - (known.center + known.moved);
@@ -343,6 +373,39 @@ impl FluidWorld {
             bodies[owner].1 += arm.cross(force);
         }
     }
+}
+
+fn pose_in(world: &PhysicsWorld, body: BodyHandle) -> Option<SubstepPose> {
+    let state = world.body_state(body).ok()?;
+    Some(SubstepPose {
+        position: state.position,
+        rotation: state.rotation,
+        linear_velocity: state.linear_velocity,
+        angular_velocity: state.angular_velocity,
+    })
+}
+
+fn save_points(out: &mut Writer, points: &[Vec3]) {
+    out.len(points.len());
+    for point in points {
+        out.vec3(*point);
+    }
+}
+
+fn load_points(reader: &mut Reader<'_>, max: usize) -> Result<Vec<Vec3>, SnapshotError> {
+    let count = reader.count(12, max)?;
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        let point = reader.vec3()?;
+        if !point.is_finite() {
+            return Err(SnapshotError::Invalid("fluid body point"));
+        }
+        points.push(point);
+    }
+    if points.is_empty() {
+        return Err(SnapshotError::Invalid("fluid body"));
+    }
+    Ok(points)
 }
 
 /// Lattice points `spacing` apart inside the shape, no deeper than `reach`, centered on it. Fails
@@ -420,7 +483,9 @@ mod tests {
         fluid
             .fill_box(Vec3::ZERO, Vec3::new(1.0, 0.6, 1.0))
             .unwrap();
-        let world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        // the pool's floor holds bodies, its walls only the water
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        crate::world::testing::ground(&mut world);
         (fluid, world)
     }
 
@@ -552,14 +617,41 @@ mod tests {
     }
 
     #[test]
-    fn pushing_inside_the_substeps_takes_out_the_tick_lag_bounce() {
-        // measured in the fifth second, speed m/s, spin rad/s, off the floor m: once a tick
-        // 0.21, 0.05, 0.05. inside the substeps 0.07, 1.6, 0.05. the lag's bounce goes, the half
-        // spacing layer of water under the brick stays and the spin it floats with grows
-        let (speed, _, gap) = brick_under_water(true);
-        let (lagged, _, lagged_gap) = brick_under_water(false);
-        assert!(speed < lagged / 2.0, "{speed} against {lagged}");
-        assert!(gap < 0.06 && lagged_gap < 0.06, "{gap} {lagged_gap}");
+    fn a_brick_under_water_rests_on_the_floor() {
+        // fifth second, speed m/s, spin rad/s, off the floor m. with the water's pressure taken
+        // back point by point: once a tick 0.21, 0.05, 0.05, inside the substeps 0.07, 1.6, 0.05,
+        // floating on a half spacing layer of water. read as a field: 1e-6, 2e-6, 0 and
+        // 4e-4, 1e-3, 0
+        for hooked in [true, false] {
+            let (speed, spin, gap) = brick_under_water(hooked);
+            assert!(speed < 0.01 && spin < 0.05, "{hooked}: {speed} {spin}");
+            assert!(gap < 0.01, "{hooked}: {gap}");
+        }
+    }
+
+    #[test]
+    fn a_box_floats_as_deep_as_its_density_says() {
+        let (mut fluid, mut world) = pool();
+        // 0.85 under. a cube half as dense as water rolls over and floats on an edge, past 0.79
+        // it floats upright
+        let body = drop_box(&mut fluid, &mut world, 850.0);
+        run(&mut fluid, &mut world, 240);
+        let mut tops: Vec<f32> = fluid
+            .positions()
+            .iter()
+            .filter(|at| at.x < 0.2 && at.z < 0.2)
+            .map(|at| at.y)
+            .collect();
+        tops.sort_unstable_by(f32::total_cmp);
+        let level = tops[tops.len() - 1] + fluid.settings().spacing / 2.0;
+        let middle = height(&world, body);
+        let expected = level - 0.35 * 0.3;
+        let spin = world.body_state(body).unwrap().angular_velocity.length();
+        assert!(
+            (middle - expected).abs() < fluid.settings().spacing,
+            "{middle} {expected}"
+        );
+        assert!(spin < 0.05, "{spin}");
     }
 
     #[test]

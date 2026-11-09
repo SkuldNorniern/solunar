@@ -48,6 +48,13 @@ impl SubstepBodies<'_> {
         })
     }
 
+    /// Whether pushes move it, false for a fixed or kinematic body or a stale handle.
+    pub fn is_dynamic(&self, body: BodyHandle) -> bool {
+        self.bodies
+            .dense_index(body)
+            .is_ok_and(|dense| self.bodies.kind[dense] == BodyKind::Dynamic)
+    }
+
     /// Adds an impulse through the middle and an angular impulse, now, to a dynamic body. A
     /// sleeping one is not moved this step, it wakes once the step is done.
     ///
