@@ -20,7 +20,7 @@ const LOAD_PASSES: usize = 400;
 /// the step length decided what held. Averaged, a one step spike counts by its impulse, a load
 /// that stays counts in full after a few steps.
 const STRAIN_TIME: f32 = 0.05;
-const LOAD_TOLERANCE: f32 = 1e-5;
+const LOAD_TOLERANCE: f32 = 1e-3;
 
 /// Two parts of a compound body held together, a weld, a bolted frame, a docking collar. The
 /// parts are indexes into the body's [`PhysicsWorld::compound_children`] when the structure is
