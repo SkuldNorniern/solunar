@@ -4,8 +4,10 @@ use algebrix::DVec3;
 
 use crate::error::PhysicsError;
 
+mod climate;
 mod ground;
 
+pub use climate::{Climate, ClimateDesc, SECONDS_PER_YEAR};
 pub use ground::{PlanetFrames, PlanetGround, level_at, level_for};
 
 /// Deepest a tile is split, a planet the size of the earth gets tiles of a few meters there.
