@@ -82,6 +82,7 @@ impl PhysicsWorld {
         self.remember_structure_motion();
         self.apply_fields();
         self.apply_aero()?;
+        self.step_gas(self.settings.fixed_timestep)?;
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
         let mut phases = PhaseTimes::default();

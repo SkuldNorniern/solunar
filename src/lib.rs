@@ -13,6 +13,7 @@ mod field;
 mod fluid;
 mod fracture;
 mod frame;
+mod gas;
 mod gravity;
 mod inspect;
 mod joint;
@@ -57,6 +58,7 @@ pub use fracture::{
     MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };
 pub use frame::{FrameDesc, FrameId, FrameMotion, FrameState, Frames, MAX_FRAME_DEPTH, Orbit};
+pub use gas::{CompartmentDesc, CompartmentId, MAX_COMPARTMENTS, OpeningDesc, OpeningId};
 pub use gravity::{GravityId, GravitySource, MAX_GRAVITY_SOURCES};
 pub use inspect::{ContactEvent, ContactView, IslandStats};
 pub use joint::{
