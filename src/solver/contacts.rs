@@ -195,7 +195,9 @@ impl std::fmt::Debug for SolverManifold {
     }
 }
 
-/// Bodies moved since the contacts were found, so gaps and arms follow them.
+/// Bodies moved since the contacts were found, so gaps follow them. Arms and masses are worked
+/// out in the first substep and kept for the step, as box2d does: redone every substep they were
+/// a sixth of the 2000 body pile's step, the bodies barely turn in a step.
 /// Manifolds refreshed in one job.
 const REFRESH_CHUNK: usize = 256;
 
@@ -205,7 +207,7 @@ pub(super) fn refresh_manifolds(
     bodies: &Bodies,
     state: &[Integrated],
     scratch: &mut ContactScratch,
-    last: bool,
+    (first, last): (bool, bool),
     (dispatch, dt): (&dyn JobDispatch, f32),
 ) {
     let manifolds = &mut scratch.manifolds;
@@ -218,7 +220,7 @@ pub(super) fn refresh_manifolds(
         for manifold in manifolds.iter_mut() {
             let range = manifold.first..manifold.first + manifold.count;
             let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
-            refresh_manifold(bodies, state, manifold, points, last, dt);
+            refresh_manifold(bodies, state, manifold, points, (first, last), dt);
         }
         return;
     }
@@ -254,7 +256,7 @@ pub(super) fn refresh_manifolds(
         for manifold in manifolds.iter_mut() {
             let range = manifold.first - base..manifold.first - base + manifold.count;
             let pair = (&mut points[range.clone()], &frames[range]);
-            refresh_manifold(bodies, state, manifold, pair, last, dt);
+            refresh_manifold(bodies, state, manifold, pair, (first, last), dt);
         }
         *done = true;
     };
@@ -273,7 +275,7 @@ fn refresh_manifold(
     state: &[Integrated],
     manifold: &mut SolverManifold,
     (points, frames): (&mut [SolverPoint], &[PointFrame]),
-    last: bool,
+    (first, last): (bool, bool),
     dt: f32,
 ) {
     let (a, b) = (&state[manifold.a], &state[manifold.b]);
@@ -288,7 +290,7 @@ fn refresh_manifold(
         }
     };
     for k in 0..3 {
-        if manifold.resist[k] <= 0.0 {
+        if !first || manifold.resist[k] <= 0.0 {
             continue;
         }
         let axis = manifold.axes[k];
@@ -307,23 +309,23 @@ fn refresh_manifold(
     for (point, frame) in points.iter_mut().zip(frames) {
         let offset_a = a.rotation.rotate_vec3(frame.local_a);
         let offset_b = b.rotation.rotate_vec3(frame.local_b);
-        let mut mass = [0.0; 3];
-        for (k, axis) in manifold.axes.iter().enumerate() {
-            point.arm_a[k] = offset_a.cross(*axis);
-            point.arm_b[k] = offset_b.cross(*axis);
-            point.turn_a[k] = response(manifold.a, a.rotation, point.arm_a[k]);
-            point.turn_b[k] = response(manifold.b, b.rotation, point.arm_b[k]);
-            let inverse = inverse_a
-                + inverse_b
-                + point.arm_a[k].dot(point.turn_a[k])
-                + point.arm_b[k].dot(point.turn_b[k]);
-            mass[k] = if inverse > 1e-12 {
-                inverse.recip()
-            } else {
-                0.0
-            };
+        if first {
+            for (k, axis) in manifold.axes.iter().enumerate() {
+                point.arm_a[k] = offset_a.cross(*axis);
+                point.arm_b[k] = offset_b.cross(*axis);
+                point.turn_a[k] = response(manifold.a, a.rotation, point.arm_a[k]);
+                point.turn_b[k] = response(manifold.b, b.rotation, point.arm_b[k]);
+                let inverse = inverse_a
+                    + inverse_b
+                    + point.arm_a[k].dot(point.turn_a[k])
+                    + point.arm_b[k].dot(point.turn_b[k]);
+                point.mass[k] = if inverse > 1e-12 {
+                    inverse.recip()
+                } else {
+                    0.0
+                };
+            }
         }
-        point.mass = Vec3::new(mass[0], mass[1], mass[2]);
         let gap = (center_b + offset_b - offset_a).dot(normal);
         // still apart it may close the gap, and only arriving can bounce. arriving in the last
         // substep would clamp the speed the next step's bounce is worked out from, so it bounces now

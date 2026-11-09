@@ -201,7 +201,7 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    refresh_manifolds(bodies, state, scratch, last, (dispatch, dt));
+    refresh_manifolds(bodies, state, scratch, (substep == 0, last), (dispatch, dt));
     color_constraints(bodies, scratch);
     factor_islands(bodies, scratch);
     scratch.motions.clear();
