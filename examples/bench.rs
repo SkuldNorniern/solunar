@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use solunar::{
     Base, BodyKind, BreakableDesc, CompoundChild, Edit, EditOp, EditShape, FluidSettings,
-    FluidSolver, FluidWorld, GridPosition, JobDispatch, JointDesc, JointHandle, Material,
-    PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray, RigidBodyDesc,
-    SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape, ShapeCast, Vec3,
-    voronoi_box,
+    FluidSolver, FluidWorld, FractureMaterial, GridPosition, JobDispatch, JointDesc, JointHandle,
+    Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter, Ray,
+    RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
+    ShapeCast, Vec3, voronoi_box,
 };
 
 type Result<T> = std::result::Result<T, PhysicsError>;
@@ -24,11 +24,12 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 25] = [
+const SUITES: [(&str, Suite); 26] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
     ("fracture", fracture_wall),
+    ("gallery", gallery),
     ("stacks", stacks),
     ("chains", chains),
     ("net", net),
@@ -644,6 +645,73 @@ fn fracture_wall() -> Result<Outcome> {
             "{} parts, {} steps split, slowest of those {worst:.2} ms",
             world.breakable_bodies(target).len(),
             splits.len()
+        ),
+    })
+}
+
+/// A glass, ceramic, ice, concrete, stone and wood target in a row, each shot once by a 15 cm steel
+/// ball at 32 m/s two seconds apart, and a glass cube dropped from 5 m. Every step timed, the
+/// worst named.
+fn gallery() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 30.0)?;
+    let targets = [
+        (FractureMaterial::GLASS, Vec3::new(0.8, 0.7, 0.02), -7.5),
+        (FractureMaterial::CERAMIC, Vec3::new(0.6, 0.6, 0.05), -4.5),
+        (FractureMaterial::ICE, Vec3::new(0.5, 0.6, 0.4), -1.5),
+        (FractureMaterial::CONCRETE, Vec3::new(0.9, 1.0, 0.12), 1.5),
+        (FractureMaterial::STONE, Vec3::new(0.35, 1.0, 0.35), 4.5),
+        (FractureMaterial::WOOD, Vec3::new(0.12, 1.1, 0.12), 7.5),
+    ];
+    let at = |v: Vec3| GridPosition::from_local(v).ok_or(PhysicsError::OutOfRange);
+    for (index, (kind, half, x)) in targets.iter().enumerate() {
+        world.add_breakable(BreakableDesc {
+            fixed: true,
+            ..BreakableDesc::of(
+                kind,
+                *half,
+                at(Vec3::new(*x, half.y, 0.0))?,
+                11 + index as u64,
+            )?
+        })?;
+    }
+    world.add_breakable(BreakableDesc::of(
+        &FractureMaterial::GLASS,
+        Vec3::splat(0.3),
+        at(Vec3::new(0.0, 5.0, -2.5))?,
+        3,
+    )?)?;
+    let mut times = Vec::with_capacity(900);
+    let mut worst = (Duration::ZERO, 0);
+    for step in 0..900_usize {
+        if step >= 60 && (step - 60) % 120 == 0 && (step - 60) / 120 < targets.len() {
+            let (_, half, x) = targets[(step - 60) / 120];
+            world.spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.15))
+                    .material(Material {
+                        density: 7800.0,
+                        rolling_resistance: 0.01,
+                        spin_resistance: 0.01,
+                        ..Material::default()
+                    })
+                    .local_position(Vec3::new(x + 0.1, half.y + 0.1, -9.0))
+                    .linear_velocity(Vec3::new(0.0, 0.6, 32.0)),
+            )?;
+        }
+        let time = steps(&mut world, 1)?[0];
+        if time > worst.0 {
+            worst = (time, step);
+        }
+        times.push(time);
+    }
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "slowest step {} at {:.2} ms",
+            worst.1,
+            worst.0.as_secs_f64() * 1e3
         ),
     })
 }
