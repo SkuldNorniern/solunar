@@ -6,6 +6,7 @@ mod command;
 mod compound;
 mod direct;
 mod dispatch;
+mod dock;
 mod error;
 mod field;
 mod fluid;
@@ -38,6 +39,7 @@ pub use collision::{CastHit, CollisionFilter, PointHit, QueryFilter, Ray, ShapeC
 pub use command::{ApplyReport, Command, CommandBuffer};
 pub use compound::{CompoundChild, CompoundId, CompoundInfo, ConvexId, ConvexInfo, MeshId};
 pub use dispatch::{JobDispatch, Sequential};
+pub use dock::{DockFit, DockPort};
 pub use error::PhysicsError;
 pub use field::{FieldDesc, FieldHandle, FieldRegion, ForceField};
 pub use fluid::{
