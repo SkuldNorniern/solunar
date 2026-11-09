@@ -211,16 +211,13 @@ impl PhysicsWorld {
     /// # Errors
     /// Fails on a stale handle, a body that is not a compound, a part index past its parts, a
     /// link of a part to itself or a non finite or non positive strength, too many links, or a
-    /// body with joints or owned by a breakable or another structure.
+    /// body owned by a breakable or another structure.
     pub fn add_structure(
         &mut self,
         body: BodyHandle,
         links: &[LinkDesc],
     ) -> Result<StructureHandle, PhysicsError> {
         let parts = self.compound_children(body)?.len() as u32;
-        if self.joints.touching(body).next().is_some() {
-            return Err(PhysicsError::BodyHasJoints);
-        }
         if self.breakables.holds(body) || self.structures.holds(body) {
             return Err(PhysicsError::ShapeInUse);
         }
@@ -933,6 +930,33 @@ mod tests {
         let children = world.compound_children(body).unwrap();
         assert!(world.reshape_compound(body, &children).is_err());
         assert!(world.add_structure(body, &[]).is_err());
+    }
+
+    #[test]
+    fn a_structure_held_by_a_joint_still_breaks_and_the_joint_stays_on_its_part() {
+        let mut world = no_gravity();
+        let (body, structure) = rod(&mut world, 3, 1.0e9);
+        let x = along_x(&world, body);
+        let first = (0..3).min_by(|a, b| x[*a].total_cmp(&x[*b])).unwrap();
+        let anchor = world.compound_children(body).unwrap()[first].position;
+        let post = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(Vec3::new(-5.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        let joint = world
+            .add_joint(
+                crate::JointDesc::distance(post, body, 0.0, 10.0).anchors(Vec3::ZERO, anchor),
+            )
+            .unwrap();
+        world.break_link(structure, 0).unwrap();
+        world.break_link(structure, 1).unwrap();
+        world.step_fixed().unwrap();
+        assert_eq!(world.structure_bodies(structure).unwrap().len(), 3);
+        let held = world.joints.get(joint).unwrap().desc.b;
+        let parts = world.structure_bodies(structure).unwrap();
+        let (_, ids) = parts.iter().find(|(body, _)| *body == held).unwrap();
+        assert_eq!(ids, &vec![first as u32]);
     }
 
     #[test]

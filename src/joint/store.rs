@@ -140,6 +140,11 @@ impl Joints {
             })
     }
 
+    /// Joint ends moved between bodies, which pairs they keep apart is found again.
+    pub(crate) fn touched(&mut self) {
+        self.excluded_stale = true;
+    }
+
     pub(crate) fn refresh_exclusions(&mut self) {
         if !self.excluded_stale {
             return;

@@ -7,8 +7,9 @@ use crate::shape::Shape;
 use crate::world::PhysicsWorld;
 
 /// Changing what a body is made of while it keeps its handle: a ship that loses a wing, a
-/// building that takes a new floor, two parts welded into one. Between steps only. A body with
-/// joints or that a breakable owns is refused, they hold its parts in their own axes.
+/// building that takes a new floor, two parts welded into one. Between steps only. Its joints
+/// stay where they are in the world, an end goes with the part it is nearest. A body a
+/// breakable or a structure owns is refused, they hold its parts in their own order.
 impl PhysicsWorld {
     /// The parts of `body`'s compound, in its axes about its center of mass.
     ///
@@ -34,7 +35,7 @@ impl PhysicsWorld {
     /// the speed it had. Its contacts are found again.
     ///
     /// # Errors
-    /// Fails on a stale handle, bad children, a body with joints or owned by a breakable.
+    /// Fails on a stale handle, bad children, or a body owned by a breakable or a structure.
     pub fn reshape_compound(
         &mut self,
         body: BodyHandle,
@@ -98,7 +99,21 @@ impl PhysicsWorld {
                 .linear_velocity(linear + angular.cross(shift))
                 .angular_velocity(angular);
         }
+        let made_at = (desc.position, desc.rotation);
         let made = self.spawn(desc)?;
+        // a joint end goes with the part it is nearest
+        let nearest_gone = |anchor: Vec3| {
+            children
+                .iter()
+                .zip(&taken)
+                .min_by(|a, b| {
+                    (a.0.position - anchor)
+                        .length_squared()
+                        .total_cmp(&(b.0.position - anchor).length_squared())
+                })
+                .is_some_and(|(_, gone)| *gone)
+        };
+        self.move_joint_ends(body, made, ((position, rotation), made_at), nearest_gone);
         self.reshape_compound(body, &kept)?;
         Ok(made)
     }
@@ -170,6 +185,12 @@ impl PhysicsWorld {
             self.bodies.momentum[dense] + arm.cross(velocity) * mass
         };
         let momentum = spin_of(a, -middle, mass_a) + spin_of(b, offset - middle, mass_b);
+        // the other's joints go onto the body where they are, a joint between the two is gone
+        let pose = |world: &Self, dense: usize| {
+            (world.bodies.position(dense), world.bodies.rotation[dense])
+        };
+        let (at_a, at_b) = (pose(self, a), pose(self, b));
+        self.move_joint_ends(other, body, (at_b, at_a), |_| true);
         self.despawn(other)?;
         let a = self.bodies.dense_index(body)?;
         let info = self.add_owned_compound(&children)?;
@@ -187,12 +208,53 @@ impl PhysicsWorld {
         Ok(())
     }
 
+    /// Moves the ends of joints on `from` whose anchor, in `from`'s axes, `which` picks onto
+    /// `to`, keeping where they are in the world: anchors and frames from the `from` pose into
+    /// the `to` pose. A joint whose both ends are then on one body is removed, it holds nothing.
+    fn move_joint_ends(
+        &mut self,
+        from: BodyHandle,
+        to: BodyHandle,
+        (old, new): ((crate::GridPosition, Quat), (crate::GridPosition, Quat)),
+        which: impl Fn(Vec3) -> bool,
+    ) {
+        let joints: Vec<_> = self.joints.touching(from).collect();
+        if joints.is_empty() {
+            return;
+        }
+        let offset = old.0.offset_from(new.0).as_vec3();
+        let back = new.1.conjugate();
+        let carry = |anchor: Vec3, frame: Quat| {
+            let anchor = back.rotate_vec3(offset + old.1.rotate_vec3(anchor));
+            (anchor, (back * old.1 * frame).normalize())
+        };
+        let mut emptied = Vec::new();
+        for joint in joints {
+            let Ok(state) = self.joints.get_mut(joint) else {
+                continue;
+            };
+            let desc = &mut state.desc;
+            if desc.a == from && which(desc.anchor_a) {
+                (desc.anchor_a, desc.frame_a) = carry(desc.anchor_a, desc.frame_a);
+                desc.a = to;
+            }
+            if desc.b == from && which(desc.anchor_b) {
+                (desc.anchor_b, desc.frame_b) = carry(desc.anchor_b, desc.frame_b);
+                desc.b = to;
+            }
+            if desc.a == desc.b {
+                emptied.push(joint);
+            }
+        }
+        for joint in emptied {
+            let _ = self.remove_joint(joint);
+        }
+        self.joints.touched();
+    }
+
     /// The body's dense index if its parts may change.
     fn editable(&self, body: BodyHandle) -> Result<usize, PhysicsError> {
         let dense = self.bodies.dense_index(body)?;
-        if self.joints.touching(body).next().is_some() {
-            return Err(PhysicsError::BodyHasJoints);
-        }
         if self.breakables.holds(body) || self.structures.holds(body) {
             return Err(PhysicsError::ShapeInUse);
         }
@@ -210,6 +272,9 @@ impl PhysicsWorld {
     ) {
         let old = std::mem::replace(&mut self.bodies.shape[dense], shape);
         self.free_owned(old);
+        let body = self.bodies.handle_at(dense);
+        let before = (self.bodies.position(dense), self.bodies.rotation[dense]);
+        self.move_joint_ends(body, body, (before, (position, rotation)), |_| true);
         let bodies = &mut self.bodies;
         let kind = bodies.kind[dense];
         if kind == BodyKind::Dynamic {
@@ -449,6 +514,86 @@ mod tests {
             loaded.step_fixed().unwrap();
         }
         assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+    }
+
+    #[test]
+    fn a_joint_goes_with_the_part_it_holds_when_that_part_splits_off() {
+        let mut world = world();
+        let body = rod(&mut world);
+        let dense = world.bodies.dense_index(body).unwrap();
+        world.bodies.linear[dense] = Vec3::ZERO;
+        world.bodies.angular[dense] = Vec3::ZERO;
+        world.bodies.momentum[dense] = Vec3::ZERO;
+        let hook = world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(Vec3::new(1.5, 6.0, 0.0)),
+            )
+            .unwrap();
+        // the rod's +x end cube hangs from the hook by a ball joint at its top
+        let children = world.compound_children(body).unwrap();
+        let rotation = world.body_state(body).unwrap().rotation;
+        let end = (0..4)
+            .max_by(|a, b| {
+                let x = |i: usize| rotation.rotate_vec3(children[i].position).x;
+                x(*a).total_cmp(&x(*b))
+            })
+            .unwrap();
+        let top =
+            children[end].position + rotation.conjugate().rotate_vec3(Vec3::new(0.0, 0.5, 0.0));
+        let joint = world
+            .add_joint(crate::JointDesc::ball(hook, body).anchors(Vec3::new(0.0, -0.5, 0.0), top))
+            .unwrap();
+        let piece = world.split_compound(body, &[end]).unwrap();
+        let desc = world.joints.get(joint).unwrap().desc;
+        assert_eq!(desc.b, piece);
+        // where it holds in the world has not moved
+        let state = world.body_state(piece).unwrap();
+        let held = state.position.local + state.rotation.rotate_vec3(desc.anchor_b);
+        assert!(
+            (held - Vec3::new(1.5, 5.5, 0.0)).length() < 1e-4,
+            "{held:?}"
+        );
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        // the piece hangs, the rest fell
+        let hung = world.body_state(piece).unwrap().position.local;
+        assert!(
+            (hung - Vec3::new(1.5, 5.0, 0.0)).length() < 0.05,
+            "{hung:?}"
+        );
+        assert!(world.body_state(body).unwrap().position.local.y < 2.0);
+    }
+
+    #[test]
+    fn a_reshape_keeps_a_joint_where_it_was_and_a_merge_drops_the_one_between() {
+        let mut world = no_gravity();
+        let body = rod(&mut world);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.3)).local_position(Vec3::new(0.0, 8.0, 0.0)),
+            )
+            .unwrap();
+        let state = world.body_state(body).unwrap();
+        let world_anchor = state.position.local + Vec3::new(0.0, 1.0, 0.0);
+        let local = state
+            .rotation
+            .conjugate()
+            .rotate_vec3(Vec3::new(0.0, 1.0, 0.0));
+        let joint = world
+            .add_joint(crate::JointDesc::distance(body, ball, 0.0, 2.0).anchors(local, Vec3::ZERO))
+            .unwrap();
+        let children = world.compound_children(body).unwrap();
+        world.reshape_compound(body, &children[1..]).unwrap();
+        let desc = world.joints.get(joint).unwrap().desc;
+        let after = world.body_state(body).unwrap();
+        let held = after.position.local + after.rotation.rotate_vec3(desc.anchor_a);
+        assert!(
+            (held - world_anchor).length() < 1e-4,
+            "{held:?} {world_anchor:?}"
+        );
+        world.merge_bodies(body, ball).unwrap();
+        assert!(world.joints.get(joint).is_err());
     }
 
     #[test]
