@@ -1,13 +1,54 @@
 //! Steps a world with bodies coming and going for a long time and prints whether anything creeps.
 //! `cargo run --release --example soak [seconds] [threads]`.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use solunar::{
     BodyHandle, JobDispatch, PhysicsError, PhysicsSettings, PhysicsWorld, RigidBodyDesc,
     Sequential, Shape, Vec3,
 };
+
+/// The system allocator, keeping count of bytes held and calls, so a leak shows as a trend.
+struct Counting;
+
+static HELD: AtomicI64 = AtomicI64::new(0);
+static CALLS: AtomicU64 = AtomicU64::new(0);
+
+// SAFETY: every call goes straight to `System` with the same arguments, only counters are added.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        HELD.fetch_add(layout.size() as i64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        HELD.fetch_add(layout.size() as i64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        HELD.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        HELD.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        // SAFETY: as the caller promised to us.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
 
 const CHURN_PER_STEP: usize = 2;
 const LIVE: usize = 1500;
@@ -45,8 +86,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => &Sequential,
     };
     println!("{seconds} s on {threads} threads, {LIVE} bodies, {CHURN_PER_STEP} replaced a step");
-    println!("| at s | steps | bodies | asleep | contacts | islands | p50 ms | p99 ms | max ms |");
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    println!(
+        "| at s | steps | bodies | asleep | contacts | islands | p50 ms | p99 ms | max ms | held kib | allocs a step |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     soak(seconds, dispatch)?;
     Ok(())
 }
@@ -99,8 +142,9 @@ fn soak(seconds: u64, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
                 times[rank - 1].as_secs_f64() * 1e3
             };
             world.contacts(&mut contacts);
+            let calls = CALLS.swap(0, Ordering::Relaxed);
             println!(
-                "| {} | {steps} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} |",
+                "| {} | {steps} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {} | {:.1} |",
                 started.elapsed().as_secs(),
                 world.body_count(),
                 world.sleeping_body_count(),
@@ -109,6 +153,8 @@ fn soak(seconds: u64, dispatch: &dyn JobDispatch) -> Result<(), PhysicsError> {
                 at(50),
                 at(99),
                 at(100),
+                HELD.load(Ordering::Relaxed) / 1024,
+                calls as f64 / times.len() as f64,
             );
             times.clear();
         }
