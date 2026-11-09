@@ -174,11 +174,22 @@ impl<'a, T: Copy> Shared<'a, T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CachedPoint {
     /// Contact in body A axes, finds the same point next step.
     pub(crate) local_a: Vec3,
     pub(crate) impulse: Vec3,
+    /// Normal impulse over the whole step, every substep's added, newton seconds. A hit is
+    /// mostly taken in the first substep, the last one alone says little about it.
+    pub(crate) pushed: f32,
+}
+
+/// `pushed` is what the last step did, the next step never reads it, so snapshots leave it
+/// out and equal state ignores it.
+impl PartialEq for CachedPoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.local_a == other.local_a && self.impulse == other.impulse
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -214,6 +225,7 @@ struct PointFrame {
     local_a: Vec3,
     local_b: Vec3,
     bounce: f32,
+    pushed: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -708,6 +720,9 @@ pub(crate) fn solve_substep(
         &scratch.joint_rows,
         &mut scratch.joint_impulses,
     );
+    for (frame, point) in scratch.frames.iter_mut().zip(&scratch.points) {
+        frame.pushed += point.impulse.x.max(0.0);
+    }
 }
 
 impl Colors {
@@ -1408,6 +1423,7 @@ pub(crate) fn finish_contacts(
             *out = CachedPoint {
                 local_a: frame.local_a,
                 impulse: point.impulse,
+                pushed: frame.pushed,
             };
         }
         cache.push(CachedManifold {
@@ -1618,6 +1634,7 @@ fn contact_manifold(
             local_a,
             local_b,
             bounce,
+            pushed: 0.0,
         });
     }
     manifold
