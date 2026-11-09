@@ -175,8 +175,14 @@ impl Vehicle {
         // grip goes in with the first substep and gravity over all of them, so aim the mean slip
         // over the coming step at zero: gravity counts (n + 1) / 2n of a step
         let parts = world.settings().substeps.max(1) as f32;
-        let gravity = world.settings().gravity * ((parts + 1.0) / (2.0 * parts));
         let body = world.body_state(self.chassis)?;
+        // the chassis' own frame: on a planet that is the ground frame, its pull and turning in
+        let felt = world.gravity_at(body.frame, body.position, body.linear_velocity)?;
+        let gravity = felt * ((parts + 1.0) / (2.0 * parts));
+        let filter = QueryFilter {
+            frame: body.frame,
+            ..self.filter
+        };
         let up = body.rotation.rotate_vec3(Vec3::Y);
         let point_velocity =
             |offset: Vec3| body.linear_velocity + body.angular_velocity.cross(offset);
@@ -196,7 +202,7 @@ impl Vehicle {
                     direction: -up,
                     max_distance: reach,
                 },
-                &self.filter,
+                &filter,
             )?;
             let Some(hit) = hit else {
                 state.compression = 0.0;
@@ -396,6 +402,52 @@ mod tests {
                 contact.load
             );
         }
+    }
+
+    #[test]
+    fn in_a_turned_frame_it_settles_by_that_frame_and_its_pull() {
+        use crate::{FrameDesc, FrameId, GravitySource};
+        use algebrix::DQuat;
+        let mut world = PhysicsWorld::new(PhysicsSettings {
+            gravity: Vec3::ZERO,
+            ..PhysicsSettings::default()
+        })
+        .unwrap();
+        let frame = world
+            .add_frame(FrameDesc {
+                rotation: DQuat::from_axis_angle(DVec3::Z, std::f64::consts::FRAC_PI_2),
+                ..FrameDesc::new(FrameId::ROOT)
+            })
+            .unwrap();
+        // a planet a thousand kilometers under the frame, 9.81 at its origin
+        let radius = 1.0e6;
+        world
+            .add_gravity(GravitySource::point(
+                frame,
+                DVec3::new(0.0, -radius, 0.0),
+                9.81 * radius * radius,
+            ))
+            .unwrap();
+        let mut ground = RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(200.0, 1.0, 200.0)))
+            .local_position(Vec3::new(0.0, -1.0, 0.0));
+        ground.frame = frame;
+        world.spawn(ground).unwrap();
+        let mut desc = RigidBodyDesc::dynamic(Shape::cuboid(CHASSIS_HALF))
+            .density(DENSITY)
+            .local_position(Vec3::new(0.0, 1.2, 0.0));
+        desc.frame = frame;
+        let body = world.spawn(desc).unwrap();
+        let mut vehicle = Vehicle::new(&mut world, body, &wheels()).unwrap();
+        run(&mut world, &mut vehicle, Controls::default(), 300);
+        let state = chassis(&world, &vehicle);
+        let sag = 1_000.0 * 9.81 / (4.0 * 30_000.0);
+        let wanted = 0.3 + (0.3 - sag) + 0.35;
+        assert!(
+            (state.position.local.y - wanted).abs() < 5e-3,
+            "{} {wanted}",
+            state.position.local.y
+        );
+        assert!(vehicle.states().iter().all(|wheel| wheel.contact.is_some()));
     }
 
     #[test]
