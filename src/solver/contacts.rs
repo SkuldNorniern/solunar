@@ -21,6 +21,9 @@ const MAX_RECOVERY_SPEED: f32 = 3.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
 /// A pair whose bodies moved less than this against each other since its contacts were found,
 /// meters squared, keeps them rather than finding them again.
+/// Radians a substep a manifold's bodies may turn together and keep their arms from the first
+/// substep.
+const FAST_TURN: f32 = 0.2;
 const REUSE_DISTANCE_SQUARED: f32 = 0.0002 * 0.0002;
 /// The same for turning: the cosine of half of 0.1 degree.
 const REUSE_HALF_TURN_COS: f32 = 0.999_999_6;
@@ -279,6 +282,9 @@ fn refresh_manifold(
     dt: f32,
 ) {
     let (a, b) = (&state[manifold.a], &state[manifold.b]);
+    // a body turning fast moves its arms a lot in a substep, kept from the first one a capsule
+    // rolling at 1700 rad/s tumbled up to 38,000 and flew off
+    let first = first || (a.angular.length() + b.angular.length()) * dt > FAST_TURN;
     let center_b = b.position.offset_from(a.position).as_vec3();
     let normal = manifold.axes[0];
     let [inverse_a, inverse_b] = manifold.inverse_mass;
@@ -306,9 +312,10 @@ fn refresh_manifold(
             0.0
         };
     }
+    let (shape_a, shape_b) = (bodies.shape[manifold.a], bodies.shape[manifold.b]);
     for (point, frame) in points.iter_mut().zip(frames) {
-        let offset_a = a.rotation.rotate_vec3(frame.local_a);
-        let offset_b = b.rotation.rotate_vec3(frame.local_b);
+        let offset_a = round_point(&shape_a, a.rotation, frame.local_a, normal);
+        let offset_b = round_point(&shape_b, b.rotation, frame.local_b, -normal);
         if first {
             for (k, axis) in manifold.axes.iter().enumerate() {
                 point.arm_a[k] = offset_a.cross(*axis);
@@ -340,6 +347,17 @@ fn refresh_manifold(
         point.recovery =
             (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
         point.recovery_impulse = 0.0;
+    }
+}
+
+/// Where a contact point on a body is from its center, in world axes. On a ball the point facing
+/// `toward` is the same however it has turned, so it is taken that way: carried round with a ball
+/// spun up by a fast slide, 1700 rad/s, the point swung away from the wall between substeps and
+/// the gap read as open while the ball went through a 5 cm plate.
+fn round_point(shape: &Shape, rotation: Quat, local: Vec3, toward: Vec3) -> Vec3 {
+    match *shape {
+        Shape::Sphere { radius } => toward * radius,
+        _ => rotation.rotate_vec3(local),
     }
 }
 

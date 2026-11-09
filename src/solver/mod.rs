@@ -340,6 +340,147 @@ mod tests {
         world.body_state(body).unwrap().position.local.y
     }
 
+    fn space() -> PhysicsWorld {
+        PhysicsWorld::new(PhysicsSettings {
+            gravity: Vec3::ZERO,
+            ..PhysicsSettings::default()
+        })
+        .unwrap()
+    }
+
+    /// The furthest along x `mover` got over `steps` steps.
+    fn furthest(world: &mut PhysicsWorld, mover: crate::BodyHandle, steps: usize) -> f64 {
+        let mut most = f64::MIN;
+        for _ in 0..steps {
+            world.step_fixed().unwrap();
+            most = most.max(world.body_state(mover).unwrap().position.to_dvec3().x);
+        }
+        most
+    }
+
+    fn plate(world: &mut PhysicsWorld, half: Vec3, at: GridPosition) {
+        world
+            .spawn(RigidBodyDesc::fixed(Shape::cuboid(half)).position(at))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_ball_at_1000_m_s_stops_on_a_25_cm_plate() {
+        let mut world = space();
+        let at = GridPosition::from_local(Vec3::new(10.0, 0.0, 0.0)).unwrap();
+        plate(&mut world, Vec3::new(0.125, 2.0, 2.0), at);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.05))
+                    .density(7800.0)
+                    .local_position(Vec3::new(-20.0, 0.0, 0.0))
+                    .linear_velocity(Vec3::new(1000.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        // the face less the radius, never past it
+        assert!(furthest(&mut world, ball, 30) <= 9.875 - 0.05 + 1e-3);
+    }
+
+    #[test]
+    fn a_hit_across_a_cell_edge_is_caught() {
+        let mut world = space();
+        let at = GridPosition::from_dvec3(algebrix::DVec3::new(1024.0, 0.0, 0.0)).unwrap();
+        plate(&mut world, Vec3::new(0.125, 2.0, 2.0), at);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.05))
+                    .position(
+                        GridPosition::from_dvec3(algebrix::DVec3::new(1000.0, 0.0, 0.0)).unwrap(),
+                    )
+                    .linear_velocity(Vec3::new(800.0, 0.0, 0.0)),
+            )
+            .unwrap();
+        assert!(furthest(&mut world, ball, 30) <= 1023.875 - 0.05 + 1e-3);
+    }
+
+    #[test]
+    fn two_boxes_at_300_m_s_meet_head_on() {
+        let mut world = space();
+        let shot = |world: &mut PhysicsWorld, x: f32, speed: f32| {
+            world
+                .spawn(
+                    RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5)))
+                        .local_position(Vec3::new(x, 0.0, 0.0))
+                        .linear_velocity(Vec3::new(speed, 0.0, 0.0)),
+                )
+                .unwrap()
+        };
+        let (a, b) = (
+            shot(&mut world, -30.0, 300.0),
+            shot(&mut world, 30.0, -300.0),
+        );
+        for _ in 0..20 {
+            world.step_fixed().unwrap();
+            let x = |body| world.body_state(body).unwrap().position.local.x;
+            assert!(x(b) - x(a) >= 1.0 - 0.01, "{} {}", x(a), x(b));
+        }
+    }
+
+    #[test]
+    fn a_glancing_ball_slides_along_a_thin_plate() {
+        // 10 degrees in at 500 m/s on a 5 cm plate, a slide that spins it up to 2000 rad/s. a
+        // capsule still goes through, its point is not the same however it turns
+        {
+            let shape = Shape::sphere(0.05);
+            let mut world = space();
+            let at = GridPosition::from_local(Vec3::new(10.0, 0.0, 0.0)).unwrap();
+            plate(&mut world, Vec3::new(0.025, 20.0, 20.0), at);
+            let way = Vec3::new(
+                10.0_f32.to_radians().sin(),
+                0.0,
+                10.0_f32.to_radians().cos(),
+            );
+            let body = world
+                .spawn(
+                    RigidBodyDesc::dynamic(shape)
+                        .local_position(Vec3::new(9.0, 0.0, -10.0))
+                        .linear_velocity(way * 500.0),
+                )
+                .unwrap();
+            // into the face no more than the 5 mm the solver lets things rest in. it went 8 to
+            // 11 cm in and out the back, its contact point carried round by its spin
+            let deepest = furthest(&mut world, body, 4);
+            assert!(deepest <= 9.975 - 0.05 + 5e-3, "{shape:?} {deepest}");
+            let state = world.body_state(body).unwrap();
+            assert!(state.linear_velocity.z > 300.0, "{shape:?} {state:?}");
+            assert!(state.linear_velocity.x.abs() < 1.0, "{shape:?} {state:?}");
+            assert!(
+                state.angular_velocity.length() > 1000.0,
+                "{shape:?} {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plate_spinning_at_50_rad_s_hits_what_is_in_its_sweep() {
+        let mut world = space();
+        let mut desc = RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(1.0, 0.5, 0.025)))
+            .density(5000.0)
+            .angular_velocity(Vec3::new(0.0, 50.0, 0.0));
+        desc.can_sleep = false;
+        world.spawn(desc).unwrap();
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.05))
+                    .local_position(Vec3::new(0.7, 0.0, 0.0)),
+            )
+            .unwrap();
+        let mut fastest = 0.0_f32;
+        for _ in 0..30 {
+            world.step_fixed().unwrap();
+            fastest = fastest.max(world.body_state(ball).unwrap().linear_velocity.length());
+        }
+        // the plate's edge passes at 35 m/s there, the ball goes off with about that
+        assert!(fastest > 20.0, "{fastest}");
+        let gone = world.body_state(ball).unwrap().position.to_dvec3().length();
+        assert!(gone > 1.0, "{gone}");
+    }
+
     #[test]
     fn gap_inside_the_margin_does_not_stop_a_slow_fall_early() {
         let mut world = world();
