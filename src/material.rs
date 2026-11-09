@@ -51,7 +51,8 @@ pub struct Material {
     pub bounce_threshold: f32,
     pub friction_combine: Combine,
     pub restitution_combine: Combine,
-    /// Lever, meters: the turning a contact resists while rolling is this times its load.
+    /// Lever, meters: the turning a contact resists while rolling is this times its load. A
+    /// contact takes the larger of its two bodies'.
     pub rolling_resistance: f32,
     /// Lever, meters: the same for spinning about the contact normal.
     pub spin_resistance: f32,
@@ -86,9 +87,10 @@ impl Contact {
             ),
             restitution: restitution.apply(a.restitution, b.restitution),
             bounce_threshold: a.bounce_threshold.max(b.bounce_threshold),
-            // they resist like friction does, so they combine by its rule
-            rolling: friction.apply(a.rolling_resistance, b.rolling_resistance),
-            spin: friction.apply(a.spin_resistance, b.spin_resistance),
+            // either side giving or rough is enough to resist. by the friction rule, a mean, a
+            // steel ball on a floor that set none kept rolling and spinning for ever
+            rolling: a.rolling_resistance.max(b.rolling_resistance),
+            spin: a.spin_resistance.max(b.spin_resistance),
         }
     }
 }
@@ -363,19 +365,19 @@ mod tests {
     }
 
     /// A ball rolled at 2 m/s on a floor of `material`: how far it gets in 4 s.
-    fn roll(material: Material) -> f32 {
+    fn roll(floor: Material, ball: Material) -> f32 {
         use crate::{PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape, Vec3};
         let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
         world
             .spawn(
                 RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(50.0, 0.5, 5.0)))
                     .local_position(Vec3::new(0.0, -0.5, 0.0))
-                    .material(material),
+                    .material(floor),
             )
             .unwrap();
         let mut desc = RigidBodyDesc::dynamic(Shape::sphere(0.25))
             .local_position(Vec3::new(-40.0, 0.25, 0.0))
-            .material(material);
+            .material(ball);
         desc.linear_velocity = Vec3::new(2.0, 0.0, 0.0);
         desc.angular_velocity = Vec3::new(0.0, 0.0, -8.0);
         let ball = world.spawn(desc).unwrap();
@@ -386,19 +388,19 @@ mod tests {
     }
 
     /// A ball spun about y at 10 rad/s resting on a floor: its spin after 2 s.
-    fn spin(material: Material) -> f32 {
+    fn spin(floor: Material, ball: Material) -> f32 {
         use crate::{PhysicsSettings, PhysicsWorld, RigidBodyDesc, Shape, Vec3};
         let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
         world
             .spawn(
                 RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)))
                     .local_position(Vec3::new(0.0, -0.5, 0.0))
-                    .material(material),
+                    .material(floor),
             )
             .unwrap();
         let mut desc = RigidBodyDesc::dynamic(Shape::sphere(0.25))
             .local_position(Vec3::new(0.0, 0.25, 0.0))
-            .material(material);
+            .material(ball);
         desc.angular_velocity = Vec3::new(0.0, 10.0, 0.0);
         desc.can_sleep = false;
         let ball = world.spawn(desc).unwrap();
@@ -419,12 +421,15 @@ mod tests {
             spin_resistance: 0.02,
             ..free
         };
-        let (far, near) = (roll(free), roll(rolling));
+        let (far, near) = (roll(free, free), roll(rolling, rolling));
+        // the ball's own is enough on a floor that set none
+        assert!((roll(free, rolling) - near).abs() < 1e-3);
         // free it keeps rolling, 2 m/s for 4 s. a lever l on a rolling ball of radius r slows it
         // by l g / (1.4 r), 0.56 m/s^2 here, so it stops after v^2 / 2a = 3.57 m
         assert!(far > 7.5, "{far}");
         assert!((near - 3.57).abs() < 0.4, "{near}");
-        let (kept, lost) = (spin(free), spin(spinning));
+        let (kept, lost) = (spin(free, free), spin(spinning, spinning));
+        assert!((spin(free, spinning) - lost).abs() < 1e-3);
         assert!(kept > 9.0, "{kept}");
         assert!(lost.abs() < 0.5, "{lost}");
     }
