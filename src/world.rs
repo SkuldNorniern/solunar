@@ -771,9 +771,12 @@ impl PhysicsWorld {
         self.scratch
             .extend((0..count).map(|dense| starting_state(&self.bodies, dense)));
 
-        let chunk_size = count
-            .div_ceil(dispatch.parallelism().max(1))
-            .max(MIN_BODIES_PER_JOB);
+        // a small world integrates on this thread, a big one in a job per worker
+        let chunk_size = if count < MIN_BODIES_PER_JOB {
+            count.max(1)
+        } else {
+            count.div_ceil(dispatch.parallelism().max(1))
+        };
         let bodies = &self.bodies;
         let frame_gravity = &self.frame_gravity;
         let awake = self.sleep.awake();
