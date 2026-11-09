@@ -8,6 +8,7 @@ mod dispatch;
 mod error;
 mod field;
 mod fluid;
+mod fracture;
 mod frame;
 mod inspect;
 mod joint;
@@ -36,6 +37,10 @@ pub use field::{FieldDesc, FieldHandle, FieldRegion, ForceField};
 pub use fluid::{
     BoundaryId, Erosion, FlowId, FluidReport, FluidSettings, FluidSolver, FluidWorld, Kernel,
     ShallowReport, ShallowSettings, ShallowWater,
+};
+pub use fracture::{
+    BreakableDesc, BreakableHandle, FractureEvent, FracturePattern, MAX_CELLS, PatternBond,
+    PatternPiece, voronoi_box,
 };
 pub use frame::{FrameDesc, FrameId, FrameState, Frames, MAX_FRAME_DEPTH};
 pub use inspect::{ContactEvent, ContactView, IslandStats};

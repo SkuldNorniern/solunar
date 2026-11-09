@@ -113,6 +113,7 @@ pub struct PhysicsWorld {
     touched: (Pairs, Pairs),
     contact_events: Vec<ContactEvent>,
     pub(crate) sensors: Sensors,
+    pub(crate) breakables: crate::fracture::Breakables,
     pub(crate) fields: Fields,
     failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
@@ -158,6 +159,7 @@ impl PhysicsWorld {
             touched: (Vec::new(), Vec::new()),
             contact_events: Vec::new(),
             sensors: Sensors::default(),
+            breakables: crate::fracture::Breakables::default(),
             fields: Fields::default(),
             failed_body: None,
             recheck_sleepers: false,
@@ -707,6 +709,7 @@ impl PhysicsWorld {
         let started = Instant::now();
         self.failed_body = None;
         self.prepare_frame_gravity()?;
+        self.remember_velocities();
         self.apply_fields();
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
@@ -815,6 +818,7 @@ impl PhysicsWorld {
         self.recheck_sleepers = false;
         self.tick += 1;
         self.update_sensors()?;
+        self.update_breakables()?;
         lap(&mut phases.finish);
         self.phases = phases;
         self.times.record(started.elapsed());
