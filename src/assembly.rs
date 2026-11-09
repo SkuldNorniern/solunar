@@ -42,6 +42,39 @@ impl PhysicsWorld {
         children: &[CompoundChild],
     ) -> Result<(), PhysicsError> {
         let dense = self.editable(body)?;
+        self.rebuild(dense, children)
+    }
+
+    /// Makes part `part` of `body` `scale` times as dense as the body: a tank filling or
+    /// emptying, cargo loaded. Its mass, center and turning follow, each point keeps its speed.
+    /// The parts keep their order, so a structure's body may change this way too.
+    ///
+    /// # Errors
+    /// Fails on a stale handle, a body that is not a compound, a part past its parts, a scale
+    /// that is not finite and positive, or a body a breakable owns.
+    pub fn set_part_density(
+        &mut self,
+        body: BodyHandle,
+        part: usize,
+        scale: f32,
+    ) -> Result<(), PhysicsError> {
+        let dense = self.bodies.dense_index(body)?;
+        if self.breakables.holds(body) {
+            return Err(PhysicsError::ShapeInUse);
+        }
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(PhysicsError::InvalidMaterial);
+        }
+        let mut children = self.compound_children(body)?;
+        children
+            .get_mut(part)
+            .ok_or(PhysicsError::OutOfRange)?
+            .density_scale = scale;
+        self.rebuild(dense, &children)
+    }
+
+    /// `dense` made of `children`, about their new center and axes, every point's speed kept.
+    fn rebuild(&mut self, dense: usize, children: &[CompoundChild]) -> Result<(), PhysicsError> {
         let info = self.add_owned_compound(children)?;
         let (rotation, position) = (self.bodies.rotation[dense], self.bodies.position(dense));
         let shift = rotation.rotate_vec3(info.center);
@@ -594,6 +627,37 @@ mod tests {
         );
         world.merge_bodies(body, ball).unwrap();
         assert!(world.joints.get(joint).is_err());
+    }
+
+    #[test]
+    fn a_tank_emptying_moves_the_center_and_lightens_the_body() {
+        let mut world = no_gravity();
+        let body = rod(&mut world);
+        let children = world.compound_children(body).unwrap();
+        let rotation = world.body_state(body).unwrap().rotation;
+        let end = (0..4)
+            .max_by(|a, b| {
+                let x = |i: usize| rotation.rotate_vec3(children[i].position).x;
+                x(*a).total_cmp(&x(*b))
+            })
+            .unwrap();
+        let mass = |world: &PhysicsWorld| {
+            world.bodies.inverse_mass[world.bodies.dense_index(body).unwrap()].recip()
+        };
+        let before = (mass(&world), world.body_state(body).unwrap().position.local);
+        // the +x end cube was full, now a tenth
+        world.set_part_density(body, end, 0.1).unwrap();
+        assert!(
+            (mass(&world) - (before.0 - 900.0)).abs() < 1.0,
+            "{}",
+            mass(&world)
+        );
+        let center = world.body_state(body).unwrap().position.local;
+        // 1000 kg cubes at -1.5, -0.5 and 0.5, 100 kg at 1.5: the center at -1350 / 3100
+        let expected = before.1.x - 1350.0 / 3100.0;
+        assert!((center.x - expected).abs() < 1e-3, "{center:?} {expected}");
+        assert!(world.set_part_density(body, end, 0.0).is_err());
+        assert!(world.set_part_density(body, 9, 1.0).is_err());
     }
 
     #[test]
