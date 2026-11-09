@@ -54,7 +54,8 @@ pub use joint::{
 };
 pub use material::{Combine, Material};
 pub use planet::{
-    MAX_LEVEL, Planet, PlanetDesc, PlanetGround, TileKey, direction, face_of, level_at, level_for,
+    MAX_LEVEL, Planet, PlanetDesc, PlanetFrames, PlanetGround, TileKey, direction, face_of,
+    level_at, level_for,
 };
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};

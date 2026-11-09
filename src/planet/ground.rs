@@ -5,6 +5,8 @@ use algebrix::{DQuat, DVec3, Vec3};
 use super::{Planet, TileKey, direction, face_of};
 use crate::body::{BodyHandle, RigidBodyDesc};
 use crate::error::PhysicsError;
+use crate::frame::{FrameDesc, FrameId, FrameMotion};
+use crate::gravity::{GravityId, GravitySource};
 use crate::shape::Shape;
 use crate::world::PhysicsWorld;
 
@@ -22,6 +24,19 @@ pub struct PlanetGround {
     turn: DQuat,
     level: u8,
     tiles: BTreeMap<TileKey, (BodyHandle, Shape)>,
+    /// The frame the tiles stand in.
+    frame: FrameId,
+}
+
+/// The frames and pull [`PlanetGround::on_planet`] made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanetFrames {
+    /// Centered on the planet and turning with it.
+    pub planet: FrameId,
+    /// At the anchor in the planet frame, up there +y: the ground's tiles and bodies on them go
+    /// here.
+    pub ground: FrameId,
+    pub gravity: GravityId,
 }
 
 impl PlanetGround {
@@ -41,7 +56,56 @@ impl PlanetGround {
             anchor,
             level,
             tiles: BTreeMap::new(),
+            frame: FrameId::ROOT,
         })
+    }
+
+    /// The ground on a real planet in `world`: a frame at its center turning once a
+    /// [`PlanetDesc::day`](super::PlanetDesc::day), its pull there, and a frame at `anchor` in it
+    /// with up +y, where the tiles stand. Bodies in that frame fall toward the center however far
+    /// they go and feel the turning, so the world's uniform gravity should be zero.
+    ///
+    /// # Errors
+    /// As [`Self::new`], and when the world refuses a frame or the pull.
+    pub fn on_planet(
+        world: &mut PhysicsWorld,
+        planet: Planet,
+        anchor: DVec3,
+        level: u8,
+    ) -> Result<(Self, PlanetFrames), PhysicsError> {
+        let mut ground = Self::new(planet, anchor, level)?;
+        let desc = *ground.planet.desc();
+        let spin = if desc.day > 0.0 {
+            DVec3::Y * (std::f64::consts::TAU / desc.day)
+        } else {
+            DVec3::ZERO
+        };
+        let center = world.add_frame(FrameDesc {
+            motion: FrameMotion { spin, orbit: None },
+            ..FrameDesc::new(FrameId::ROOT)
+        })?;
+        // pulls as a point down to the lowest ground can be, the base sphere less the relief:
+        // with the base sphere a valley under it was pulled as inside the ball, 0.06% weak
+        let gravity = world.add_gravity(GravitySource {
+            radius: desc.radius - desc.relief,
+            ..GravitySource::point(center, DVec3::ZERO, desc.mu)
+        })?;
+        ground.frame = world.add_frame(FrameDesc {
+            translation: anchor,
+            rotation: ground.turn.conjugate(),
+            ..FrameDesc::new(center)
+        })?;
+        let frames = PlanetFrames {
+            planet: center,
+            ground: ground.frame,
+            gravity,
+        };
+        Ok((ground, frames))
+    }
+
+    /// The frame the tiles stand in, the root for [`Self::new`].
+    pub fn frame(&self) -> FrameId {
+        self.frame
     }
 
     pub fn planet(&self) -> &Planet {
@@ -133,7 +197,9 @@ impl PlanetGround {
             }
             let (vertices, triangles, center) = self.tile_mesh(tile);
             let shape = world.add_mesh(&vertices, &triangles)?;
-            let body = world.spawn(RigidBodyDesc::fixed(shape).local_position(center.as_vec3()));
+            let mut desc = RigidBodyDesc::fixed(shape).local_position(center.as_vec3());
+            desc.frame = self.frame;
+            let body = world.spawn(desc);
             match body {
                 Ok(body) => {
                     self.tiles.insert(tile, (body, shape));
@@ -280,6 +346,91 @@ mod tests {
         let height = at.y - ground.ground_under(at).y;
         assert!((height - 0.5).abs() < 0.15, "{height}");
         assert!(ground.tile_count() <= 16, "{}", ground.tile_count());
+    }
+
+    /// Earth turning, its pull, and its ground frame at the equator on the x axis.
+    fn on_earth() -> (PlanetGround, PlanetFrames, PhysicsWorld) {
+        let planet = Planet::new(PlanetDesc::earth(3)).unwrap();
+        let anchor = planet.surface(DVec3::X);
+        let level = level_for(&planet, 2.5);
+        let mut world = PhysicsWorld::new(PhysicsSettings {
+            gravity: Vec3::ZERO,
+            ..PhysicsSettings::default()
+        })
+        .unwrap();
+        let (ground, frames) = PlanetGround::on_planet(&mut world, planet, anchor, level).unwrap();
+        (ground, frames, world)
+    }
+
+    #[test]
+    fn on_a_turning_planet_things_fall_with_its_pull_less_the_turning() {
+        let (ground, frames, world) = on_earth();
+        let desc = *ground.planet().desc();
+        let r = ground.anchor().length();
+        let spin = std::f64::consts::TAU / desc.day;
+        let felt = world
+            .gravity_at(frames.ground, crate::GridPosition::ORIGIN, Vec3::ZERO)
+            .unwrap();
+        let expected = desc.mu / (r * r) - spin * spin * r;
+        assert!(
+            (f64::from(-felt.y) - expected).abs() < 1e-4,
+            "{felt:?} {expected}"
+        );
+        assert!(felt.x.abs() < 1e-4 && felt.z.abs() < 1e-4, "{felt:?}");
+    }
+
+    #[test]
+    fn a_ball_dropped_at_the_equator_lands_east_by_coriolis() {
+        let (ground, frames, mut world) = on_earth();
+        let height = 100.0_f32;
+        let mut desc =
+            RigidBodyDesc::dynamic(Shape::sphere(0.1)).local_position(Vec3::new(0.0, height, 0.0));
+        desc.frame = frames.ground;
+        desc.can_sleep = false;
+        let ball = world.spawn(desc).unwrap();
+        let mut time = 0.0;
+        while world.body_state(ball).unwrap().position.local.y > 0.0 {
+            world.step_fixed().unwrap();
+            time += 1.0 / 60.0;
+        }
+        // the planet turns about its y, so east at the anchor on its x is minus z there
+        let east = ground.turn().mul_vec3(DVec3::new(0.0, 0.0, -1.0)).as_vec3();
+        let landed = world.body_state(ball).unwrap().position.local;
+        let spin = std::f64::consts::TAU / ground.planet().desc().day;
+        let g = 2.0 * f64::from(height) / (time * time);
+        let expected = spin * g * time.powi(3) / 3.0;
+        let off = f64::from(landed.dot(east));
+        assert!((off - expected).abs() < 0.2 * expected, "{off} {expected}");
+        assert!(expected > 0.02);
+    }
+
+    #[test]
+    fn a_box_rests_on_a_turning_planet() {
+        let (mut ground, frames, mut world) = on_earth();
+        let drop = ground.ground_under(DVec3::new(12.0, 0.0, -7.0)) + DVec3::Y * 3.0;
+        let mut desc =
+            RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.5))).local_position(drop.as_vec3());
+        desc.frame = frames.ground;
+        let body = world.spawn(desc).unwrap();
+        for _ in 0..240 {
+            let at = world.body_state(body).unwrap().position.to_dvec3();
+            ground.update(&mut world, &[at], 20.0).unwrap();
+            world.step_fixed().unwrap();
+        }
+        let state = world.body_state(body).unwrap();
+        let at = state.position.to_dvec3();
+        let height = at.y - ground.ground_under(at).y;
+        assert!((height - 0.5).abs() < 0.15, "{height}");
+        assert!(
+            state.linear_velocity.length() < 0.01,
+            "{:?}",
+            state.linear_velocity
+        );
+        assert!(
+            ground
+                .bodies()
+                .all(|tile| world.body_state(tile).unwrap().frame == frames.ground)
+        );
     }
 
     #[test]

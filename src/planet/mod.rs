@@ -6,7 +6,7 @@ use crate::error::PhysicsError;
 
 mod ground;
 
-pub use ground::{PlanetGround, level_at, level_for};
+pub use ground::{PlanetFrames, PlanetGround, level_at, level_for};
 
 /// Deepest a tile is split, a planet the size of the earth gets tiles of a few meters there.
 pub const MAX_LEVEL: u8 = 22;
@@ -29,6 +29,10 @@ pub struct PlanetDesc {
     pub octaves: u32,
     /// Height of the sea over the base sphere, meters.
     pub sea_level: f64,
+    /// Mass times the gravitational constant, m^3/s^2, for its pull.
+    pub mu: f64,
+    /// Seconds for one turn about its y axis against the stars, zero for none.
+    pub day: f64,
 }
 
 impl PlanetDesc {
@@ -41,6 +45,8 @@ impl PlanetDesc {
             wavelength: 2_000_000.0,
             octaves: 16,
             sea_level: 0.0,
+            mu: 3.986_004_418e14,
+            day: 86_164.1,
         }
     }
 
@@ -53,7 +59,10 @@ impl PlanetDesc {
             && positive(self.wavelength)
             && (1..=24).contains(&self.octaves)
             && self.sea_level.is_finite()
-            && self.sea_level.abs() < self.radius / 2.0;
+            && self.sea_level.abs() < self.radius / 2.0
+            && positive(self.mu)
+            && self.day.is_finite()
+            && self.day >= 0.0;
         if valid {
             Ok(())
         } else {

@@ -129,10 +129,6 @@ impl StepGravity {
         Ok(())
     }
 
-    pub(crate) fn covers(&self, frame: FrameId) -> bool {
-        (frame.0 as usize) < self.frames.len()
-    }
-
     /// The acceleration a body in `frame` at `position` moving at `velocity` feels, in that
     /// frame's axes. A moving frame adds what its motion does: minus its origin's acceleration,
     /// coriolis, centrifugal and the turning speeding up.

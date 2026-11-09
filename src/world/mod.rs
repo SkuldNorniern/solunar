@@ -250,13 +250,20 @@ impl PhysicsWorld {
     }
 
     /// What a body in `frame` at `position` moving at `velocity` falls with, in that frame's axes:
-    /// uniform gravity, the sources and the frame's own motion. As of the last step.
-    pub fn gravity_at(&self, frame: FrameId, position: GridPosition, velocity: Vec3) -> Vec3 {
-        if self.frames.contains(frame) && self.gravity.covers(frame) {
-            self.gravity.at(frame, position, velocity)
-        } else {
-            self.settings.gravity
-        }
+    /// uniform gravity, the sources and the frame's own motion, now.
+    ///
+    /// # Errors
+    /// Fails on an unknown frame.
+    pub fn gravity_at(
+        &self,
+        frame: FrameId,
+        position: GridPosition,
+        velocity: Vec3,
+    ) -> Result<Vec3, PhysicsError> {
+        self.frames.get(frame)?;
+        let mut now = StepGravity::default();
+        now.prepare(self.settings.gravity, &self.frames, &self.gravity_sources)?;
+        Ok(now.at(frame, position, velocity))
     }
 
     /// # Errors
