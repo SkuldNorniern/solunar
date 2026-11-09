@@ -1,6 +1,8 @@
 use algebrix::{DVec3, Quat, Vec3};
 
-use crate::{GridPosition, Shape};
+use std::sync::{Mutex, PoisonError};
+
+use crate::{GridPosition, JobDispatch, Shape};
 
 /// World bounds in f64, so far cells do not lose precision.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,11 +53,16 @@ fn shape_extent(shape: &Shape, rotation: Quat) -> Vec3 {
 const WIDE: f64 = 16.0;
 
 /// Sort and sweep on x. Fills `pairs` with overlapping index pairs, low index first, sorted.
-pub(crate) fn find_pairs(bounds: &[Bounds], order: &mut Vec<u32>, pairs: &mut Vec<(u32, u32)>) {
+pub(crate) fn find_pairs(
+    bounds: &[Bounds],
+    order: &mut Vec<u32>,
+    pairs: &mut Vec<(u32, u32)>,
+    dispatch: &dyn JobDispatch,
+) {
     order.clear();
     order.extend(0..bounds.len() as u32);
     pairs.clear();
-    sweep(bounds, order, &mut Vec::new(), pairs);
+    sweep(bounds, order, &mut Vec::new(), pairs, dispatch);
     pairs.sort_unstable();
 }
 
@@ -78,23 +85,59 @@ fn sweep(
     order: &mut [u32],
     packed: &mut Vec<Bounds>,
     pairs: &mut Vec<(u32, u32)>,
+    dispatch: &dyn JobDispatch,
 ) {
     sort_by_min_x(bounds, order);
     packed.clear();
     packed.extend(order.iter().map(|index| bounds[*index as usize]));
-    for (at, first) in packed.iter().enumerate() {
-        let a = order[at];
-        for (offset, second) in packed[at + 1..].iter().enumerate() {
-            if second.min.x > first.max.x {
-                break;
-            }
-            if first.overlaps_yz(second) {
-                let b = order[at + 1 + offset];
-                pairs.push((a.min(b), a.max(b)));
+    let (order, packed) = (&*order, &**packed);
+    let from = |start: usize, end: usize, out: &mut Vec<(u32, u32)>| {
+        for at in start..end {
+            let (a, first) = (order[at], &packed[at]);
+            for (offset, second) in packed[at + 1..].iter().enumerate() {
+                if second.min.x > first.max.x {
+                    break;
+                }
+                if first.overlaps_yz(second) {
+                    let b = order[at + 1 + offset];
+                    out.push((a.min(b), a.max(b)));
+                }
             }
         }
+    };
+    let jobs = (packed.len() / SWEEP_PER_JOB).min(dispatch.parallelism() * 4);
+    if jobs < 2 {
+        from(0, packed.len(), pairs);
+        return;
+    }
+    // each job sweeps on from its own slice of the order, reading past its end. outputs join
+    // in job order, the caller sorts them, so the result does not depend on the thread count
+    let size = packed.len().div_ceil(jobs);
+    type Output = Mutex<(Vec<(u32, u32)>, bool)>;
+    let outputs: Vec<Output> = (0..jobs).map(|_| Mutex::new((Vec::new(), false))).collect();
+    let run = |job: usize| {
+        let Some(slot) = outputs.get(job) else {
+            return;
+        };
+        let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.1 {
+            return;
+        }
+        let start = (job * size).min(packed.len());
+        from(start, (start + size).min(packed.len()), &mut guard.0);
+        guard.1 = true;
+    };
+    dispatch.run(jobs, &run);
+    for job in 0..jobs {
+        run(job);
+    }
+    for slot in outputs {
+        pairs.extend(slot.into_inner().unwrap_or_else(PoisonError::into_inner).0);
     }
 }
+
+/// Bodies a sweep job starts from at least.
+const SWEEP_PER_JOB: usize = 256;
 
 /// Pairs that have at least one mover. Static and sleeping bodies never pair with each other,
 /// they stay still, so a field of sleepers costs a sort and not a sweep.
@@ -116,6 +159,7 @@ impl MovingPairs {
         bounds: &[Bounds],
         moving: impl Fn(usize) -> bool,
         pairs: &mut Vec<(u32, u32)>,
+        dispatch: &dyn JobDispatch,
     ) {
         self.movers.clear();
         self.wide.clear();
@@ -152,7 +196,7 @@ impl MovingPairs {
             sort_by_min_x(bounds, &mut self.narrow);
         }
         pairs.clear();
-        sweep(bounds, &mut self.movers, &mut self.packed, pairs);
+        sweep(bounds, &mut self.movers, &mut self.packed, pairs, dispatch);
         for at in 0..self.movers.len() {
             self.against_passive(bounds, self.movers[at] as usize, pairs);
         }
@@ -203,6 +247,51 @@ impl MovingPairs {
 mod tests {
     use super::*;
 
+    struct Threads(usize);
+
+    impl JobDispatch for Threads {
+        fn parallelism(&self) -> usize {
+            self.0
+        }
+
+        fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+            let workers = self.0;
+            std::thread::scope(|scope| {
+                for worker in 0..workers {
+                    scope.spawn(move || {
+                        for index in (0..jobs).rev().filter(|index| index % workers == worker) {
+                            job(index);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_sweep_on_threads_finds_the_pairs_one_thread_does() {
+        let mut seed = 99_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let bounds: Vec<Bounds> = (0..3000)
+            .map(|_| at(next() * 30.0, next() * 10.0, next() * 30.0, 0.3 + next()))
+            .collect();
+        let (mut order, mut alone, mut shared) = (Vec::new(), Vec::new(), Vec::new());
+        find_pairs(&bounds, &mut order, &mut alone, &crate::Sequential);
+        find_pairs(&bounds, &mut order, &mut shared, &Threads(4));
+        assert!(alone.len() > 1000, "{}", alone.len());
+        assert_eq!(alone, shared);
+        let moving = |index: usize| !index.is_multiple_of(3);
+        let (mut one, mut many) = (MovingPairs::default(), MovingPairs::default());
+        one.find(&bounds, moving, &mut alone, &crate::Sequential);
+        many.find(&bounds, moving, &mut shared, &Threads(3));
+        assert_eq!(alone, shared);
+    }
+
     fn at(x: f64, y: f64, z: f64, half: f64) -> Bounds {
         let center = DVec3::new(x, y, z);
         Bounds {
@@ -238,7 +327,7 @@ mod tests {
                 .map(|_| at(next(), next(), next(), next() / 20.0))
                 .collect();
             let (mut order, mut pairs) = (Vec::new(), Vec::new());
-            find_pairs(&bounds, &mut order, &mut pairs);
+            find_pairs(&bounds, &mut order, &mut pairs, &crate::Sequential);
             assert_eq!(pairs, brute_force(&bounds));
         }
     }
@@ -265,7 +354,7 @@ mod tests {
             let woken = |index: usize| index % 11 == 5;
             let mut search = MovingPairs::default();
             let mut pairs = Vec::new();
-            search.find(&bounds, moving, &mut pairs);
+            search.find(&bounds, moving, &mut pairs, &crate::Sequential);
             let mut wanted: Vec<(u32, u32)> = brute_force(&bounds)
                 .into_iter()
                 .filter(|(a, b)| moving(*a as usize) || moving(*b as usize))
@@ -311,8 +400,8 @@ mod tests {
             if step % 11 == 6 {
                 bounds.swap_remove((next() * 2.0) as usize % bounds.len());
             }
-            kept.find(&bounds, moving, &mut pairs);
-            MovingPairs::default().find(&bounds, moving, &mut fresh_pairs);
+            kept.find(&bounds, moving, &mut pairs, &crate::Sequential);
+            MovingPairs::default().find(&bounds, moving, &mut fresh_pairs, &crate::Sequential);
             assert_eq!(pairs, fresh_pairs, "step {step}");
         }
     }
@@ -325,7 +414,7 @@ mod tests {
             at(9.0, 0.0, 0.0, 1.0),
         ];
         let (mut order, mut pairs) = (Vec::new(), Vec::new());
-        find_pairs(&bounds, &mut order, &mut pairs);
+        find_pairs(&bounds, &mut order, &mut pairs, &crate::Sequential);
         assert_eq!(pairs, [(0, 1)]);
     }
 

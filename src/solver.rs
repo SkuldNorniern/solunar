@@ -458,7 +458,7 @@ pub(crate) fn find_broad_pairs(
     bodies: &Bodies,
     scratch: &mut ContactScratch,
     every: bool,
-    dt: f32,
+    (dispatch, dt): (&dyn JobDispatch, f32),
 ) {
     let count = bodies.len();
     scratch.bounds.truncate(count);
@@ -483,12 +483,17 @@ pub(crate) fn find_broad_pairs(
         }
     }
     if every {
-        find_pairs(&scratch.bounds, &mut scratch.order, &mut scratch.pairs);
+        find_pairs(
+            &scratch.bounds,
+            &mut scratch.order,
+            &mut scratch.pairs,
+            dispatch,
+        );
     } else {
         let moving = |dense: usize| bodies.kind[dense] != BodyKind::Static && !bodies.asleep[dense];
         scratch
             .moving
-            .find(&scratch.bounds, moving, &mut scratch.pairs);
+            .find(&scratch.bounds, moving, &mut scratch.pairs, dispatch);
     }
 }
 

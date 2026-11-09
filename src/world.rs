@@ -768,7 +768,7 @@ impl PhysicsWorld {
             &self.bodies,
             &mut self.contact_scratch,
             self.recheck_sleepers,
-            dt,
+            (dispatch, dt),
         );
         plan_wakes(
             &self.bodies,
