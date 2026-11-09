@@ -24,10 +24,11 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 26] = [
+const SUITES: [(&str, Suite); 27] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
+    ("moving-rays", moving_rays),
     ("fracture", fracture_wall),
     ("gallery", gallery),
     ("stacks", stacks),
@@ -555,6 +556,60 @@ fn sleepers() -> Result<Outcome> {
 
 /// The `sleepers` field once all of it sleeps, then frames of one step and 100 rays down onto
 /// it, like a listener's or a light's checks each frame. Times are whole frames.
+/// `sleep-rays` with 20 balls rolling over the sleepers, so something moves every step: the step
+/// and the 100 rays after it, as a game queries each frame.
+fn moving_rays() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 200.0)?;
+    for i in 0..10_000 {
+        let (x, z) = ((i % 100) as f32, (i / 100) as f32);
+        let at = Vec3::new(x * 1.5 - 75.0, 0.41, z * 1.5 - 75.0);
+        world.spawn(RigidBodyDesc::dynamic(Shape::cuboid(Vec3::splat(0.4))).local_position(at))?;
+    }
+    for _ in 0..600 {
+        world.step_fixed()?;
+        if world.sleeping_body_count() == 10_000 {
+            break;
+        }
+    }
+    for i in 0..20 {
+        let mut ball = RigidBodyDesc::dynamic(Shape::sphere(0.3))
+            .local_position(Vec3::new(i as f32 * 7.0 - 70.0, 1.5, -70.0))
+            .linear_velocity(Vec3::new(0.0, 0.0, 4.0));
+        ball.can_sleep = false;
+        world.spawn(ball)?;
+    }
+    let rays: Vec<Ray> = (0..100)
+        .map(|i| {
+            let (x, z) = ((i % 10) as f32, (i / 10) as f32);
+            let at = Vec3::new(x * 15.0 - 75.0, 5.0, z * 15.0 - 75.0);
+            Ok(Ray {
+                origin: GridPosition::from_local(at).ok_or(PhysicsError::OutOfRange)?,
+                direction: Vec3::NEG_Y,
+                max_distance: 10.0,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let filter = QueryFilter::default();
+    let mut hits = 0;
+    let mut times = Vec::with_capacity(300);
+    for _ in 0..300 {
+        let started = Instant::now();
+        world.step_fixed()?;
+        hits = 0;
+        for ray in &rays {
+            hits += usize::from(world.raycast(ray, &filter)?.is_some());
+        }
+        times.push(started.elapsed());
+    }
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("{hits} of 100 hit, {} asleep", world.sleeping_body_count()),
+    })
+}
+
 fn sleep_rays() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 200.0)?;
