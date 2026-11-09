@@ -24,6 +24,8 @@ const FATIGUE_RATE: f32 = 0.2;
 
 /// Per piece, the strongest push on it this step and from which body.
 type Hits = [Option<(f32, BodyHandle)>];
+/// Force on each piece of one breakable, and the body that pushed hardest on it.
+type PieceLoads = (Vec<f32>, Vec<Option<(f32, BodyHandle)>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BreakableHandle {
@@ -670,7 +672,8 @@ impl PhysicsWorld {
             .filter(|(dense, _)| *dense < self.bodies.len())
             .map(|(dense, velocity)| (self.bodies.handle_at(dense), *velocity))
             .collect();
-        for index in 0..self.breakables.slots.len() {
+        let loads = self.piece_loads(dt);
+        for (index, (force, hitter)) in loads.into_iter().enumerate() {
             let Some(mut breakable) = self.breakables.slots[index].take() else {
                 continue;
             };
@@ -678,38 +681,59 @@ impl PhysicsWorld {
                 index: index as u32,
                 generation: self.breakables.generations[index],
             };
-            let result = self.load_and_split(handle, &mut breakable, dt, &before);
+            let result = self.load_and_split(handle, &mut breakable, (&force, &hitter), &before);
             self.breakables.slots[index] = Some(breakable);
             result?;
         }
         Ok(())
     }
 
-    fn load_and_split(
-        &mut self,
-        handle: BreakableHandle,
-        breakable: &mut Breakable,
-        dt: f32,
-        before: &HashMap<BodyHandle, Vec3>,
-    ) -> Result<(), PhysicsError> {
-        // force on each piece, and the body that pushed hardest on it
-        let mut force = vec![0.0_f32; breakable.pieces.len()];
-        let mut hitter: Vec<Option<(f32, BodyHandle)>> = vec![None; breakable.pieces.len()];
+    /// For each breakable, the force on each of its pieces from the last step's contacts and the
+    /// body that pushed hardest on it. One pass over the contacts, each side found by its body in
+    /// one sorted list: searched breakable by breakable and group by group it was 1.2 ms a step
+    /// with a few hundred pieces loose.
+    fn piece_loads(&self, dt: f32) -> Vec<PieceLoads> {
+        let slots = &self.breakables.slots;
+        let mut owners: Vec<(BodyHandle, u32, u32)> = Vec::new();
+        for (slot, breakable) in slots.iter().enumerate() {
+            let Some(breakable) = breakable else {
+                continue;
+            };
+            for (group, held) in breakable.groups.iter().enumerate() {
+                owners.push((held.body, slot as u32, group as u32));
+            }
+        }
+        owners.sort_unstable();
+        let mut loads: Vec<PieceLoads> = slots
+            .iter()
+            .map(|breakable| {
+                let count = breakable
+                    .as_ref()
+                    .map_or(0, |breakable| breakable.pieces.len());
+                (vec![0.0; count], vec![None; count])
+            })
+            .collect();
         for entry in &self.contact_cache {
             for (body, part, other) in [
                 (entry.a, entry.part_a, entry.b),
                 (entry.b, entry.part_b, entry.a),
             ] {
-                let Some(group) = breakable.groups.iter().find(|g| g.body == body) else {
+                let Ok(at) = owners.binary_search_by_key(&body, |owner| owner.0) else {
                     continue;
                 };
-                let Some(&piece) = group.pieces.get(part as usize) else {
+                let (_, slot, group) = owners[at];
+                let Some(breakable) = &slots[slot as usize] else {
+                    continue;
+                };
+                let Some(&piece) = breakable.groups[group as usize].pieces.get(part as usize)
+                else {
                     continue;
                 };
                 let load: f32 = entry.points[..entry.count]
                     .iter()
                     .map(|point| point.pushed / dt)
                     .sum();
+                let (force, hitter) = &mut loads[slot as usize];
                 force[piece as usize] += load;
                 let best = &mut hitter[piece as usize];
                 if best.is_none_or(|(held, _)| load > held) {
@@ -717,6 +741,16 @@ impl PhysicsWorld {
                 }
             }
         }
+        loads
+    }
+
+    fn load_and_split(
+        &mut self,
+        handle: BreakableHandle,
+        breakable: &mut Breakable,
+        (force, hitter): (&[f32], &Hits),
+        before: &HashMap<BodyHandle, Vec3>,
+    ) -> Result<(), PhysicsError> {
         let mut held = vec![0.0_f32; breakable.pieces.len()];
         for bond in breakable.bonds.iter().filter(|bond| !bond.broken) {
             held[bond.a as usize] += bond.strength;
@@ -771,7 +805,7 @@ impl PhysicsWorld {
                 breakable.groups.push(group);
                 continue;
             }
-            self.split(handle, breakable, group, parts, (&hitter, before))?;
+            self.split(handle, breakable, group, parts, (hitter, before))?;
         }
         Ok(())
     }
