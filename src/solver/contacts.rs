@@ -122,6 +122,8 @@ pub(super) struct SolverManifold {
     pub(super) resist_turn: [[Vec3; 2]; 3],
     pub(super) resist_mass: [f32; 3],
     pub(super) resist_impulse: [f32; 3],
+    /// Two points' normal rows solved together, none when they are too near the same.
+    pub(super) block: Option<NormalBlock>,
     /// Zero for bodies that are not dynamic, they are never pushed.
     pub(super) inverse_mass: [f32; 2],
     /// Its points are `first..first + count` in the scratch point lists.
@@ -354,15 +356,62 @@ fn refresh_manifold(
             (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
         point.recovery_impulse = 0.0;
     }
+    if first {
+        manifold.block = match &*points {
+            [one, two] => NormalBlock::of(one, two, inverse_a + inverse_b),
+            _ => None,
+        };
+    }
+}
+
+/// Two points' normal rows as one 2 by 2 system, `k` and its inverse. Solved one after the
+/// other, a push at one end of a long light body mostly turns it, and a capsule's other end ran
+/// through a wall at 5000 m/s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct NormalBlock {
+    pub(super) k: [f32; 3],
+    pub(super) inverse: [f32; 3],
+}
+
+/// Past this the two rows are near the same, and the block is left to the iterations.
+const MOST_BLOCK_CONDITION: f32 = 1000.0;
+
+impl NormalBlock {
+    fn of(one: &SolverPoint, two: &SolverPoint, linear: f32) -> Option<Self> {
+        if one.mass.x <= 0.0 || two.mass.x <= 0.0 {
+            return None;
+        }
+        let k11 = one.mass.x.recip();
+        let k22 = two.mass.x.recip();
+        let k12 = linear + one.arm_a[0].dot(two.turn_a[0]) + one.arm_b[0].dot(two.turn_b[0]);
+        let determinant = k11 * k22 - k12 * k12;
+        if !(determinant.is_finite() && k11 * k11 < MOST_BLOCK_CONDITION * determinant) {
+            return None;
+        }
+        let over = determinant.recip();
+        Some(Self {
+            k: [k11, k12, k22],
+            inverse: [k22 * over, -k12 * over, k11 * over],
+        })
+    }
 }
 
 /// Where a contact point on a body is from its center, in world axes. On a ball the point facing
 /// `toward` is the same however it has turned, so it is taken that way: carried round with a ball
 /// spun up by a fast slide, 1700 rad/s, the point swung away from the wall between substeps and
-/// the gap read as open while the ball went through a 5 cm plate.
+/// the gap read as open while the ball went through a 5 cm plate. A capsule is a ball swept
+/// along its axis, so its point is the one over the same place on the axis: rolling along a
+/// plate at 100 rad/s it went through the same way.
 fn round_point(shape: &Shape, rotation: Quat, local: Vec3, toward: Vec3) -> Vec3 {
     match *shape {
         Shape::Sphere { radius } => toward * radius,
+        Shape::Capsule {
+            radius,
+            half_height,
+        } => {
+            let core = Vec3::new(0.0, local.y.clamp(-half_height, half_height), 0.0);
+            rotation.rotate_vec3(core) + toward * radius
+        }
         _ => rotation.rotate_vec3(local),
     }
 }
@@ -713,6 +762,7 @@ fn new_manifold(
         resist_turn: [[Vec3::ZERO; 2]; 3],
         resist_mass: [0.0; 3],
         resist_impulse: [0.0; 3],
+        block: None,
         inverse_mass: [
             dynamic_inverse_mass(bodies, a),
             dynamic_inverse_mass(bodies, b),

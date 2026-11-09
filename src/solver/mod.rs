@@ -431,11 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn a_glancing_ball_slides_along_a_thin_plate() {
-        // 10 degrees in at 500 m/s on a 5 cm plate, a slide that spins it up to 2000 rad/s. a
-        // capsule still goes through, its point is not the same however it turns
-        {
-            let shape = Shape::sphere(0.05);
+    fn a_glancing_ball_or_capsule_slides_along_a_thin_plate() {
+        // 10 degrees in at 500 m/s on a 5 cm plate, a slide that spins it up to 2000 rad/s
+        for shape in [Shape::sphere(0.05), Shape::capsule(0.05, 0.1)] {
             let mut world = space();
             let at = GridPosition::from_local(Vec3::new(10.0, 0.0, 0.0)).unwrap();
             plate(&mut world, Vec3::new(0.025, 20.0, 20.0), at);

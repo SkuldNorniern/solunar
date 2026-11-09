@@ -5,7 +5,11 @@ use crate::body::Bodies;
 use crate::world::Integrated;
 
 use super::Pair;
-use super::contacts::{SolverManifold, SolverPoint};
+use super::contacts::{NormalBlock, SolverManifold, SolverPoint};
+
+/// Two points still apart and closing faster than this, m/s, are solved as one block. Resting
+/// pairs keep the iterations, a block there cost a pile 10% and changed nothing.
+const BLOCK_SPEED: f32 = 1.0;
 
 /// A point slipping slower than this, m/s, counts as held still and gets static friction.
 const SLIP_SPEED: f32 = 0.05;
@@ -79,30 +83,78 @@ pub(super) fn solve_manifold(
     points: &mut [SolverPoint],
 ) {
     let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
-    let (friction, held) = (manifold.friction, manifold.static_friction);
-    for point in points.iter_mut() {
-        // friction first, so the normal impulse has the last word on penetration
-        let (limit, hold) = (
-            (friction * point.impulse.x).max(0.0),
-            (held * point.impulse.x).max(0.0),
-        );
-        for k in 1..3 {
-            let speed = slip_along(pair, manifold, point, k);
-            let accumulated = point.impulse[k];
-            let bound = if point.sliding { limit } else { hold };
-            // not `clamp`, it panics on a nan limit
-            let next = (accumulated - speed * point.mass[k]).min(bound).max(-bound);
-            point.impulse[k] = next;
-            push(pair, (axes, inverse), point, k, next - accumulated);
+    // friction first, so the normal impulse has the last word on penetration
+    if let (Some(block), [one, two]) = (manifold.block, &mut *points)
+        && one.target.min(two.target) < -BLOCK_SPEED
+    {
+        solve_friction(pair, manifold, one);
+        solve_friction(pair, manifold, two);
+        solve_block(pair, (axes, inverse), &block, [one, two]);
+    } else {
+        for point in points.iter_mut() {
+            solve_friction(pair, manifold, point);
+            let speed = speed_along(pair, axes, point, 0);
+            let next = (point.impulse.x + (point.target - speed) * point.mass.x).max(0.0);
+            let change = next - point.impulse.x;
+            point.impulse.x = next;
+            push(pair, (axes, inverse), point, 0, change);
         }
-        let speed = speed_along(pair, axes, point, 0);
-        let next = (point.impulse.x + (point.target - speed) * point.mass.x).max(0.0);
-        let change = next - point.impulse.x;
-        point.impulse.x = next;
-        push(pair, (axes, inverse), point, 0, change);
     }
     let load: f32 = points.iter().map(|point| point.impulse.x).sum();
     resist(pair, manifold, load);
+}
+
+fn solve_friction(pair: &mut Pair, manifold: &SolverManifold, point: &mut SolverPoint) {
+    let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
+    let (limit, hold) = (
+        (manifold.friction * point.impulse.x).max(0.0),
+        (manifold.static_friction * point.impulse.x).max(0.0),
+    );
+    for k in 1..3 {
+        let speed = slip_along(pair, manifold, point, k);
+        let accumulated = point.impulse[k];
+        let bound = if point.sliding { limit } else { hold };
+        // not `clamp`, it panics on a nan limit
+        let next = (accumulated - speed * point.mass[k]).min(bound).max(-bound);
+        point.impulse[k] = next;
+        push(pair, (axes, inverse), point, k, next - accumulated);
+    }
+}
+
+/// Both normal impulses at once: the totals that leave each point at its target speed or
+/// pushing nothing, tried as both pushing, either alone, then neither (the block solver of
+/// Box2D).
+fn solve_block(
+    pair: &mut Pair,
+    parts: (&[Vec3; 3], [f32; 2]),
+    block: &NormalBlock,
+    [one, two]: [&mut SolverPoint; 2],
+) {
+    let [k11, k12, k22] = block.k;
+    let [i11, i12, i22] = block.inverse;
+    let (old1, old2) = (one.impulse.x, two.impulse.x);
+    // speed over target each point would have with no impulse at all
+    let b1 = speed_along(pair, parts.0, one, 0) - one.target - (k11 * old1 + k12 * old2);
+    let b2 = speed_along(pair, parts.0, two, 0) - two.target - (k12 * old1 + k22 * old2);
+    let both = (-(i11 * b1 + i12 * b2), -(i12 * b1 + i22 * b2));
+    let first = -b1 / k11;
+    let second = -b2 / k22;
+    let (x1, x2) = if both.0 >= 0.0 && both.1 >= 0.0 {
+        both
+    } else if first >= 0.0 && k12 * first + b2 >= 0.0 {
+        (first, 0.0)
+    } else if second >= 0.0 && k12 * second + b1 >= 0.0 {
+        (0.0, second)
+    } else if b1 >= 0.0 && b2 >= 0.0 {
+        (0.0, 0.0)
+    } else {
+        // only rounding gets here, the old impulses stay
+        (old1, old2)
+    };
+    one.impulse.x = x1;
+    two.impulse.x = x2;
+    push(pair, parts, one, 0, x1 - old1);
+    push(pair, parts, two, 0, x2 - old2);
 }
 
 /// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
