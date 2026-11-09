@@ -403,6 +403,35 @@ mod tests {
     }
 
     #[test]
+    fn a_body_added_inside_the_water_pushes_it_aside_without_throwing_it() {
+        let (mut fluid, mut world) = pool();
+        // half under the surface at 0.6 m, at rest, as a cannon fired from the surface would be
+        let shape = Shape::sphere(0.2);
+        let ball = world
+            .spawn(
+                RigidBodyDesc::dynamic(shape)
+                    .density(7800.0)
+                    .local_position(Vec3::new(0.5, 0.6, 0.5)),
+            )
+            .unwrap();
+        fluid.couple(ball, &shape).unwrap();
+        let (mut fastest, mut last) = (0.0_f32, 0.0_f32);
+        for _ in 0..90 {
+            let report = fluid
+                .step_with_bodies(TICK, &mut world, &Sequential)
+                .unwrap();
+            world.step_fixed().unwrap();
+            fastest = fastest.max(report.max_speed);
+            last = report.max_speed;
+        }
+        // a burst as the ball's half volume of water leaves it at once, then calm. measured
+        // 710 m/s before pressure stopped growing past 10% over rest, 17 while fast water raised
+        // its own sound speed, 9.4 now
+        assert!(fastest < 12.0, "{fastest}");
+        assert!(last < 2.0, "{last}");
+    }
+
+    #[test]
     fn a_floating_box_and_its_water_step_on_the_same_after_snapshots() {
         let (mut fluid, mut world) = pool();
         drop_box(&mut fluid, &mut world, 500.0);

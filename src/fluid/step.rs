@@ -15,9 +15,14 @@ const WALL_DAMPING: f32 = 1.0;
 /// water into a slosh that grew. Short ones never reach it.
 const STABLE_WALL_DAMPING: f32 = 0.25;
 const STABLE_VISCOSITY: f32 = 0.05;
-/// Under a hit the sound speed is at least this many times the fastest water or body, so water
-/// squeezes about 1 / 4^2, 6%.
+/// Under a hit the sound speed is at least this many times the fastest body in the water, so
+/// water squeezes about 1 / 4^2, 6%.
 const IMPACT_SOUND: f32 = 4.0;
+/// Pressure is worked out from at most this much over rest density. Water that sound speed keeps
+/// within a few percent never gets near it. Water a body was pushed deep into between steps
+/// would read a pressure the seventh power makes ten times that of 10%, and throw it out faster
+/// than anything hit it.
+const PRESSURE_SQUEEZE_CAP: f32 = 1.1;
 
 /// What one [`FluidWorld::step`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -93,16 +98,16 @@ impl FluidWorld {
     /// Weakly compressible water squeezes about (flow / sound speed)^2, so under a hit faster
     /// than its sound speed it squeezes past half and its pressure throws water far faster than
     /// the hit. For the step the sound speed is raised to [`IMPACT_SOUND`] times the fastest
-    /// water or body, the substeps follow it, calm water is untouched.
+    /// coupled body, the substeps follow it, water with no fast body in it is untouched.
     fn wcsph(
         &mut self,
         dt: f32,
         dispatch: &dyn JobDispatch,
         report: &mut FluidReport,
     ) -> Result<(), PhysicsError> {
-        let fastest = self.fastest().max(self.fastest_mover());
+        // bodies only: water sped up by pressure raising its own sound speed feeds itself
         let configured = self.settings.sound_speed;
-        self.settings.sound_speed = configured.max(IMPACT_SOUND * fastest);
+        self.settings.sound_speed = configured.max(IMPACT_SOUND * self.fastest_mover());
         report.sound_speed = self.settings.sound_speed;
         let result = self.wcsph_steps(dt, dispatch, report);
         self.settings.sound_speed = configured;
@@ -143,7 +148,10 @@ impl FluidWorld {
         let pressures: Vec<f32> = self
             .densities
             .iter()
-            .map(|density| (stiffness * ((density / rest).powi(TAIT) - 1.0)).max(0.0))
+            .map(|density| {
+                let ratio = (density / rest).min(PRESSURE_SQUEEZE_CAP);
+                (stiffness * (ratio.powi(TAIT) - 1.0)).max(0.0)
+            })
             .collect();
         let world = &*self;
         let mass = self.mass;
