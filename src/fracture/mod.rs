@@ -146,7 +146,12 @@ impl PhysicsWorld {
         let bottom = -desc.pattern.half.y;
         let mut pieces = Vec::with_capacity(count);
         for (index, piece) in desc.pattern.pieces.iter().enumerate() {
-            let info = self.add_convex(&piece.points)?;
+            // from its own middle, so the hull's tolerance goes by the piece and not the box
+            let middle = piece.points.iter().fold(Vec3::ZERO, |sum, p| sum + *p)
+                / piece.points.len().max(1) as f32;
+            let local: Vec<Vec3> = piece.points.iter().map(|p| *p - middle).collect();
+            let mut info = self.add_convex(&local)?;
+            info.center += middle;
             let anchored = desc.fixed
                 && match desc.anchored.get(index) {
                     Some(flag) => *flag,
@@ -574,6 +579,22 @@ mod tests {
         let mut world = world();
         let cube = glass_cube(&mut world, height, strength);
         (world, cube)
+    }
+
+    #[test]
+    fn thin_and_finely_cut_patterns_all_build() {
+        let mut world = world();
+        for (half, cells, seed) in [
+            (Vec3::new(1.6, 1.25, 0.12), 60, 7),
+            (Vec3::new(3.0, 2.0, 0.08), 120, 1),
+            (Vec3::new(0.05, 1.0, 1.0), 40, 4),
+            (Vec3::splat(0.4), 200, 9),
+        ] {
+            let pattern = voronoi_box(half, cells, seed).unwrap();
+            world
+                .add_breakable(BreakableDesc::new(pattern, at(0.0, 10.0, 0.0)))
+                .unwrap();
+        }
     }
 
     #[test]
