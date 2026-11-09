@@ -58,7 +58,7 @@ impl PhysicsWorld {
         if self.joints.touching(body).next().is_some() {
             return Err(PhysicsError::BodyHasJoints);
         }
-        if self.breakables.holds(body) {
+        if self.breakables.holds(body) || self.structures.holds(body) {
             return Err(PhysicsError::ShapeInUse);
         }
         let pull = *self

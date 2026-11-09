@@ -159,7 +159,7 @@ fn part_radius(shape: &Shape, convexes: &[ConvexHull]) -> f32 {
     }
 }
 
-fn part_mass(shape: &Shape, density: f32, convexes: &[ConvexHull]) -> MassProperties {
+pub(crate) fn part_mass(shape: &Shape, density: f32, convexes: &[ConvexHull]) -> MassProperties {
     match *shape {
         Shape::Convex(id) => convexes.get(id.0 as usize).map_or(
             MassProperties {

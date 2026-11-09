@@ -26,6 +26,7 @@ mod shape;
 mod sleep;
 mod snapshot;
 mod solver;
+mod structure;
 mod substep;
 mod vehicle;
 mod world;
@@ -71,6 +72,7 @@ pub use sdf::{
 pub use sensor::{SensorDesc, SensorEvent, SensorHandle};
 pub use shape::{MassProperties, Shape};
 pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};
+pub use structure::{Link, LinkDesc, MAX_LINKS, StructureEvent, StructureHandle};
 pub use substep::{SubstepBodies, SubstepHook, SubstepPose};
 pub use vehicle::{Controls, Vehicle, WheelContact, WheelDesc, WheelState};
 pub use world::{Advance, PhysicsSettings, PhysicsWorld};

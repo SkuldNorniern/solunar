@@ -79,6 +79,7 @@ impl PhysicsWorld {
         self.gravity
             .prepare(self.settings.gravity, &self.frames, &self.gravity_sources)?;
         self.remember_velocities();
+        self.remember_structure_motion();
         self.apply_fields();
         self.joints.refresh_exclusions();
         let dt = self.settings.fixed_timestep;
@@ -214,6 +215,7 @@ impl PhysicsWorld {
         self.change_frames();
         self.update_sensors()?;
         self.update_breakables()?;
+        self.update_structures()?;
         lap(&mut phases.finish);
         self.phases = phases;
         self.times.record(started.elapsed());
