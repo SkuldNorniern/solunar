@@ -676,11 +676,7 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    for manifold in &mut scratch.manifolds {
-        let range = manifold.first..manifold.first + manifold.count;
-        let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
-        refresh_manifold(bodies, state, manifold, points, last, dt);
-    }
+    refresh_manifolds(bodies, state, scratch, last, (dispatch, dt));
     color_constraints(bodies, scratch);
     factor_islands(bodies, scratch);
     scratch.motions.clear();
@@ -1325,6 +1321,78 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
 }
 
 /// Bodies moved since the contacts were found, so gaps and arms follow them.
+/// Manifolds refreshed in one job.
+const REFRESH_CHUNK: usize = 256;
+
+/// Each manifold's refresh reads bodies and writes only its own points, so chunks of them run as
+/// jobs side by side, the same as one after another. A chunk a dispatcher skipped runs here after.
+fn refresh_manifolds(
+    bodies: &Bodies,
+    state: &[Integrated],
+    scratch: &mut ContactScratch,
+    last: bool,
+    (dispatch, dt): (&dyn JobDispatch, f32),
+) {
+    let manifolds = &mut scratch.manifolds;
+    // points lie in manifold order, one range after another, so chunks split them cleanly
+    let in_a_row = manifolds.first().is_none_or(|first| first.first == 0)
+        && manifolds
+            .windows(2)
+            .all(|pair| pair[0].first + pair[0].count == pair[1].first);
+    if manifolds.len() <= REFRESH_CHUNK || dispatch.parallelism() <= 1 || !in_a_row {
+        for manifold in manifolds.iter_mut() {
+            let range = manifold.first..manifold.first + manifold.count;
+            let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
+            refresh_manifold(bodies, state, manifold, points, last, dt);
+        }
+        return;
+    }
+    type Chunk<'a> = (
+        &'a mut [SolverManifold],
+        &'a mut [SolverPoint],
+        &'a [PointFrame],
+        bool,
+    );
+    let mut chunks: Vec<Mutex<Chunk<'_>>> = Vec::new();
+    let (mut rest, mut points, mut frames) = (
+        manifolds.as_mut_slice(),
+        scratch.points.as_mut_slice(),
+        scratch.frames.as_slice(),
+    );
+    while !rest.is_empty() {
+        let (head, tail) = rest.split_at_mut(REFRESH_CHUNK.min(rest.len()));
+        let used = head
+            .last()
+            .map_or(0, |last| last.first + last.count - head[0].first);
+        let (head_points, tail_points) = points.split_at_mut(used);
+        let (head_frames, tail_frames) = frames.split_at(used);
+        chunks.push(Mutex::new((head, head_points, head_frames, false)));
+        (rest, points, frames) = (tail, tail_points, tail_frames);
+    }
+    let refresh = |chunk: &Mutex<Chunk<'_>>| {
+        let mut guard = chunk.lock().unwrap_or_else(PoisonError::into_inner);
+        let (manifolds, points, frames, done) = &mut *guard;
+        if *done {
+            return;
+        }
+        let base = manifolds.first().map_or(0, |first| first.first);
+        for manifold in manifolds.iter_mut() {
+            let range = manifold.first - base..manifold.first - base + manifold.count;
+            let pair = (&mut points[range.clone()], &frames[range]);
+            refresh_manifold(bodies, state, manifold, pair, last, dt);
+        }
+        *done = true;
+    };
+    dispatch.run(chunks.len(), &|job| {
+        if let Some(chunk) = chunks.get(job) {
+            refresh(chunk);
+        }
+    });
+    for chunk in &chunks {
+        refresh(chunk);
+    }
+}
+
 fn refresh_manifold(
     bodies: &Bodies,
     state: &[Integrated],
