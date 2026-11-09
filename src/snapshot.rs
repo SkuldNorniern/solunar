@@ -17,7 +17,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 4;
+pub const SNAPSHOT_VERSION: u32 = 5;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -885,6 +885,11 @@ fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, Sn
         },
         _ => return Err(SnapshotError::Invalid("joint kind")),
     };
+    let (break_force, break_torque) = if reader.version >= 5 {
+        (reader.f32()?, reader.f32()?)
+    } else {
+        (f32::INFINITY, f32::INFINITY)
+    };
     let desc = JointDesc {
         a,
         b,
@@ -894,6 +899,8 @@ fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, Sn
         frame_b,
         kind,
         collide_connected,
+        break_force,
+        break_torque,
     };
     desc.validate()
         .map_err(|_| SnapshotError::Invalid("joint"))?;
@@ -1119,6 +1126,8 @@ impl Writer {
                 self.f32(max);
             }
         }
+        self.f32(desc.break_force);
+        self.f32(desc.break_torque);
         for impulse in state.impulses {
             self.f32(impulse);
         }

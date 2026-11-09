@@ -124,6 +124,10 @@ pub struct JointDesc {
     pub frame_b: Quat,
     pub kind: JointKind,
     pub collide_connected: bool,
+    /// Newtons on body B past which the joint breaks at the end of a step. Infinite holds.
+    pub break_force: f32,
+    /// Newton meters, the same for turning.
+    pub break_torque: f32,
 }
 
 impl JointDesc {
@@ -137,7 +141,16 @@ impl JointDesc {
             frame_b: Quat::IDENTITY,
             kind,
             collide_connected: false,
+            break_force: f32::INFINITY,
+            break_torque: f32::INFINITY,
         }
+    }
+
+    /// Breaks once a step pulls harder than `force` or twists harder than `torque`.
+    pub fn breaks_at(mut self, force: f32, torque: f32) -> Self {
+        self.break_force = force;
+        self.break_torque = torque;
+        self
     }
 
     pub fn fixed(a: BodyHandle, b: BodyHandle) -> Self {
@@ -208,7 +221,10 @@ impl JointDesc {
                 JointKind::Distance { min, max } => {
                     min.is_finite() && max.is_finite() && min >= 0.0 && min <= max
                 }
-            };
+            }
+            // infinite holds for good, nan or zero or less never held
+            && self.break_force > 0.0
+            && self.break_torque > 0.0;
         if valid {
             Ok(())
         } else {
@@ -1487,6 +1503,75 @@ mod tests {
         // measured 0.036 while the tip whips past 15 m/s
         assert!(fastest > 15.0, "{fastest}");
         assert!(worst < 0.06, "{worst}");
+    }
+
+    /// A 10 kg ball on a ball joint under a fixed point, rated to `limit` newtons.
+    fn hung(limit: f32) -> (PhysicsWorld, JointHandle, BodyHandle) {
+        let mut world = world();
+        let top = fixed_at(&mut world, Vec3::new(0.0, 5.0, 0.0));
+        let weight = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.2))
+                    .density(10.0 / (4.0 / 3.0 * PI * 0.008))
+                    .can_sleep(false)
+                    .local_position(Vec3::new(0.0, 4.0, 0.0)),
+            )
+            .unwrap();
+        let joint = world
+            .add_joint(
+                JointDesc::ball(top, weight)
+                    .anchors(Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0))
+                    .breaks_at(limit, f32::INFINITY),
+            )
+            .unwrap();
+        (world, joint, weight)
+    }
+
+    #[test]
+    fn a_joint_holds_under_its_limit_and_breaks_past_it() {
+        // 10 kg pulls about 98 n
+        let (mut world, joint, weight) = hung(150.0);
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+            assert!(world.broken_joints().is_empty());
+        }
+        assert!(world.joint_reaction(joint).is_ok());
+        let held = world.body_state(weight).unwrap().position.to_dvec3().y;
+        assert!((held - 4.0).abs() < 0.05, "{held}");
+        let (mut world, joint, weight) = hung(60.0);
+        world.step_fixed().unwrap();
+        assert_eq!(world.broken_joints(), [joint]);
+        assert!(world.joint_reaction(joint).is_err());
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+            assert!(world.broken_joints().is_empty());
+        }
+        let fell = world.body_state(weight).unwrap().position.to_dvec3().y;
+        assert!(fell < 0.0, "{fell}");
+        // a limit of zero or nan never held, refused
+        let (mut world, _, _) = hung(150.0);
+        let (a, b) = (
+            world.body_handles().next().unwrap(),
+            world.body_handles().nth(1).unwrap(),
+        );
+        for bad in [0.0, -1.0, f32::NAN] {
+            assert!(
+                world
+                    .add_joint(JointDesc::ball(a, b).breaks_at(bad, 1.0))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_joints_limits_survive_a_snapshot() {
+        let (world, joint, _) = hung(150.0);
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        let desc = loaded.joints.get(joint).unwrap().desc;
+        assert_eq!(
+            (desc.break_force, desc.break_torque),
+            (150.0, f32::INFINITY)
+        );
     }
 
     fn hang_load(ratio: f32) -> (f32, f32) {

@@ -114,6 +114,7 @@ pub struct PhysicsWorld {
     contact_events: Vec<ContactEvent>,
     pub(crate) sensors: Sensors,
     pub(crate) breakables: crate::fracture::Breakables,
+    broken_joints: Vec<JointHandle>,
     pub(crate) fields: Fields,
     failed_body: Option<BodyHandle>,
     /// A static or kinematic body appeared, so sleepers must check for new contact.
@@ -160,6 +161,7 @@ impl PhysicsWorld {
             contact_events: Vec::new(),
             sensors: Sensors::default(),
             breakables: crate::fracture::Breakables::default(),
+            broken_joints: Vec::new(),
             fields: Fields::default(),
             failed_body: None,
             recheck_sleepers: false,
@@ -275,6 +277,32 @@ impl PhysicsWorld {
             }
         }
         Ok(())
+    }
+
+    /// Joints that broke at the end of the last step, their handles no longer good.
+    pub fn broken_joints(&self) -> &[JointHandle] {
+        &self.broken_joints
+    }
+
+    /// Takes out every joint the last step pulled or twisted past its limit. Between steps,
+    /// never inside a solve.
+    fn break_joints(&mut self) {
+        self.broken_joints.clear();
+        let over: Vec<JointHandle> = self
+            .joints
+            .handles()
+            .filter(|joint| {
+                self.joints.get(*joint).is_ok_and(|state| {
+                    state.force.length() > state.desc.break_force
+                        || state.torque.length() > state.desc.break_torque
+                })
+            })
+            .collect();
+        for joint in over {
+            if self.remove_joint(joint).is_ok() {
+                self.broken_joints.push(joint);
+            }
+        }
     }
 
     /// Force and torque of the last step on body B.
@@ -808,6 +836,7 @@ impl PhysicsWorld {
         self.spare_cache = std::mem::replace(&mut self.contact_cache, next_cache);
         let (points, rows, impulses) = self.contact_scratch.joint_parts();
         self.joints.store(impulses, points, rows, part);
+        self.break_joints();
         update_sleep(
             &mut self.bodies,
             &self.joints,
