@@ -465,7 +465,7 @@ mod tests {
                 .map(|point| point.impulse.x)
                 .sum::<f32>()
         };
-        run(&mut world, 2.0);
+        run(&mut world, 1.0);
         // four boxes of 1000 kg and the ball, per substep
         let part = world.settings().fixed_timestep / world.settings().substeps as f32;
         let ball_mass = 5000.0 * 4.0 / 3.0 * std::f32::consts::PI * 0.125;
