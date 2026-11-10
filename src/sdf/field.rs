@@ -1,6 +1,7 @@
-use algebrix::{Quat, Vec3};
+use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::PhysicsError;
+use crate::planet::PlanetDesc;
 
 /// Signed distance where no base and no edit has put anything. Far, but finite so crossings
 /// still interpolate.
@@ -21,7 +22,22 @@ pub enum Base {
         wavelength: f32,
         octaves: u32,
     },
+    /// A planet's ground as it stands in a [`PlanetGround`](crate::PlanetGround)'s frame, made by
+    /// [`PlanetGround::sdf_desc`](crate::PlanetGround::sdf_desc). `corner` is the volume's origin
+    /// in that frame, `low` and `high` bound the ground's height in the volume.
+    Planet {
+        planet: PlanetDesc,
+        anchor: DVec3,
+        turn: DQuat,
+        corner: DVec3,
+        low: f32,
+        high: f32,
+    },
 }
+
+/// Newton steps for a planet column from a far guess, and from a neighbour's height.
+const PLANET_STEPS: usize = 6;
+const PLANET_NEAR_STEPS: usize = 3;
 
 impl Base {
     pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
@@ -41,6 +57,30 @@ impl Base {
                     && wavelength.is_finite()
                     && wavelength > 0.0
                     && (1..=8).contains(&octaves)
+            }
+            Self::Planet {
+                planet,
+                anchor,
+                turn,
+                corner,
+                low,
+                high,
+            } => {
+                planet.validate().is_ok()
+                    && finite(anchor)
+                    && anchor.length() > 0.0
+                    && [turn.x, turn.y, turn.z, turn.w]
+                        .iter()
+                        .all(|v| v.is_finite())
+                    && ((turn.x * turn.x + turn.y * turn.y + turn.z * turn.z + turn.w * turn.w)
+                        .sqrt()
+                        - 1.0)
+                        .abs()
+                        < 1e-6
+                    && finite(corner)
+                    && low.is_finite()
+                    && high.is_finite()
+                    && low <= high
             }
         };
         if valid {
@@ -64,6 +104,7 @@ impl Base {
                 let reach = amplitude * (2.0 - 0.5_f32.powi(octaves as i32 - 1));
                 Some((height - reach, height + reach))
             }
+            Self::Planet { low, high, .. } => Some((low, high)),
         }
     }
 
@@ -78,7 +119,42 @@ impl Base {
                 let dz = (self.hills(x, z + step) - self.hills(x, z - step)) / (2.0 * step);
                 (h, 1.0 / (1.0 + dx * dx + dz * dz).sqrt())
             }
+            Self::Planet { .. } => {
+                let h = self.planet_column(x, z, 0.0, PLANET_STEPS);
+                let near = |x: f32, z: f32| self.planet_column(x, z, h, PLANET_NEAR_STEPS);
+                let dx = (near(x + step, z) - near(x - step, z)) / (2.0 * step);
+                let dz = (near(x, z + step) - near(x, z - step)) / (2.0 * step);
+                (h, 1.0 / (1.0 + dx * dx + dz * dz).sqrt())
+            }
         }
+    }
+
+    /// Height of the planet's ground over the volume's column at `x`, `z`, from `guess`. The
+    /// column runs along the frame's up, which is out from the center only at the anchor, so
+    /// the height is found by Newton's steps on distance from the center less the ground's.
+    fn planet_column(&self, x: f32, z: f32, guess: f32, steps: usize) -> f32 {
+        let Self::Planet {
+            planet,
+            anchor,
+            turn,
+            corner,
+            ..
+        } = *self
+        else {
+            return 0.0;
+        };
+        let back = turn.conjugate();
+        let up = back.mul_vec3(DVec3::Y);
+        let foot = anchor + back.mul_vec3(corner + DVec3::new(f64::from(x), 0.0, f64::from(z)));
+        let mut y = f64::from(guess);
+        for _ in 0..steps {
+            let at = foot + up * y;
+            let out = at.length();
+            let over = out - planet.radius - planet.height(at);
+            // the ground's own slope is left out, it only moves the root a little
+            y -= over / up.dot(at / out).max(0.1);
+        }
+        y as f32
     }
 
     fn hills(&self, x: f32, z: f32) -> f32 {
@@ -102,6 +178,10 @@ impl Base {
         }
         height + sum
     }
+}
+
+pub(crate) fn finite(v: DVec3) -> bool {
+    v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
 pub(crate) fn base_distance(height: f32, slope: f32, y: f32) -> f32 {

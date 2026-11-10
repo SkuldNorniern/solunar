@@ -7,6 +7,9 @@ use crate::body::{BodyHandle, RigidBodyDesc};
 use crate::error::PhysicsError;
 use crate::frame::{FrameDesc, FrameId, FrameMotion};
 use crate::gravity::{GravityId, GravitySource};
+use crate::material::Material;
+use crate::position::GridPosition;
+use crate::sdf::{Base, SdfDesc};
 use crate::shape::Shape;
 use crate::world::PhysicsWorld;
 
@@ -26,6 +29,8 @@ pub struct PlanetGround {
     tiles: BTreeMap<TileKey, (BodyHandle, Shape)>,
     /// The frame the tiles stand in.
     frame: FrameId,
+    /// Tiles wholly inside are left to an editable region.
+    carved: Option<(DVec3, DVec3)>,
 }
 
 /// The frames and pull [`PlanetGround::on_planet`] made.
@@ -57,6 +62,7 @@ impl PlanetGround {
             level,
             tiles: BTreeMap::new(),
             frame: FrameId::ROOT,
+            carved: None,
         })
     }
 
@@ -136,6 +142,118 @@ impl PlanetGround {
         self.to_world(self.planet.surface(self.to_planet(world)))
     }
 
+    /// An editable region of this ground: a cube of `half` meters about `center` in the world's
+    /// frame, lattice `voxel`, bricks of `brick_cells`. Build it with
+    /// [`SdfTerrain::new_in`](crate::SdfTerrain::new_in) in [`Self::frame`], and [`Self::carve`]
+    /// the tiles it covers. Its ground is the planet's to within the lattice.
+    ///
+    /// # Errors
+    /// Fails on a non finite center, a size that is not positive, or more bricks than a volume
+    /// takes.
+    pub fn sdf_desc(
+        &self,
+        center: DVec3,
+        half: f64,
+        (voxel, brick_cells): (f32, u32),
+        material: Material,
+    ) -> Result<SdfDesc, PhysicsError> {
+        let finite = center.x.is_finite() && center.y.is_finite() && center.z.is_finite();
+        if !finite || !(half.is_finite() && half > 0.0) || !(voxel.is_finite() && voxel > 0.0) {
+            return Err(PhysicsError::OutOfRange);
+        }
+        let brick = f64::from(voxel) * f64::from(brick_cells.max(1));
+        let count = ((2.0 * half) / brick).ceil().max(1.0);
+        if count > 1024.0 {
+            return Err(PhysicsError::OutOfRange);
+        }
+        let side = count * brick;
+        let corner = center - DVec3::splat(side / 2.0);
+        // the ground's height in the volume from the sphere at its lowest and highest, the
+        // frame's y is out from the center at the anchor, and drops away from it
+        let desc = self.planet.desc();
+        let out = self.anchor.length();
+        let far = [corner.x, corner.x + side]
+            .iter()
+            .flat_map(|x| [corner.z, corner.z + side].map(|z| x * x + z * z))
+            .fold(0.0, f64::max);
+        let nearest = |from: f64| {
+            if from <= 0.0 && from + side >= 0.0 {
+                0.0
+            } else {
+                from.abs().min((from + side).abs())
+            }
+        };
+        let (near_x, near_z) = (nearest(corner.x), nearest(corner.z));
+        let lowest = (desc.radius - desc.relief).powi(2) - far;
+        let lowest = if lowest > 0.0 { lowest.sqrt() } else { 0.0 } - out;
+        let highest = ((desc.radius + desc.relief).powi(2) - near_x * near_x - near_z * near_z)
+            .max(0.0)
+            .sqrt()
+            - out;
+        let pad = f64::from(voxel) * 2.0;
+        let origin = GridPosition::from_dvec3(corner).ok_or(PhysicsError::OutOfRange)?;
+        let sdf = SdfDesc {
+            origin,
+            voxel,
+            brick_cells,
+            bricks: [count as u32; 3],
+            base: Base::Planet {
+                planet: *desc,
+                anchor: self.anchor,
+                turn: self.turn,
+                corner,
+                low: (lowest - corner.y - pad) as f32,
+                high: (highest - corner.y + pad) as f32,
+            },
+            material,
+        };
+        sdf.validate()?;
+        Ok(sdf)
+    }
+
+    /// Leaves out the tiles whose ground lies wholly inside `region`, the low and high corner
+    /// of a box in the world's frame, as an editable region from [`Self::sdf_desc`] covers.
+    /// Tiles it only partly covers stay, so a region wants a margin past where it is dug.
+    /// `None` brings them all back on the next [`Self::update`].
+    ///
+    /// # Errors
+    /// Fails when the world refuses to let a tile go.
+    pub fn carve(
+        &mut self,
+        world: &mut PhysicsWorld,
+        region: Option<(DVec3, DVec3)>,
+    ) -> Result<(), PhysicsError> {
+        self.carved = region;
+        let covered: Vec<TileKey> = self
+            .tiles
+            .keys()
+            .filter(|tile| self.covered(**tile))
+            .copied()
+            .collect();
+        for tile in covered {
+            if let Some((body, shape)) = self.tiles.remove(&tile) {
+                world.despawn(body)?;
+                world.remove_mesh(shape)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn covered(&self, tile: TileKey) -> bool {
+        let Some((low, high)) = self.carved else {
+            return false;
+        };
+        let ((u0, v0), (u1, v1)) = tile.bounds();
+        [(u0, v0), (u1, v0), (u0, v1), (u1, v1)]
+            .iter()
+            .all(|(u, v)| {
+                let at = self.to_world(self.planet.surface(direction(tile.face, *u, *v)));
+                (low.x..=high.x).contains(&at.x)
+                    && (low.y..=high.y).contains(&at.y)
+                    && (low.z..=high.z).contains(&at.z)
+            })
+    }
+
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }
@@ -192,7 +310,7 @@ impl PlanetGround {
             }
         }
         for tile in wanted {
-            if self.tiles.contains_key(&tile) {
+            if self.tiles.contains_key(&tile) || self.covered(tile) {
                 continue;
             }
             let (vertices, triangles, center) = self.tile_mesh(tile);

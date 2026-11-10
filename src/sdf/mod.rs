@@ -34,7 +34,7 @@ pub struct SdfDesc {
 }
 
 impl SdfDesc {
-    fn validate(&self) -> Result<(), PhysicsError> {
+    pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
         let count = self.bricks.iter().map(|n| u64::from(*n)).product::<u64>();
         let valid = self.voxel.is_finite()
             && self.voxel > 0.0

@@ -5,9 +5,11 @@ use algebrix::DVec3;
 use crate::error::PhysicsError;
 
 mod climate;
+mod edits;
 mod ground;
 
 pub use climate::{Climate, ClimateDesc, SECONDS_PER_YEAR};
+pub use edits::{PLANET_EDITS_VERSION, PlanetEdit, PlanetEdits, PlanetShape};
 pub use ground::{PlanetFrames, PlanetGround, level_at, level_for};
 
 /// Deepest a tile is split, a planet the size of the earth gets tiles of a few meters there.
@@ -52,7 +54,24 @@ impl PlanetDesc {
         }
     }
 
-    fn validate(&self) -> Result<(), PhysicsError> {
+    /// Ground over the base sphere along `direction`, as [`Planet::height`].
+    pub(crate) fn height(&self, direction: DVec3) -> f64 {
+        let unit = direction.normalize();
+        let mut sum = 0.0;
+        let mut amplitude = 1.0;
+        let mut total = 0.0;
+        let mut scale = self.radius / self.wavelength;
+        for octave in 0..self.octaves {
+            let at = unit * scale;
+            sum += amplitude * value_noise(at, self.seed.wrapping_add(octave));
+            total += amplitude;
+            amplitude *= 0.5;
+            scale *= 2.0;
+        }
+        self.relief * sum / total
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
         let positive = |value: f64| value.is_finite() && value > 0.0;
         let valid = positive(self.radius)
             && self.relief.is_finite()
@@ -126,20 +145,7 @@ impl Planet {
     /// Ground over the base sphere straight out along `direction`, meters. `direction` need
     /// not be unit length, it must not be zero.
     pub fn height(&self, direction: DVec3) -> f64 {
-        let desc = &self.desc;
-        let unit = direction.normalize();
-        let mut sum = 0.0;
-        let mut amplitude = 1.0;
-        let mut total = 0.0;
-        let mut scale = desc.radius / desc.wavelength;
-        for octave in 0..desc.octaves {
-            let at = unit * scale;
-            sum += amplitude * value_noise(at, desc.seed.wrapping_add(octave));
-            total += amplitude;
-            amplitude *= 0.5;
-            scale *= 2.0;
-        }
-        desc.relief * sum / total
+        self.desc.height(direction)
     }
 
     /// The point on the ground straight out along `direction`, from the center.

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use algebrix::{DVec3, Vec3};
 
+use crate::frame::FrameId;
 use crate::{
     BodyHandle, BodyKind, CastHit, CollisionFilter, JobDispatch, PhysicsError, PhysicsWorld,
     QueryFilter, Ray, RigidBodyDesc, Sequential, Shape,
@@ -31,6 +32,8 @@ pub struct SdfTerrain {
     /// What the job handed out holds, until it commits or is abandoned.
     flying: Vec<Queued>,
     token: u64,
+    /// The frame its bricks stand in.
+    frame: FrameId,
 }
 
 impl SdfTerrain {
@@ -49,12 +52,27 @@ impl SdfTerrain {
         desc: SdfDesc,
         dispatch: &dyn JobDispatch,
     ) -> Result<Self, PhysicsError> {
+        Self::new_in(world, desc, FrameId::ROOT, dispatch)
+    }
+
+    /// [`Self::new_with`] with its bricks in `frame`, as a planet's ground in its
+    /// [`PlanetGround::frame`](crate::PlanetGround::frame).
+    ///
+    /// # Errors
+    /// See [`Self::new_with`], and a frame the world does not have.
+    pub fn new_in(
+        world: &mut PhysicsWorld,
+        desc: SdfDesc,
+        frame: FrameId,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<Self, PhysicsError> {
         let mut terrain = Self {
             volume: SdfVolume::new_with(desc, dispatch)?,
             bodies: HashMap::new(),
             queue: VecDeque::new(),
             flying: Vec::new(),
             token: 0,
+            frame,
         };
         let mut keys: Vec<BrickKey> = terrain
             .volume
@@ -141,15 +159,15 @@ impl SdfTerrain {
             .shifted(corner)
             .ok_or(PhysicsError::OutOfRange)
             .and_then(|position| {
-                world.spawn(
-                    RigidBodyDesc::fixed(shape)
-                        .position(position)
-                        .material(self.volume.desc.material)
-                        .filter(CollisionFilter {
-                            layers: CollisionFilter::default().layers | GROUND_LAYER,
-                            mask: u32::MAX,
-                        }),
-                )
+                let mut desc = RigidBodyDesc::fixed(shape)
+                    .position(position)
+                    .material(self.volume.desc.material)
+                    .filter(CollisionFilter {
+                        layers: CollisionFilter::default().layers | GROUND_LAYER,
+                        mask: u32::MAX,
+                    });
+                desc.frame = self.frame;
+                world.spawn(desc)
             });
         match placed {
             Ok(body) => Ok((body, shape)),

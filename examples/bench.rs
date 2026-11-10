@@ -12,6 +12,7 @@ use solunar::{
     Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
     ShapeCast, Vec3, voronoi_box,
 };
+use solunar::{DVec3, Planet, PlanetDesc, PlanetEdits, PlanetGround, level_for};
 
 type Result<T> = std::result::Result<T, PhysicsError>;
 
@@ -24,7 +25,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 29] = [
+const SUITES: [(&str, Suite); 30] = [
     ("pile", pile),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
@@ -46,6 +47,7 @@ const SUITES: [(&str, Suite); 29] = [
     ("terrain-casts", terrain_casts),
     ("bullets", bullets),
     ("tunnel", tunnel),
+    ("planet-dig", planet_dig),
     ("commit", tunnel_commit),
     ("moving", moving_tunnel),
     ("dam", dam_small),
@@ -1409,6 +1411,58 @@ fn tunnel() -> Result<Outcome> {
             built.as_secs_f64() * 1e3,
             step_p99.as_secs_f64() * 1e3,
             removed(&terrain),
+        ),
+    })
+}
+
+/// A 64 m region of an earth sized planet's ground, sampled from the planet, and a bore dug
+/// along under its surface, each kept as a planet edit. Times are the digs.
+fn planet_dig() -> Result<Outcome> {
+    let mut world = world()?;
+    let planet = Planet::new(PlanetDesc::earth(3))?;
+    let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+    let level = level_for(&planet, 2.5);
+    let ground = PlanetGround::new(planet, anchor, level)?;
+    let started = Instant::now();
+    let desc = ground.sdf_desc(DVec3::ZERO, 32.0, (0.5, 16), Material::default())?;
+    let corner = desc.origin.to_dvec3();
+    let mut terrain = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+        Some(pool) => SdfTerrain::new_in(&mut world, desc, ground.frame(), pool),
+        None => SdfTerrain::new_in(&mut world, desc, ground.frame(), &Sequential),
+    })?;
+    let built = started.elapsed();
+    let mut kept = PlanetEdits::new();
+    let mut edits = Vec::new();
+    for i in 0..200 {
+        let x = -28.0 + f64::from(i) * 0.28;
+        let under = ground.ground_under(DVec3::new(x, 0.0, 0.0)) - DVec3::Y * 3.0 - corner;
+        let at = under.as_vec3();
+        let edit = Edit {
+            shape: EditShape::Capsule {
+                a: at - Vec3::X * 0.28,
+                b: at,
+                radius: 2.0,
+            },
+            op: EditOp::Excavate,
+        };
+        let started = Instant::now();
+        DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => terrain.edit_with(&mut world, edit, pool),
+            None => terrain.edit(&mut world, edit),
+        })?;
+        kept.push(ground.edit_to_planet(corner, &edit))?;
+        edits.push(started.elapsed());
+    }
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times: edits,
+        unit: "ms",
+        check: format!(
+            "build {:.0} ms, {:.0} m3 removed, {} kept in {} bytes",
+            built.as_secs_f64() * 1e3,
+            removed(&terrain),
+            kept.len(),
+            kept.to_bytes().len(),
         ),
     })
 }
