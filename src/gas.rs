@@ -16,8 +16,9 @@ const MOST_PER_STEP: f32 = 0.1;
 /// Most gas steps in one physics step.
 const MOST_GAS_STEPS: usize = 256;
 
-/// A sealed volume of air: cubic meters, kilograms, kelvin, kept at that temperature. In a
-/// body, gas leaving it to outside pushes that body.
+/// A sealed volume of air: cubic meters, kilograms, kelvin. Gas left behind in a room it flows
+/// out of expands and cools, gas flowing in brings its heat, no heat passes through the walls.
+/// In a body, gas leaving it to outside pushes that body.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompartmentDesc {
     pub volume: f32,
@@ -239,6 +240,27 @@ fn orifice(area: f32, discharge: f32, (up, down): (f32, f32), temperature: f32) 
     (flow, speed, up * ratio)
 }
 
+/// `amount` kilograms leave `room`. What stays behind expands with no heat in or out, so its
+/// temperature falls as the mass to the power gamma - 1, taken exactly so a long step does not
+/// cool it less than many short ones.
+fn give(room: &mut CompartmentDesc, amount: f32) {
+    let left = room.mass - amount;
+    if left > 0.0 && room.mass > 0.0 {
+        room.temperature *= (left / room.mass).powf(HEATS - 1.0);
+    }
+    room.mass = left.max(0.0);
+}
+
+/// `amount` kilograms at `warmth` come into `room`, bringing their enthalpy: a room filled from
+/// empty ends gamma times warmer than the gas that filled it.
+fn take(room: &mut CompartmentDesc, amount: f32, warmth: f32) {
+    let mass = room.mass + amount;
+    if mass > 0.0 {
+        room.temperature = (room.mass * room.temperature + HEATS * amount * warmth) / mass;
+    }
+    room.mass = mass;
+}
+
 impl PhysicsWorld {
     /// # Errors
     /// Fails on values out of range, a stale body or too many compartments.
@@ -417,13 +439,26 @@ impl PhysicsWorld {
             } in &flows
             {
                 let carried = (flow * step).clamp(-most, most);
-                if let Some(room) = gas.compartments[from].as_mut() {
-                    room.mass = (room.mass - carried).max(0.0);
+                let (giver, taker, amount) = if carried >= 0.0 {
+                    (Some(from), to, carried)
+                } else {
+                    (to, Some(from), -carried)
+                };
+                let warmth = giver
+                    .and_then(|giver| gas.compartments[giver])
+                    .map(|room| room.temperature);
+                if let Some(room) = giver.and_then(|giver| gas.compartments[giver].as_mut()) {
+                    give(room, amount);
                 }
-                if let Some(to) = to {
-                    if let Some(room) = gas.compartments[to].as_mut() {
-                        room.mass = (room.mass + carried).max(0.0);
-                    }
+                if let (Some(room), Some(warmth)) = (
+                    taker
+                        .filter(|_| to.is_some())
+                        .and_then(|taker| gas.compartments[taker].as_mut()),
+                    warmth,
+                ) {
+                    take(room, amount, warmth);
+                }
+                if to.is_some() {
                     moved[index] += carried;
                     continue;
                 }
@@ -505,7 +540,14 @@ mod tests {
             world.compartment(full).unwrap().pressure(),
             world.compartment(empty).unwrap().pressure(),
         );
+        // the energy, p V / (gamma - 1), is kept, so the end pressure is the volume weighted one.
+        // the room that gave is colder now and the one that took warmer
         let ends = (30.0 * 101_325.0 + 10.0 * 20_000.0) / 40.0;
+        let (giver, taker) = (
+            world.compartment(full).unwrap().temperature,
+            world.compartment(empty).unwrap().temperature,
+        );
+        assert!(giver < 293.0 && taker > 294.0, "{giver} {taker}");
         assert!(
             (a - ends).abs() < 0.01 * ends && (b - ends).abs() < 0.01 * ends,
             "{a} {b} {ends}"
@@ -515,6 +557,40 @@ mod tests {
         world.set_opening(door, false, 0.5).unwrap();
         world.step_fixed().unwrap();
         assert_eq!(world.opening_flow(door), Some(0.0));
+    }
+
+    #[test]
+    fn a_room_filled_from_almost_nothing_ends_gamma_times_warmer() {
+        let mut world = no_gravity();
+        // a big tank, so its air barely changes while the small room fills
+        let tank = world
+            .add_compartment(CompartmentDesc::air(1.0e5, 101_325.0, None))
+            .unwrap();
+        let room = world
+            .add_compartment(CompartmentDesc::air(1.0, 10.0, None))
+            .unwrap();
+        world
+            .add_opening(OpeningDesc {
+                from: tank,
+                to: Some(room),
+                area: 0.01,
+                discharge: 1.0,
+                position: Vec3::ZERO,
+                normal: Vec3::X,
+                open: true,
+            })
+            .unwrap();
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+        }
+        let filled = world.compartment(room).unwrap();
+        assert!((filled.pressure() - 101_325.0).abs() < 0.01 * 101_325.0);
+        let hot = HEATS * 293.15;
+        assert!(
+            (filled.temperature - hot).abs() < 0.01 * hot,
+            "{} {hot}",
+            filled.temperature
+        );
     }
 
     #[test]
@@ -534,20 +610,32 @@ mod tests {
                 open: true,
             })
             .unwrap();
-        // choked all the way to vacuum, isothermal: p falls as exp(-t / tau),
-        // tau = V / (A sqrt(gamma R T)) / (2 / (gamma + 1))^((gamma + 1) / (2 (gamma - 1)))
+        // choked all the way to vacuum, the gas left expanding with no heat in:
+        // (m / m0)^(-(gamma - 1) / 2) = 1 + (gamma - 1) / 2 t / tau,
+        // tau = V / (A sqrt(gamma R T0)) / (2 / (gamma + 1))^((gamma + 1) / (2 (gamma - 1))),
+        // p / p0 the mass share to the gamma, T / T0 to gamma - 1
         let temperature = 293.15_f32;
         let choke = (2.0 / (HEATS + 1.0)).powf((HEATS + 1.0) / (2.0 * (HEATS - 1.0)));
         let tau = 10.0 / (0.01 * (HEATS * GAS * temperature).sqrt() * choke);
         let start = world.compartment(room).unwrap().pressure();
-        for _ in 0..(tau * 60.0) as usize {
+        let steps = (tau * 60.0) as usize;
+        for _ in 0..steps {
             world.step_fixed().unwrap();
         }
-        let after = world.compartment(room).unwrap().pressure();
-        let expected = start * (-((tau * 60.0).floor() / 60.0) / tau).exp();
+        let after = *world.compartment(room).unwrap();
+        let t = steps as f32 / 60.0;
+        let share = (1.0 + (HEATS - 1.0) / 2.0 * t / tau).powf(-2.0 / (HEATS - 1.0));
+        let expected = start * share.powf(HEATS);
         assert!(
-            (after - expected).abs() < 0.03 * expected,
-            "{after} {expected} tau {tau}"
+            (after.pressure() - expected).abs() < 0.03 * expected,
+            "{} {expected} tau {tau}",
+            after.pressure()
+        );
+        let cold = temperature * share.powf(HEATS - 1.0);
+        assert!(
+            (after.temperature - cold).abs() < 0.01 * cold,
+            "{} {cold}",
+            after.temperature
         );
     }
 
