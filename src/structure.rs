@@ -1,4 +1,4 @@
-use algebrix::{Quat, Vec3};
+use algebrix::{DVec3, Quat, Vec3};
 
 use crate::body::{BodyHandle, BodyKind};
 use crate::compound::part_mass;
@@ -478,6 +478,8 @@ impl PhysicsWorld {
             .map(|group| group.parts.len())
             .sum::<usize>();
         let mut need = vec![Vec3::ZERO; parts];
+        // the largest force that went into a need, its rounding is what a need can not resolve
+        let mut scale = 0.0_f32;
         for group in &structure.groups {
             let Ok(dense) = self.bodies.dense_index(group.body) else {
                 continue;
@@ -498,7 +500,8 @@ impl PhysicsWorld {
                 self.bodies.position(dense),
                 linear,
             );
-            let speeding = (linear - group.before.0) / dt - gravity;
+            let measured = (linear - group.before.0) / dt;
+            let speeding = measured - gravity;
             let turning = (angular - group.before.1) / dt;
             let density = self.bodies.material[dense].density;
             for (child, part) in compound.children.iter().zip(&group.parts) {
@@ -511,6 +514,7 @@ impl PhysicsWorld {
                 let arm = rotation.rotate_vec3(child.position);
                 let along = speeding + turning.cross(arm) + angular.cross(angular.cross(arm));
                 need[*part as usize] -= along * mass;
+                scale = scale.max(mass * (measured.length() + gravity.length() + along.length()));
             }
         }
         // contacts on each part, both sides, the part numbered as the compound's children
@@ -541,14 +545,16 @@ impl PhysicsWorld {
                 // the cache keeps its normal in a's axes, b is pushed along it
                 let normal = self.bodies.rotation[dense].rotate_vec3(entry.normal);
                 need[id as usize] += normal * (sign * push / dt);
+                scale = scale.max(push.abs() / dt);
             }
         }
         for (part, force) in &structure.pushes {
             if let Some(slot) = need.get_mut(*part as usize) {
                 *slot += *force;
+                scale = scale.max(force.length());
             }
         }
-        let potentials = solve_loads(&structure.links, &structure.groups, &mut need, parts);
+        let potentials = solve_loads(&structure.links, &structure.groups, &mut need, scale);
         for link in &mut structure.links {
             if link.broken {
                 link.load = 0.0;
@@ -645,10 +651,20 @@ impl PhysicsWorld {
 /// The least loads through unbroken `links` that carry `need`, as each part's potential, a
 /// link's load over its strength being the potentials' difference. Within each joined lot the
 /// needs are made to sum to zero first, what is left over is the lot's own speeding up.
-fn solve_loads(links: &[Link], groups: &[Group], need: &mut [Vec3], parts: usize) -> Vec<Vec3> {
+/// `scale` is the largest force summed into a need: what is left once each lot's mean is gone
+/// must stand out of its rounding, else it lies in the graph's null space and the solve runs
+/// off to infinity, as a falling ship's parts all needing the same once gravity is taken out.
+/// Rounding of a need against the forces summed into it, a few f32 steps.
+const NEED_ROUNDING: f32 = 1e-5;
+
+fn solve_loads(links: &[Link], groups: &[Group], need: &mut [Vec3], scale: f32) -> Vec<Vec3> {
+    let parts = need.len();
     for group in groups {
         for lot in joined(&group.parts, links) {
-            let mean = lot.iter().map(|id| need[*id as usize]).sum::<Vec3>() / lot.len() as f32;
+            let sum = lot.iter().fold(DVec3::ZERO, |sum, id| {
+                sum + DVec3::from_vec3(need[*id as usize])
+            });
+            let mean = (sum / lot.len() as f64).as_vec3();
             for id in &lot {
                 need[*id as usize] -= mean;
             }
@@ -673,6 +689,10 @@ fn solve_loads(links: &[Link], groups: &[Group], need: &mut [Vec3], parts: usize
     let mut p = r.clone();
     let mut lp = vec![Vec3::ZERO; parts];
     let start = dot(&r, &r);
+    let noise = f64::from(scale * NEED_ROUNDING);
+    if start <= noise * noise * parts as f64 {
+        return x;
+    }
     let mut rr = start;
     for _ in 0..LOAD_PASSES {
         if rr <= start * f64::from(LOAD_TOLERANCE * LOAD_TOLERANCE) || rr == 0.0 {
@@ -680,10 +700,10 @@ fn solve_loads(links: &[Link], groups: &[Group], need: &mut [Vec3], parts: usize
         }
         apply(&p, &mut lp);
         let curve = dot(&p, &lp);
-        if curve <= 0.0 {
+        let step = (rr / curve) as f32;
+        if curve <= 0.0 || !step.is_finite() {
             break;
         }
-        let step = (rr / curve) as f32;
         for i in 0..parts {
             x[i] += p[i] * step;
             r[i] -= lp[i] * step;
@@ -808,6 +828,83 @@ mod tests {
             let expected = force * (k + 1) as f32 / 5.0;
             assert!((load - expected).abs() < 0.01 * force, "{loads:?}");
         }
+    }
+
+    #[test]
+    fn a_part_cut_free_on_the_ground_leaves_the_loads_finite() {
+        let mut world = crate::world::testing::world();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(20.0, 1.0, 20.0)))
+                    .local_position(Vec3::new(0.0, -1.5, 0.0)),
+            )
+            .unwrap();
+        let (_, structure) = rod(&mut world, 4, 1.0e9);
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let links = world.structure_links(structure).unwrap().to_vec();
+        for (index, link) in links.iter().enumerate() {
+            if link.a == 2 || link.b == 2 {
+                world.break_link(structure, index).unwrap();
+            }
+        }
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        assert_eq!(world.structure_bodies(structure).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_falling_structure_with_a_part_cut_free_keeps_its_loads_finite() {
+        let mut world = crate::world::testing::world();
+        // nothing under it, it falls the whole time
+        let (_, structure) = rod(&mut world, 6, 1.0e9);
+        let links = world.structure_links(structure).unwrap().to_vec();
+        for (index, link) in links.iter().enumerate() {
+            if link.a == 4 || link.b == 4 {
+                world.break_link(structure, index).unwrap();
+            }
+        }
+        for _ in 0..120 {
+            world.step_fixed().unwrap();
+        }
+        // falling freely nothing pulls on the links
+        for link in world.structure_links(structure).unwrap() {
+            assert!(link.load.is_finite() && link.load < 1.0, "{link:?}");
+        }
+    }
+
+    #[test]
+    fn a_need_that_is_only_rounding_gives_no_load() {
+        let links: Vec<Link> = (0..4)
+            .map(|index| Link {
+                a: index,
+                b: index + 1,
+                strength: 2400.0,
+                load: 0.0,
+                strain: 0.0,
+                damage: 0.0,
+                broken: false,
+            })
+            .collect();
+        let body = crate::world::testing::world()
+            .spawn(RigidBodyDesc::dynamic(Shape::sphere(0.5)))
+            .unwrap();
+        let group = Group {
+            body,
+            parts: (0..5).collect(),
+            before: (Vec3::ZERO, Vec3::ZERO),
+        };
+        // a mean taken out in f32 leaves the same few ulps on every part
+        let mut need = vec![Vec3::new(1e-15, -1.5e-5, 5e-16); 5];
+        let potentials = solve_loads(&links, &[group], &mut need, 2000.0);
+        assert!(
+            potentials
+                .iter()
+                .all(|p| p.is_finite() && p.length() < 1e-6),
+            "{potentials:?}"
+        );
     }
 
     #[test]
@@ -971,6 +1068,7 @@ mod tests {
         let (body, structure) = rod(&mut world, 4, 5.0e4);
         world.break_link(structure, 1).unwrap();
         world.step_fixed().unwrap();
+        // one cut, two bodies: resting with no pull nothing loads the other links
         assert_eq!(world.structure_bodies(structure).unwrap().len(), 2);
         let mut loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
         for _ in 0..30 {
