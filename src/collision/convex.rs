@@ -128,12 +128,16 @@ fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
     let mut face_starts = vec![0];
     let mut face_corners: Vec<u32> = Vec::new();
     let mut edges: Vec<Vec3> = Vec::new();
+    let mut faces: Vec<(Vec3, f32)> = Vec::with_capacity(planes.len());
     for (normal, offset) in &planes {
         let mut corners: Vec<Vec3> = unique
             .iter()
             .filter(|point| (normal.dot(**point) - offset).abs() <= tolerance * 4.0)
             .copied()
             .collect();
+        if corners.len() < 3 {
+            continue;
+        }
         let middle = corners.iter().fold(Vec3::ZERO, |sum, point| sum + *point)
             * (corners.len() as f32).recip();
         let across = (corners[0] - middle).normalize();
@@ -163,6 +167,11 @@ fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
             })
             .map(|at| corners[at])
             .collect();
+        // a sliver plane a hair off a real face keeps no corners of its own
+        if kept.len() < 3 {
+            continue;
+        }
+        faces.push((*normal, *offset));
         for (at, corner) in kept.iter().enumerate() {
             let index = match vertices
                 .iter()
@@ -185,6 +194,10 @@ fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
         }
         face_starts.push(face_corners.len() as u32);
     }
+    if faces.len() < 4 {
+        return Err(PhysicsError::InvalidShape);
+    }
+    let planes = faces;
     let edge_faces = pair_edges(&face_starts, &face_corners);
     Ok(RawHull {
         vertices,
@@ -855,6 +868,34 @@ pub(crate) fn poly_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_flat_point_sets_give_a_hull_or_an_error_never_a_panic() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32 - 0.5
+        };
+        for _ in 0..20_000 {
+            let count = 4 + (next().abs() * 40.0) as usize;
+            let flat = 10.0_f32.powf(-1.0 - 6.0 * (next() + 0.5));
+            let points: Vec<Vec3> = (0..count)
+                .map(|_| {
+                    let mut p = Vec3::new(next(), next(), next() * flat);
+                    // some points pushed onto a face, a hair off it
+                    if next() > 0.2 {
+                        p.x = 0.5 + next() * flat;
+                    }
+                    p
+                })
+                .collect();
+            if let Ok((volume, ..)) = ConvexHull::measure(&points) {
+                assert!(volume > 0.0);
+            }
+        }
+    }
     use crate::position::testing::at;
     use crate::world::testing::{ground, world};
     use crate::{
