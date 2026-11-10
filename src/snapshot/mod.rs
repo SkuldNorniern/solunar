@@ -14,7 +14,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 15;
+pub const SNAPSHOT_VERSION: u32 = 16;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -314,6 +314,7 @@ impl PhysicsWorld {
         self.structures.save(&mut out);
         self.atmospheres.save(&mut out);
         self.gas.save(&mut out);
+        self.heat.save(&mut out);
 
         let checksum = fnv1a(&out.data);
         out.u64(checksum);
@@ -425,6 +426,11 @@ impl PhysicsWorld {
         } else {
             Default::default()
         };
+        let heat = if reader.version >= 16 {
+            crate::heat::Heat::load(&mut reader)?
+        } else {
+            Default::default()
+        };
         if reader.at != reader.data.len() {
             return Err(SnapshotError::Invalid("trailing data"));
         }
@@ -445,6 +451,7 @@ impl PhysicsWorld {
         world.structures = structures;
         world.atmospheres = atmospheres;
         world.gas = gas;
+        world.heat = heat;
         // shapes and frames are the loaded world's, check the sensors against them
         for sensor in world.sensors.slots.iter().flatten() {
             let desc = &sensor.desc;
@@ -623,10 +630,10 @@ mod tests {
             .position(|window| window == marker.as_slice())
             .unwrap();
         bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 2 + 4 * 3);
-        // and the sensor, field, breakable, structure, two atmosphere and two gas counts at the
-        // end, all empty
+        // and the sensor, field, breakable, structure, two atmosphere, two gas and the heat
+        // counts at the end, all empty
         let end = bytes.len() - CHECKSUM_BYTES;
-        bytes.drain(end - 8 * 4..end);
+        bytes.drain(end - 9 * 4..end);
         // and the gravity source count after the frame count, both empty
         assert_eq!(bytes[49..57], [0; 8]);
         bytes.drain(53..57);

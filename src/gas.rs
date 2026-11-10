@@ -9,6 +9,8 @@ use crate::world::PhysicsWorld;
 pub const MAX_COMPARTMENTS: usize = 1 << 16;
 /// Air's gas constant, J/(kg K), and its ratio of heats.
 const GAS: f32 = 287.05;
+/// Joules a kilogram a kelvin air holds at fixed volume.
+pub(crate) const CV: f32 = GAS / (HEATS - 1.0);
 const HEATS: f32 = 1.4;
 /// Share of the gas upstream of an opening that may pass in one gas step, so a small room
 /// never swings past its neighbour's pressure.
@@ -94,6 +96,16 @@ pub(crate) struct Gas {
 impl Gas {
     fn is_empty(&self) -> bool {
         self.openings.iter().all(Option::is_none)
+    }
+
+    pub(crate) fn rooms_in(
+        &mut self,
+        body: BodyHandle,
+    ) -> impl Iterator<Item = &mut CompartmentDesc> + '_ {
+        self.compartments
+            .iter_mut()
+            .flatten()
+            .filter(move |room| room.body == Some(body))
     }
 
     pub(crate) fn save(&self, out: &mut Writer) {

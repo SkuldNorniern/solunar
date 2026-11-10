@@ -15,6 +15,7 @@ mod fracture;
 mod frame;
 mod gas;
 mod gravity;
+mod heat;
 mod inspect;
 mod joint;
 mod material;
@@ -60,6 +61,7 @@ pub use fracture::{
 pub use frame::{FrameDesc, FrameId, FrameMotion, FrameState, Frames, MAX_FRAME_DEPTH, Orbit};
 pub use gas::{CompartmentDesc, CompartmentId, MAX_COMPARTMENTS, OpeningDesc, OpeningId};
 pub use gravity::{GravityId, GravitySource, MAX_GRAVITY_SOURCES};
+pub use heat::{HeatDesc, HeatState, MAX_HEATED_BODIES};
 pub use inspect::{ContactEvent, ContactView, IslandStats};
 pub use joint::{
     JointAxis, JointDesc, JointDof, JointHandle, JointKind, JointLimit, JointMotor, JointReaction,
