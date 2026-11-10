@@ -438,6 +438,7 @@ impl PhysicsWorld {
     pub(crate) fn deepest_overlap(
         &self,
         shape: &Shape,
+        rotation: Quat,
         position: GridPosition,
         filter: &QueryFilter,
     ) -> Result<Option<(Vec3, f32)>, PhysicsError> {
@@ -458,7 +459,7 @@ impl PhysicsWorld {
             }
             assets.for_each_contact(
                 (&self.bodies.shape[dense], self.bodies.rotation[dense]),
-                (shape, Quat::IDENTITY),
+                (shape, rotation),
                 center.as_vec3(),
                 0.0,
                 None,

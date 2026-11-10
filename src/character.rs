@@ -7,7 +7,7 @@ use crate::{
 const SLIDE_ITERATIONS: usize = 4;
 const PUSH_OUT_ROUNDS: usize = 4;
 
-/// A capsule standing on local Y, moved by the game, not by the solver.
+/// A capsule standing along its up, local Y unless set, moved by the game, not by the solver.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CharacterDesc {
     pub radius: f32,
@@ -101,6 +101,9 @@ pub struct Character {
     ground: Option<Ground>,
     platform: Option<Platform>,
     touches: Vec<Touch>,
+    up: Vec3,
+    /// Turns local Y onto `up`, the capsule's own turn.
+    turn: Quat,
 }
 
 struct Slide {
@@ -127,6 +130,8 @@ impl Character {
             ground: None,
             platform: None,
             touches: Vec::new(),
+            up: Vec3::Y,
+            turn: Quat::IDENTITY,
         })
     }
 
@@ -140,10 +145,35 @@ impl Character {
 
     /// Bottom of the capsule.
     pub fn feet(&self) -> GridPosition {
-        let down = f64::from(self.desc.half_height + self.desc.radius);
+        let down = self.desc.half_height + self.desc.radius;
         self.position
-            .shifted(DVec3::new(0.0, -down, 0.0))
+            .shifted(DVec3::from_vec3(self.up * -down))
             .unwrap_or(self.position)
+    }
+
+    pub fn up(&self) -> Vec3 {
+        self.up
+    }
+
+    /// Stands it along `up` from the next move on, any length but none. On a planet, against
+    /// the pull where it stands: `-world.gravity_at(..)`. Ground found along the old up stays
+    /// until the next move.
+    ///
+    /// # Errors
+    /// Fails on a non finite or zero `up`.
+    pub fn set_up(&mut self, up: Vec3) -> Result<(), PhysicsError> {
+        let length = up.length();
+        if !length.is_finite() || length < 1e-6 {
+            return Err(PhysicsError::NonFinite("up"));
+        }
+        self.up = up / length;
+        self.turn = Quat::from_rotation_arc(Vec3::Y, self.up);
+        Ok(())
+    }
+
+    /// `motion` without its part along up.
+    fn flat(&self, motion: Vec3) -> Vec3 {
+        motion - self.up * motion.dot(self.up)
     }
 
     pub fn ground(&self) -> Option<Ground> {
@@ -193,13 +223,14 @@ impl Character {
         at = self.push_out(world, at)?;
         let mut touches = Vec::new();
 
-        let horizontal = Vec3::new(motion.x, 0.0, motion.z);
-        let rising = motion.y.max(0.0);
-        let falling = motion.y.min(0.0);
+        let horizontal = self.flat(motion);
+        let vertical = motion.dot(self.up);
+        let rising = vertical.max(0.0);
+        let falling = vertical.min(0.0);
 
         let mut report = MoveReport::default();
         if rising > 0.0 {
-            let up = self.slide(world, at, Vec3::Y * rising)?;
+            let up = self.slide(world, at, self.up * rising)?;
             report.hit_ceiling = up.report.hit_ceiling || up.report.hit_wall;
             at = up.at;
             touches.extend(up.touches);
@@ -219,7 +250,7 @@ impl Character {
             report.stepped = true;
         }
 
-        let down = self.slide(world, at, Vec3::Y * falling)?;
+        let down = self.slide(world, at, self.up * falling)?;
         at = down.at;
         let mut ground = down.ground;
 
@@ -227,7 +258,7 @@ impl Character {
         if ground.is_none() && was_grounded && rising == 0.0 {
             let reach = self.desc.step_height + self.desc.skin * 2.0;
             if let Some((distance, found)) = self.ground_below(world, at, reach)? {
-                at = shift(at, Vec3::Y * -(distance - self.desc.skin))?;
+                at = shift(at, self.up * -(distance - self.desc.skin))?;
                 ground = Some(found);
             }
         }
@@ -309,7 +340,7 @@ impl Character {
     }
 
     fn walkable(&self, normal: Vec3) -> bool {
-        normal.y >= self.desc.max_slope.cos()
+        normal.dot(self.up) >= self.desc.max_slope.cos()
     }
 
     fn cast(
@@ -322,7 +353,7 @@ impl Character {
         world.shape_cast(
             &ShapeCast {
                 shape: self.desc.shape(),
-                rotation: Quat::IDENTITY,
+                rotation: self.turn,
                 origin: at,
                 direction,
                 max_distance: distance,
@@ -337,7 +368,7 @@ impl Character {
         at: GridPosition,
         reach: f32,
     ) -> Result<Option<(f32, Ground)>, PhysicsError> {
-        let Some(hit) = self.cast(world, at, -Vec3::Y, reach)? else {
+        let Some(hit) = self.cast(world, at, -self.up, reach)? else {
             return Ok(None);
         };
         if !self.walkable(hit.normal) {
@@ -363,6 +394,7 @@ impl Character {
         let mut ground = None;
         let mut touches = Vec::new();
         let original = motion;
+        let level = original.dot(self.up).abs() <= 1e-6 * original.length();
         for _ in 0..SLIDE_ITERATIONS {
             let length = motion.length();
             if length < 1e-6 {
@@ -383,12 +415,12 @@ impl Character {
                     body: hit.body,
                     normal,
                 });
-            } else if normal.y < -0.3 {
+            } else if normal.dot(self.up) < -0.3 {
                 report.hit_ceiling = true;
             } else {
                 // too steep to walk, so it is a wall: never let it lift
                 report.hit_wall = true;
-                let flat = Vec3::new(normal.x, 0.0, normal.z);
+                let flat = self.flat(normal);
                 if flat.length_squared() > 1e-8 {
                     normal = flat.normalize();
                 }
@@ -396,7 +428,7 @@ impl Character {
             let mut left = direction * (length - travel);
             let walkable = self.walkable(normal);
             // landing on walkable ground ends a fall, sliding on would carry it down the slope
-            if walkable && direction.y < -0.7 {
+            if walkable && direction.dot(self.up) < -0.7 {
                 break;
             }
             let into = left.dot(normal);
@@ -412,9 +444,9 @@ impl Character {
                 }
             }
             // up a walkable slope it keeps its flat speed, it does not slow down climbing
-            let flat_left = Vec3::new(left.x, 0.0, left.z).length();
-            let flat_wanted = Vec3::new(direction.x, 0.0, direction.z).length() * (length - travel);
-            if walkable && original.y == 0.0 && flat_left > 1e-6 {
+            let flat_left = self.flat(left).length();
+            let flat_wanted = self.flat(direction).length() * (length - travel);
+            if walkable && level && flat_left > 1e-6 {
                 left *= flat_wanted / flat_left;
             }
             // never slide back against the way it was asked to go
@@ -440,22 +472,19 @@ impl Character {
         horizontal: Vec3,
         plain: &Slide,
     ) -> Result<Option<GridPosition>, PhysicsError> {
-        let up = self.slide(world, from, Vec3::Y * self.desc.step_height)?;
+        let up = self.slide(world, from, self.up * self.desc.step_height)?;
         let across = self.slide(world, up.at, horizontal)?;
-        let lifted = up.at.offset_from(from).y as f32;
+        let lifted = up.at.offset_from(from).as_vec3().dot(self.up);
         let Some((distance, _)) =
             self.ground_below(world, across.at, lifted + self.desc.skin * 2.0)?
         else {
             return Ok(None);
         };
-        let landed = shift(across.at, Vec3::Y * -(distance - self.desc.skin))?;
-        let flat = |to: GridPosition| {
-            let offset = to.offset_from(from);
-            (offset.x * offset.x + offset.z * offset.z).sqrt()
-        };
+        let landed = shift(across.at, self.up * -(distance - self.desc.skin))?;
+        let flat = |to: GridPosition| self.flat(to.offset_from(from).as_vec3()).length();
         // it has to end up on something higher, getting a hair further at the same height is
         // only the rounded bottom grazing the ledge
-        let rose = landed.offset_from(plain.at).y as f32 > self.desc.skin;
+        let rose = landed.offset_from(plain.at).as_vec3().dot(self.up) > self.desc.skin;
         if rose && flat(landed) > flat(plain.at) + 1e-4 {
             Ok(Some(landed))
         } else {
@@ -471,7 +500,7 @@ impl Character {
     ) -> Result<GridPosition, PhysicsError> {
         for _ in 0..PUSH_OUT_ROUNDS {
             let Some((normal, depth)) =
-                world.deepest_overlap(&self.desc.shape(), at, &self.desc.filter)?
+                world.deepest_overlap(&self.desc.shape(), self.turn, at, &self.desc.filter)?
             else {
                 break;
             };
@@ -530,6 +559,36 @@ mod tests {
 
     fn near(a: f32, b: f32, tolerance: f32) {
         assert!((a - b).abs() <= tolerance, "{a} != {b}");
+    }
+
+    #[test]
+    fn walks_round_a_small_planet_standing_against_its_pull() {
+        let mut world = world();
+        let radius = 20.0;
+        world
+            .spawn(RigidBodyDesc::fixed(Shape::sphere(radius)))
+            .unwrap();
+        let mut character = Character::new(CharacterDesc::default(), at(0.0, 23.0, 0.0)).unwrap();
+        let up_here = |character: &Character| character.position().local.normalize();
+        for _ in 0..60 {
+            character.set_up(up_here(&character)).unwrap();
+            character.move_by(&world, -character.up() * 0.2).unwrap();
+        }
+        assert!(character.is_grounded());
+        // a quarter of the way round, 0.1 m a step along the ground
+        let quarter = (std::f32::consts::FRAC_PI_2 * (radius + STAND) / 0.1) as usize;
+        for _ in 0..quarter {
+            let up = up_here(&character);
+            character.set_up(up).unwrap();
+            let ahead = up.cross(Vec3::Z).normalize() * 0.1;
+            character.move_by(&world, ahead - up * 0.05).unwrap();
+        }
+        let p = character.position().local;
+        assert!(character.is_grounded());
+        near(p.length(), radius + STAND, 0.02);
+        // on the planet's side now, standing out along x
+        assert!(p.x.abs() > 0.95 * p.length(), "{p:?}");
+        near(character.feet().local.length(), radius + 0.01, 0.02);
     }
 
     #[test]
