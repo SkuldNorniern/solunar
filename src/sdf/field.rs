@@ -212,6 +212,37 @@ pub(crate) fn finite(v: DVec3) -> bool {
     v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
 
+impl Base {
+    /// `distance` from the ground's height alone, with what this base cuts out under it at
+    /// `p`: a planet's caves. Others give it back as it is.
+    pub(crate) fn carve(&self, p: Vec3, height: f32, distance: f32) -> f32 {
+        let Self::Planet {
+            planet,
+            anchor,
+            turn,
+            corner,
+            ..
+        } = *self
+        else {
+            return distance;
+        };
+        if planet.caves.is_none() || distance >= 0.0 {
+            return distance;
+        }
+        let at = anchor + turn.conjugate().mul_vec3(corner + DVec3::from_vec3(p));
+        let depth = f64::from(height - p.y);
+        match planet.cave_distance(at, depth) {
+            Some(cave) => distance.max(-(cave as f32)),
+            None => distance,
+        }
+    }
+
+    /// Whether this base may hold empty space under its ground.
+    pub(crate) fn has_caves(&self) -> bool {
+        matches!(self, Self::Planet { planet, .. } if planet.caves.is_some())
+    }
+}
+
 pub(crate) fn base_distance(height: f32, slope: f32, y: f32) -> f32 {
     if height == f32::NEG_INFINITY {
         FAR

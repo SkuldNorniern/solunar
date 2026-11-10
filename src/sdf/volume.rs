@@ -182,7 +182,10 @@ impl SdfVolume {
     pub fn distance(&self, at: Vec3) -> f32 {
         let step = self.desc.voxel;
         let (height, slope) = self.desc.base.column(at.x, at.z, step * 0.5);
-        let mut distance = field::base_distance(height, slope, at.y);
+        let mut distance =
+            self.desc
+                .base
+                .carve(at, height, field::base_distance(height, slope, at.y));
         let sample = IVec3::new(
             (at.x / step).round() as i32,
             (at.y / step).round() as i32,
@@ -230,7 +233,8 @@ impl SdfVolume {
             }
             _ => {
                 let (height, slope) = self.desc.base.column(point.x, point.z, step * 0.5);
-                field::base_distance(height, slope, point.y)
+                let base = field::base_distance(height, slope, point.y);
+                self.desc.base.carve(point, height, base)
             }
         };
         raw.min(point.y - FLOOR_STEPS * step)
@@ -388,7 +392,11 @@ impl SdfVolume {
                 let (height, slope) = self.desc.base.column(gx, gz, step * 0.5);
                 for y in 0..side {
                     let gy = (low.y + y as i32) as f32 * step;
-                    values[x + side * (y + side * z)] = field::base_distance(height, slope, gy);
+                    let p = Vec3::new(gx, gy, gz);
+                    values[x + side * (y + side * z)] =
+                        self.desc
+                            .base
+                            .carve(p, height, field::base_distance(height, slope, gy));
                 }
             }
         }
@@ -507,7 +515,10 @@ impl SdfVolume {
         match range {
             None => Some(false),
             Some((_, highest)) if bottom > highest => Some(false),
-            Some((lowest, _)) if top < lowest && !on_edge => Some(true),
+            // caves may open anywhere under the ground, a brick there is sampled
+            Some((lowest, _)) if top < lowest && !on_edge && !self.desc.base.has_caves() => {
+                Some(true)
+            }
             Some(_) => None,
         }
     }

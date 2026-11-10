@@ -37,6 +37,44 @@ pub struct PlanetDesc {
     pub mu: f64,
     /// Seconds for one turn about its y axis against the stars, zero for none.
     pub day: f64,
+    /// Tunnels under the ground, none for solid rock.
+    pub caves: Option<CaveDesc>,
+}
+
+/// Caves under a planet's ground: winding tunnels where two noise fields both pass zero, in
+/// the planet's own space, so every region sees the same ones.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaveDesc {
+    /// Meters across a bend of a tunnel.
+    pub scale: f64,
+    /// How open the tunnels are, 0 to 1; about 0.1 gives tunnels a few meters wide at a 40 m
+    /// scale.
+    pub width: f64,
+    /// Meters under the ground where caves start and stop. They close before the top.
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl CaveDesc {
+    pub fn tunnels() -> Self {
+        Self {
+            scale: 40.0,
+            width: 0.1,
+            top: 4.0,
+            bottom: 200.0,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        let positive = |value: f64| value.is_finite() && value > 0.0;
+        positive(self.scale)
+            && positive(self.width)
+            && self.width < 1.0
+            && self.top.is_finite()
+            && self.top >= 0.0
+            && self.bottom.is_finite()
+            && self.bottom > self.top
+    }
 }
 
 impl PlanetDesc {
@@ -51,7 +89,33 @@ impl PlanetDesc {
             sea_level: 0.0,
             mu: 3.986_004_418e14,
             day: 86_164.1,
+            caves: None,
         }
+    }
+
+    /// The same planet with `caves` under its ground.
+    pub fn with_caves(self, caves: CaveDesc) -> Self {
+        Self {
+            caves: Some(caves),
+            ..self
+        }
+    }
+
+    /// Signed distance from `at`, from the planet's center, to the nearest cave, below zero
+    /// inside one, `depth` meters under the ground there. A lower bound, the noise's steepest
+    /// change sets the scale, so a mesh made from it never misses a tunnel. `None` without caves.
+    pub(crate) fn cave_distance(&self, at: DVec3, depth: f64) -> Option<f64> {
+        let caves = self.caves?;
+        let p = at / caves.scale;
+        let (a, b) = (
+            value_noise(p, self.seed.wrapping_add(0x9e37)),
+            value_noise(p, self.seed.wrapping_add(0x7f4a)),
+        );
+        // per meter each noise changes at most 2 * 1.875 * sqrt(3) over a cell of `scale`
+        let per_meter = 2.0 * 1.875 * 3.0_f64.sqrt() / caves.scale;
+        let tunnel = (a.abs().max(b.abs()) - caves.width) / per_meter;
+        // closed above `top` and below `bottom`
+        Some(tunnel.max(caves.top - depth).max(depth - caves.bottom))
     }
 
     /// Most the ground rises per meter across it. Each octave's value noise changes by at most 2
@@ -83,7 +147,8 @@ impl PlanetDesc {
 
     pub(crate) fn validate(&self) -> Result<(), PhysicsError> {
         let positive = |value: f64| value.is_finite() && value > 0.0;
-        let valid = positive(self.radius)
+        let valid = self.caves.is_none_or(|caves| caves.is_valid())
+            && positive(self.radius)
             && self.relief.is_finite()
             && self.relief >= 0.0
             && self.relief < self.radius / 2.0

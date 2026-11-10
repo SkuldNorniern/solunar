@@ -73,9 +73,9 @@ pub use park::{
     PARKED_GROUP_VERSION, PARKED_VERSION, Parked, ParkedGroup, Unparked, UnparkedGroup,
 };
 pub use planet::{
-    Climate, ClimateDesc, MAX_LEVEL, PLANET_EDITS_VERSION, Planet, PlanetDesc, PlanetEdit,
-    PlanetEdits, PlanetFrames, PlanetGround, PlanetShape, SECONDS_PER_YEAR, TileKey, direction,
-    face_of, level_at, level_for,
+    CaveDesc, Climate, ClimateDesc, MAX_LEVEL, PLANET_EDITS_VERSION, Planet, PlanetDesc,
+    PlanetEdit, PlanetEdits, PlanetFrames, PlanetGround, PlanetShape, SECONDS_PER_YEAR, TileKey,
+    direction, face_of, level_at, level_for,
 };
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};

@@ -448,6 +448,71 @@ mod tests {
     }
 
     #[test]
+    fn caves_open_under_the_ground_never_near_its_top_and_the_same_from_any_region() {
+        let planet =
+            Planet::new(PlanetDesc::earth(3).with_caves(crate::CaveDesc::tunnels())).unwrap();
+        let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+        let level = level_for(&planet, 2.5);
+        let ground = PlanetGround::new(planet, anchor, level).unwrap();
+        let surface = ground.ground_under(DVec3::ZERO);
+        // a region 40 m under the ground
+        let deep = ground
+            .sdf_desc(
+                surface - DVec3::Y * 40.0,
+                16.0,
+                (1.0, 8),
+                Material::default(),
+            )
+            .unwrap();
+        let volume = crate::SdfVolume::new(deep).unwrap();
+        let corner = deep.origin.to_dvec3();
+        let (mut open, mut total) = (0, 0);
+        for i in 0..2000_u32 {
+            let f = |k: u32| ((i.wrapping_mul(k) % 1000) as f32 / 1000.0) * 32.0;
+            let p = algebrix::Vec3::new(f(7919), f(104_729), f(1_299_709));
+            let world = corner + DVec3::from_vec3(p);
+            let under = ground.ground_under(world).y - world.y;
+            if under < 10.0 {
+                continue;
+            }
+            total += 1;
+            if volume.distance(p) > 0.0 {
+                open += 1;
+            }
+        }
+        assert!(open > 0 && open < total, "{open} of {total}");
+        // the top 4 m stay closed
+        let shallow = ground
+            .sdf_desc(surface - DVec3::Y * 2.0, 8.0, (0.5, 8), Material::default())
+            .unwrap();
+        let near = crate::SdfVolume::new(shallow).unwrap();
+        let corner = shallow.origin.to_dvec3();
+        for i in 0..400_u32 {
+            let f = |k: u32| ((i.wrapping_mul(k) % 1000) as f32 / 1000.0) * 16.0;
+            let p = algebrix::Vec3::new(f(7919), f(104_729), f(1_299_709));
+            let world = corner + DVec3::from_vec3(p);
+            let under = ground.ground_under(world).y - world.y;
+            if (0.5..3.5).contains(&under) {
+                assert!(near.distance(p) < 0.0, "{under} m down is open");
+            }
+        }
+        // two regions overlapping see the same cave at a shared point
+        let other = ground
+            .sdf_desc(
+                surface - DVec3::new(10.0, 40.0, -6.0),
+                16.0,
+                (1.0, 8),
+                Material::default(),
+            )
+            .unwrap();
+        let second = crate::SdfVolume::new(other).unwrap();
+        let shared = surface - DVec3::new(4.0, 40.0, -2.0);
+        let a = volume.distance((shared - deep.origin.to_dvec3()).as_vec3());
+        let b = second.distance((shared - other.origin.to_dvec3()).as_vec3());
+        assert!((a - b).abs() < 1e-3, "{a} {b}");
+    }
+
+    #[test]
     fn a_box_keeps_its_turn_through_the_planet() {
         let first = ground(DVec3::new(0.3, 0.8, 0.5));
         let second = ground(DVec3::new(0.31, 0.8, 0.49));
