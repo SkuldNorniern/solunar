@@ -105,7 +105,8 @@ impl SdfTerrain {
         self.volume.set_cache_limit(bytes);
     }
 
-    /// The first ground along `ray`, whatever other bodies are in the way.
+    /// The first ground along `ray`, whatever other bodies are in the way. The ray is in the
+    /// frame the bricks stand in, as its hit is.
     ///
     /// # Errors
     /// Fails on a bad ray.
@@ -117,6 +118,7 @@ impl SdfTerrain {
         world.raycast(
             ray,
             &QueryFilter {
+                frame: self.frame,
                 mask: GROUND_LAYER,
                 ..QueryFilter::default()
             },

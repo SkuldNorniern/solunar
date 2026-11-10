@@ -355,6 +355,17 @@ mod tests {
         kept.push(first.edit_to_planet(corner, &dig)).unwrap();
         let hole = terrain.volume().distance(center);
         assert!(hole > 1.9, "{hole}");
+        // a ray down the hole in the ground's frame finds its floor
+        let down = crate::Ray {
+            origin: crate::GridPosition::from_dvec3(
+                first.ground_under(DVec3::ZERO) + DVec3::Y * 5.0,
+            )
+            .unwrap(),
+            direction: Vec3::NEG_Y,
+            max_distance: 20.0,
+        };
+        let floor = terrain.raycast(&world, &down).unwrap().unwrap();
+        assert!((floor.distance - 7.0).abs() < 0.3, "{}", floor.distance);
         let kept = PlanetEdits::from_bytes(&kept.to_bytes()).unwrap();
 
         // a ground anchored 300 m off, so its frame is turned against the first
@@ -376,6 +387,29 @@ mod tests {
         // and a region far from it does not take it
         let away = region(&second, there + DVec3::new(200.0, 0.0, 0.0));
         assert!(kept.local(&second, &away).is_empty());
+    }
+
+    #[test]
+    fn a_region_on_a_turning_planet_stands_in_its_frame_and_rays_find_it() {
+        let planet = Planet::new(PlanetDesc::earth(3)).unwrap();
+        let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+        let level = level_for(&planet, 2.5);
+        let mut world = PhysicsWorld::new(PhysicsSettings {
+            gravity: Vec3::ZERO,
+            ..PhysicsSettings::default()
+        })
+        .unwrap();
+        let (ground, frames) = PlanetGround::on_planet(&mut world, planet, anchor, level).unwrap();
+        let desc = region(&ground, DVec3::ZERO);
+        let terrain = SdfTerrain::new_in(&mut world, desc, frames.ground, &Sequential).unwrap();
+        let top = ground.ground_under(DVec3::ZERO);
+        let down = crate::Ray {
+            origin: crate::GridPosition::from_dvec3(top + DVec3::Y * 5.0).unwrap(),
+            direction: Vec3::NEG_Y,
+            max_distance: 20.0,
+        };
+        let hit = terrain.raycast(&world, &down).unwrap().unwrap();
+        assert!((hit.distance - 5.0).abs() < 0.1, "{}", hit.distance);
     }
 
     #[test]
