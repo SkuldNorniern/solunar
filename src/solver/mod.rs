@@ -147,10 +147,11 @@ pub(crate) fn add_woken_pairs(bodies: &Bodies, awake: &[bool], scratch: &mut Con
 const MOST_TURN: f32 = 0.4;
 /// Most substeps a step takes for turning, past this a step is as good as it gets.
 const MOST_SUBSTEPS: u32 = 64;
-/// A body whose far edge moves less than this in one of the settings' substeps is left to them:
-/// a shard spinning fast hardly moves its points, and counting it cost a fracture scene half
-/// again its step.
-const SMALL_SWING: f32 = 0.05;
+/// A body whose far edge moves less than this in one of the settings' substeps is left to them.
+/// Glass shards spinning at 300 rad/s swing 0.27 m and keep their energy without more, a bar
+/// swinging 1.25 m came off with five times its own. Counting the shards cost a fracture scene
+/// half again its step.
+const SMALL_SWING: f32 = 0.4;
 
 /// Substeps this step needs so no dynamic body in contact turns more than [`MOST_TURN`] in one.
 /// Balls are left out, their point is the one facing the other body whatever their turn. Bodies
@@ -502,6 +503,61 @@ mod tests {
                 state.angular_velocity.length() > 1000.0,
                 "{shape:?} {state:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_ball_through_a_glass_pane_never_adds_energy() {
+        let energy = |world: &PhysicsWorld| {
+            let b = &world.bodies;
+            let mut total = 0.0_f64;
+            for dense in 0..b.len() {
+                if b.kind[dense] != crate::BodyKind::Dynamic || b.inverse_mass[dense] <= 0.0 {
+                    continue;
+                }
+                let m = b.inverse_mass[dense].recip();
+                let w = b.rotation[dense].conjugate().rotate_vec3(b.angular[dense]);
+                let inv = b.inverse_inertia[dense];
+                let turn = |w: f32, i: f32| if i > 0.0 { 0.5 * w * w / i } else { 0.0 };
+                let height = b.position(dense).to_dvec3().y as f32;
+                total += f64::from(
+                    0.5 * m * b.linear[dense].length_squared()
+                        + turn(w.x, inv.x)
+                        + turn(w.y, inv.y)
+                        + turn(w.z, inv.z)
+                        + m * 9.81 * height,
+                );
+            }
+            total
+        };
+        let mut world = world();
+        ground(&mut world);
+        let half = Vec3::new(0.8, 0.7, 0.02);
+        world
+            .add_breakable(
+                crate::BreakableDesc::of(
+                    &crate::FractureMaterial::GLASS,
+                    half,
+                    GridPosition::from_local(Vec3::new(0.0, half.y, 0.0)).unwrap(),
+                    7,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        run(&mut world, 0.5);
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.15))
+                    .density(7800.0)
+                    .local_position(Vec3::new(0.1, half.y + 0.1, -3.0))
+                    .linear_velocity(Vec3::new(0.0, 0.6, 32.0)),
+            )
+            .unwrap();
+        let start = energy(&world);
+        for _ in 0..240 {
+            world.step_fixed().unwrap();
+            let now = energy(&world);
+            assert!(now <= start * 1.001, "{start} to {now}");
         }
     }
 
