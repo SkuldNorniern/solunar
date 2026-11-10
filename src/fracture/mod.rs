@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use algebrix::{DVec3, Quat, Vec3};
 
+pub(crate) use voronoi::voronoi_box_within;
 pub use voronoi::{
     FracturePattern, MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };

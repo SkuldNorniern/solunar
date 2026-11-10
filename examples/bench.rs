@@ -10,7 +10,7 @@ use solunar::{
     FluidSolver, FluidWorld, FractureMaterial, GridPosition, JobDispatch, JointDesc, JointHandle,
     LinkDesc, Material, PhaseTimes, PhysicsError, PhysicsSettings, PhysicsWorld, Quat, QueryFilter,
     Ray, RigidBodyDesc, SdfDesc, SdfTerrain, Sequential, ShallowSettings, ShallowWater, Shape,
-    ShapeCast, Vec3, voronoi_box,
+    ShapeCast, Spoil, Vec3, voronoi_box,
 };
 use solunar::{DVec3, Planet, PlanetDesc, PlanetEdits, PlanetGround, level_for};
 
@@ -25,7 +25,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 33] = [
+const SUITES: [(&str, Suite); 34] = [
     ("pile", pile),
     ("delta", delta),
     ("sleepers", sleepers),
@@ -50,6 +50,7 @@ const SUITES: [(&str, Suite); 33] = [
     ("bullets", bullets),
     ("tunnel", tunnel),
     ("planet-dig", planet_dig),
+    ("planet-spoil", planet_spoil),
     ("commit", tunnel_commit),
     ("moving", moving_tunnel),
     ("dam", dam_small),
@@ -1601,6 +1602,71 @@ fn planet_dig() -> Result<Outcome> {
             removed(&terrain),
             kept.len(),
             kept.to_bytes().len(),
+        ),
+    })
+}
+
+/// A hand drill's bites into planet rock, each dug out as stone pieces that fall and settle,
+/// with a step between bites. Times are the dig alone, pieces and all.
+fn planet_spoil() -> Result<Outcome> {
+    let mut world = world()?;
+    let planet = Planet::new(PlanetDesc::earth(3))?;
+    let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+    let level = level_for(&planet, 2.5);
+    let ground = PlanetGround::new(planet, anchor, level)?;
+    let desc = ground.sdf_desc(
+        DVec3::ZERO,
+        32.0,
+        (0.5, 16),
+        Material {
+            density: 2700.0,
+            ..Material::default()
+        },
+    )?;
+    let corner = desc.origin.to_dvec3();
+    let mut terrain = SdfTerrain::new_in(&mut world, desc, ground.frame(), &Sequential)?;
+    let spoil = Spoil::Fragments {
+        material: FractureMaterial::STONE,
+        debris: Some(Debris {
+            volume: 0.05,
+            settle: 1.0,
+            remove: None,
+        }),
+    };
+    let (mut digs, mut steps) = (Vec::new(), Vec::new());
+    let (mut fragments, mut removed) = (0.0, 0.0);
+    for i in 0..200 {
+        let x = -10.0 + f64::from(i % 40) * 0.5;
+        let down = f64::from(i / 40) * 0.6 + 0.4;
+        let at =
+            (ground.ground_under(DVec3::new(x, 0.0, 0.0)) - DVec3::Y * down - corner).as_vec3();
+        let edit = Edit {
+            shape: EditShape::Sphere {
+                center: at,
+                radius: 0.6,
+            },
+            op: EditOp::Excavate,
+        };
+        let started = Instant::now();
+        let dig = terrain.dig(&mut world, edit, &spoil, i as u64)?;
+        digs.push(started.elapsed());
+        fragments += dig.fragment_mass;
+        removed += dig.report.removed_mass;
+        let started = Instant::now();
+        world.step_fixed()?;
+        steps.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    steps.sort_by(f64::total_cmp);
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times: digs,
+        unit: "ms",
+        check: format!(
+            "{:.0} of {:.0} kg in pieces, step p50 {:.2} max {:.2} ms",
+            fragments,
+            removed,
+            steps[steps.len() / 2],
+            steps[steps.len() - 1],
         ),
     })
 }

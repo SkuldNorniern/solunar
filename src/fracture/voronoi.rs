@@ -147,6 +147,34 @@ pub fn voronoi_box_stretched(
     seed: u64,
     stretch: Vec3,
 ) -> Result<FracturePattern, PhysicsError> {
+    cut(half, cells, seed, stretch, &[])
+}
+
+/// [`voronoi_box`] of only the part of the box where `normal · x <= offset` for every plane,
+/// from the box's middle: a convex region inside it. Seeds are picked inside the region and
+/// pieces it leaves empty or too many sided are left out, so the pieces may not fill all of it.
+///
+/// # Errors
+/// As [`voronoi_box`], and when no seed lands in the region.
+pub(crate) fn voronoi_box_within(
+    half: Vec3,
+    cells: usize,
+    seed: u64,
+    planes: &[(DVec3, f64)],
+) -> Result<FracturePattern, PhysicsError> {
+    cut(half, cells, seed, Vec3::ONE, planes)
+}
+
+/// Tries per seed to land inside a region before it is given up.
+const SEED_TRIES: usize = 32;
+
+fn cut(
+    half: Vec3,
+    cells: usize,
+    seed: u64,
+    stretch: Vec3,
+    planes: &[(DVec3, f64)],
+) -> Result<FracturePattern, PhysicsError> {
     if !half.is_finite()
         || half.min_element() <= 0.0
         || cells == 0
@@ -160,17 +188,41 @@ pub fn voronoi_box_stretched(
     let h = DVec3::from_vec3(half / stretch);
     let merge = MERGE * h.length();
     let mut state = seed;
-    let seeds: Vec<DVec3> = (0..cells)
-        .map(|_| {
-            // kept off the walls so no cell is a sliver against them
-            let pick = |half: f64, state: &mut u64| (next(state) * 2.0 - 1.0) * half * 0.95;
-            DVec3::new(
-                pick(h.x, &mut state),
-                pick(h.y, &mut state),
-                pick(h.z, &mut state),
+    // the planes in the squeezed box
+    let planes: Vec<(DVec3, f64)> = planes
+        .iter()
+        .map(|(normal, offset)| {
+            (
+                DVec3::new(normal.x * grow.x, normal.y * grow.y, normal.z * grow.z),
+                *offset,
             )
         })
         .collect();
+    let within = |p: DVec3| {
+        planes
+            .iter()
+            .all(|(normal, offset)| normal.dot(p) <= *offset)
+    };
+    let mut seeds: Vec<DVec3> = Vec::with_capacity(cells);
+    for _ in 0..cells {
+        for _ in 0..SEED_TRIES {
+            // kept off the walls so no cell is a sliver against them
+            let pick = |half: f64, state: &mut u64| (next(state) * 2.0 - 1.0) * half * 0.95;
+            let at = DVec3::new(
+                pick(h.x, &mut state),
+                pick(h.y, &mut state),
+                pick(h.z, &mut state),
+            );
+            if within(at) {
+                seeds.push(at);
+                break;
+            }
+        }
+    }
+    if seeds.is_empty() {
+        return Err(PhysicsError::InvalidShape);
+    }
+    let cells = seeds.len();
     let corner = |sx: f64, sy: f64, sz: f64| DVec3::new(sx * h.x, sy * h.y, sz * h.z);
     let box_faces = || -> Vec<Face> {
         let quad = |a, b, c, d| (vec![a, b, c, d], None);
@@ -215,8 +267,13 @@ pub fn voronoi_box_stretched(
     };
     let mut pieces = Vec::with_capacity(cells);
     let mut faces_of = Vec::with_capacity(cells);
+    // a cell's index among the pieces, none when the region left it out
+    let mut piece_of: Vec<Option<u32>> = vec![None; cells];
     for (i, own) in seeds.iter().enumerate() {
         let mut faces = box_faces();
+        for (normal, offset) in &planes {
+            faces = clip(faces, *normal, *offset, None, merge);
+        }
         // nearer neighbors first, they cut the most, later ones often miss
         let mut others: Vec<usize> = (0..cells).filter(|j| *j != i).collect();
         others.sort_by(|a, b| {
@@ -236,7 +293,10 @@ pub fn voronoi_box_stretched(
             }
         }
         if faces.len() < 4 {
-            return Err(PhysicsError::InvalidShape);
+            if planes.is_empty() {
+                return Err(PhysicsError::InvalidShape);
+            }
+            continue;
         }
         // back out of the squeezed box
         let faces: Vec<Face> = faces
@@ -259,9 +319,13 @@ pub fn voronoi_box_stretched(
                 }
             }
         }
-        if points.len() > MAX_POINTS {
-            return Err(PhysicsError::InvalidShape);
+        if points.len() > MAX_POINTS || volume <= 0.0 {
+            if planes.is_empty() {
+                return Err(PhysicsError::InvalidShape);
+            }
+            continue;
         }
+        piece_of[i] = Some(pieces.len() as u32);
         pieces.push(PatternPiece {
             points: points.iter().map(|p| p.as_vec3()).collect(),
             volume: volume as f32,
@@ -273,7 +337,7 @@ pub fn voronoi_box_stretched(
     let mut bonds = Vec::new();
     for (i, faces) in faces_of.iter().enumerate() {
         for (face, other) in faces {
-            let Some(j) = *other else {
+            let Some(j) = other.and_then(|cell| piece_of[cell as usize]) else {
                 continue;
             };
             let face_area = area(face);

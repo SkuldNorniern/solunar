@@ -2,6 +2,7 @@ mod compute;
 mod field;
 mod jobs;
 mod nets;
+mod spoil;
 mod terrain;
 mod volume;
 
@@ -11,6 +12,7 @@ pub use compute::{BrickSamples, CpuEdits, EditSpan, SdfCompute};
 pub use field::{Base, Edit, EditOp, EditShape};
 pub use jobs::{BrickJob, BuiltBricks};
 pub use nets::BrickMesh;
+pub use spoil::{Dig, Spoil};
 pub use terrain::{PreparedTerrain, SdfTerrain};
 pub use volume::SdfVolume;
 

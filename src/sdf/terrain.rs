@@ -222,6 +222,16 @@ impl SdfTerrain {
         &self.volume
     }
 
+    /// The frame its bricks stand in.
+    pub fn frame(&self) -> FrameId {
+        self.frame
+    }
+
+    /// Whether `body` is one of its bricks.
+    pub fn is_brick(&self, body: BodyHandle) -> bool {
+        self.bodies.values().any(|(brick, _)| *brick == body)
+    }
+
     /// See [`SdfVolume::set_cache_limit`].
     pub fn set_cache_limit(&mut self, bytes: usize) {
         self.volume.set_cache_limit(bytes);
