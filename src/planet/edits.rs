@@ -413,6 +413,41 @@ mod tests {
     }
 
     #[test]
+    fn ground_prepared_away_from_the_world_is_the_same_as_made_in_it() {
+        let ground = ground(DVec3::new(0.3, 0.8, 0.5));
+        let desc = region(&ground, DVec3::ZERO);
+        let center = (ground.ground_under(DVec3::ZERO) - desc.origin.to_dvec3()).as_vec3();
+        let edits = [Edit {
+            shape: EditShape::Sphere {
+                center,
+                radius: 2.5,
+            },
+            op: EditOp::Excavate,
+        }];
+        let mut world = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        let mut made = SdfTerrain::new_in(&mut world, desc, ground.frame(), &Sequential).unwrap();
+        for edit in edits {
+            made.edit(&mut world, edit).unwrap();
+        }
+        let prepared = SdfTerrain::prepare(desc, &edits, ground.frame(), &Sequential).unwrap();
+        let mut other = PhysicsWorld::new(PhysicsSettings::default()).unwrap();
+        let attached = SdfTerrain::attach(&mut other, prepared).unwrap();
+        assert_eq!(made.bodies().count(), attached.bodies().count());
+        assert_eq!(
+            made.volume().material_volume(),
+            attached.volume().material_volume()
+        );
+        for (key, ..) in made.volume().surface_bricks() {
+            assert_eq!(
+                made.volume().brick_mesh(key),
+                attached.volume().brick_mesh(key)
+            );
+        }
+        let hole = attached.volume().distance(center);
+        assert!(hole > 2.0, "{hole}");
+    }
+
+    #[test]
     fn a_box_keeps_its_turn_through_the_planet() {
         let first = ground(DVec3::new(0.3, 0.8, 0.5));
         let second = ground(DVec3::new(0.31, 0.8, 0.49));

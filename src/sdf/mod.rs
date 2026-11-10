@@ -11,7 +11,7 @@ pub use compute::{BrickSamples, CpuEdits, EditSpan, SdfCompute};
 pub use field::{Base, Edit, EditOp, EditShape};
 pub use jobs::{BrickJob, BuiltBricks};
 pub use nets::BrickMesh;
-pub use terrain::SdfTerrain;
+pub use terrain::{PreparedTerrain, SdfTerrain};
 pub use volume::SdfVolume;
 
 const MAX_BRICKS: u64 = 1 << 20;

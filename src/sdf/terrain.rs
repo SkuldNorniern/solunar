@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use algebrix::{DVec3, Vec3};
 
+use crate::collision::trimesh::TriMesh;
 use crate::frame::FrameId;
 use crate::{
     BodyHandle, BodyKind, CastHit, CollisionFilter, JobDispatch, PhysicsError, PhysicsWorld,
@@ -21,6 +22,20 @@ const EJECT_DEPTH: f32 = 0.25;
 const RESCUE_DEPTH: f32 = 0.3;
 /// Room left between an ejected body and the surface it lands on, meters.
 const EJECT_GAP: f32 = 0.02;
+
+/// A terrain built away from the world, from [`SdfTerrain::prepare`], waiting for
+/// [`SdfTerrain::attach`].
+#[derive(Debug)]
+pub struct PreparedTerrain {
+    terrain: SdfTerrain,
+    colliders: Vec<(BrickKey, TriMesh)>,
+}
+
+impl PreparedTerrain {
+    pub fn volume(&self) -> &SdfVolume {
+        &self.terrain.volume
+    }
+}
 
 /// An [`SdfVolume`] in a world: each surface brick is a fixed body with its triangles. Changes
 /// land between steps, every brick of one edit at once, so a step never sees half a hole.
@@ -66,8 +81,115 @@ impl SdfTerrain {
         frame: FrameId,
         dispatch: &dyn JobDispatch,
     ) -> Result<Self, PhysicsError> {
+        Self::from_volume(world, SdfVolume::new_with(desc, dispatch)?, frame)
+    }
+
+    /// Builds a terrain away from any world, as on a worker while steps go on: the volume, `edits`
+    /// in order, and every surface brick's collider. [`Self::attach`] then only links them in,
+    /// so making ground near a player never holds up a frame.
+    ///
+    /// # Errors
+    /// Fails on a bad description or edit, triangles a collider will not take, or a dispatcher
+    /// that skips jobs.
+    pub fn prepare(
+        desc: SdfDesc,
+        edits: &[Edit],
+        frame: FrameId,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<PreparedTerrain, PhysicsError> {
         let mut terrain = Self {
             volume: SdfVolume::new_with(desc, dispatch)?,
+            bodies: HashMap::new(),
+            queue: VecDeque::new(),
+            flying: Vec::new(),
+            token: 0,
+            frame,
+        };
+        for edit in edits {
+            terrain.queue_edit(*edit)?;
+        }
+        while let Some(job) = terrain.next_job() {
+            let built = job.run(dispatch)?;
+            terrain.volume.commit(built.rebuilt);
+            for item in std::mem::take(&mut terrain.flying) {
+                match item {
+                    Queued::Edit(id, entry) => {
+                        terrain.volume.edits.insert(id, entry);
+                    }
+                    Queued::Close(id, _) => {
+                        terrain.volume.edits.remove(&id);
+                    }
+                    Queued::Move { id, new, .. } => {
+                        terrain.volume.edits.insert(id, new);
+                    }
+                }
+            }
+        }
+        let mut keys: Vec<BrickKey> = terrain
+            .volume
+            .surface_bricks()
+            .map(|(key, ..)| key)
+            .collect();
+        keys.sort_unstable();
+        let volume = &terrain.volume;
+        let made = super::jobs::in_parallel(dispatch, &keys, |key| {
+            let mesh = volume.brick_mesh(*key).cloned().unwrap_or_default();
+            if mesh.is_empty() {
+                return Ok(None);
+            }
+            TriMesh::from_triangles(mesh.vertices, mesh.triangles).map(|tree| Some((*key, tree)))
+        })?;
+        let colliders = made
+            .into_iter()
+            .collect::<Result<Vec<_>, PhysicsError>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(PreparedTerrain { terrain, colliders })
+    }
+
+    /// Puts a [`PreparedTerrain`] in `world`: a fixed body for each ready collider. Between
+    /// steps.
+    ///
+    /// # Errors
+    /// Fails on a brick the world will not take or a frame it does not have. Nothing stays behind.
+    pub fn attach(
+        world: &mut PhysicsWorld,
+        prepared: PreparedTerrain,
+    ) -> Result<Self, PhysicsError> {
+        let PreparedTerrain {
+            mut terrain,
+            colliders,
+        } = prepared;
+        for (key, collider) in colliders {
+            let placed = world
+                .push_mesh(collider)
+                .and_then(|shape| terrain.place(world, key, shape));
+            match placed {
+                Ok(body) => {
+                    terrain.bodies.insert(key, body);
+                }
+                Err(error) => {
+                    terrain.remove(world);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(terrain)
+    }
+
+    /// A terrain from a volume already built, as on a worker away from the step: only its
+    /// colliders are made here. Its bricks stand in `frame`.
+    ///
+    /// # Errors
+    /// Fails on a brick the world will not take or a frame it does not have. Nothing stays behind.
+    pub fn from_volume(
+        world: &mut PhysicsWorld,
+        volume: SdfVolume,
+        frame: FrameId,
+    ) -> Result<Self, PhysicsError> {
+        let mut terrain = Self {
+            volume,
             bodies: HashMap::new(),
             queue: VecDeque::new(),
             flying: Vec::new(),
