@@ -25,7 +25,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 32] = [
+const SUITES: [(&str, Suite); 33] = [
     ("pile", pile),
     ("delta", delta),
     ("sleepers", sleepers),
@@ -37,6 +37,7 @@ const SUITES: [(&str, Suite); 32] = [
     ("ship", ship),
     ("stacks", stacks),
     ("chains", chains),
+    ("heavy-chain", heavy_chain),
     ("net", net),
     ("compound", compound),
     ("queries", queries),
@@ -989,6 +990,42 @@ fn stacks() -> Result<Outcome> {
         times,
         unit: "ms",
         check: format!("{fallen} of 30 fell, fastest {:.3} m/s", max_speed(&world)?),
+    })
+}
+
+/// A crane cable: 15 light links, 0.1 kg each, a 1000 kg ball on the end, let go level so it
+/// swings. A 10,000 to 1 load across joints.
+fn heavy_chain() -> Result<Outcome> {
+    let mut world = world()?;
+    let mut joints = Vec::new();
+    let mut last = world.spawn(
+        RigidBodyDesc::fixed(Shape::sphere(0.1)).local_position(Vec3::new(0.0, 20.0, 0.0)),
+    )?;
+    for link in 1..=16 {
+        let at = Vec3::new(link as f32 * 0.5, 20.0, 0.0);
+        // links 0.1 kg turning like a 0.5 m rod, not a bead
+        let (radius, density) = if link == 16 {
+            (0.5, 1909.0)
+        } else {
+            (0.24, 1.727)
+        };
+        let ball = world.spawn(
+            RigidBodyDesc::dynamic(Shape::sphere(radius))
+                .density(density)
+                .local_position(at),
+        )?;
+        joints.push(ball_joint(&mut world, last, ball, at - Vec3::X * 0.25)?);
+        last = ball;
+    }
+    let times = steps(&mut world, 600)?;
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "widest joint gap {:.2} cm",
+            max_gap(&world, &joints)? * 100.0
+        ),
     })
 }
 
