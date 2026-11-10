@@ -144,6 +144,11 @@ impl PhysicsWorld {
         }
     }
 
+    /// Substeps the last step took: the settings' or more, when a body in contact turned fast.
+    pub fn last_substeps(&self) -> u32 {
+        self.last_substeps
+    }
+
     pub fn sleeping_body_count(&self) -> usize {
         self.bodies.asleep.iter().filter(|asleep| **asleep).count()
     }

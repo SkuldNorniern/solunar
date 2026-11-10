@@ -9,7 +9,7 @@ use crate::profile::PhaseTimes;
 use crate::sleep::{is_slow, plan_wakes, update_sleep};
 use crate::solver::{
     CachedManifold, add_woken_pairs, find_broad_pairs, finish_contacts, prepare_contacts,
-    solve_substep,
+    solve_substep, turning_substeps,
 };
 use crate::{
     BodyHandle, BodyKind, ContactEvent, FrameId, GridPosition, JobDispatch, JointHandle,
@@ -125,8 +125,6 @@ impl PhysicsWorld {
         let bodies = &self.bodies;
         let gravity = &self.gravity;
         let awake = self.sleep.awake();
-        let substeps = self.settings.substeps;
-        let part = dt / substeps as f32;
         let mut next_cache = std::mem::take(&mut self.spare_cache);
         next_cache.clear();
         next_cache.extend_from_slice(&self.contact_cache);
@@ -141,6 +139,14 @@ impl PhysicsWorld {
             dispatch,
             dt,
         )?;
+        let substeps = self.settings.substeps.max(turning_substeps(
+            bodies,
+            &self.scratch,
+            &self.contact_scratch,
+            (dt, self.settings.substeps),
+        ));
+        self.last_substeps = substeps;
+        let part = dt / substeps as f32;
         lap(&mut phases.narrowphase);
         let mut woken = Vec::new();
         // outside forces were worked out at the start of the step, so they go in whole before the

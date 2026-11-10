@@ -121,6 +121,8 @@ pub struct PhysicsWorld {
     /// A static or kinematic body appeared, so sleepers must check for new contact.
     pub(crate) recheck_sleepers: bool,
     pub(crate) contact_scratch: ContactScratch,
+    /// Substeps the last step took, more than set when something in contact turned fast.
+    pub(crate) last_substeps: u32,
     sleep: SleepScratch,
     scratch: Vec<Integrated>,
     pub(crate) gravity: StepGravity,
@@ -175,6 +177,7 @@ impl PhysicsWorld {
             failed_body: None,
             recheck_sleepers: false,
             contact_scratch: ContactScratch::default(),
+            last_substeps: 0,
             sleep: SleepScratch::default(),
             scratch: Vec::new(),
             gravity: StepGravity::default(),

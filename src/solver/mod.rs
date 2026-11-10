@@ -141,6 +141,43 @@ pub(crate) fn add_woken_pairs(bodies: &Bodies, awake: &[bool], scratch: &mut Con
         .add_woken(&scratch.bounds, woken, &mut scratch.pairs);
 }
 
+/// Most a body in contact turns in one substep, radians. Box and hull contact points are kept
+/// on the body and carried round with it, past this they swing off where the bodies meet: a bar
+/// spinning at 600 rad/s into a wall came off at 16,000 rad/s with four substeps.
+const MOST_TURN: f32 = 0.4;
+/// Most substeps a step takes for turning, past this a step is as good as it gets.
+const MOST_SUBSTEPS: u32 = 64;
+/// A body whose far edge moves less than this in one of the settings' substeps is left to them:
+/// a shard spinning fast hardly moves its points, and counting it cost a fracture scene half
+/// again its step.
+const SMALL_SWING: f32 = 0.05;
+
+/// Substeps this step needs so no dynamic body in contact turns more than [`MOST_TURN`] in one.
+/// Balls are left out, their point is the one facing the other body whatever their turn. Bodies
+/// turning in the open cost nothing.
+pub(crate) fn turning_substeps(
+    bodies: &Bodies,
+    state: &[Integrated],
+    scratch: &ContactScratch,
+    (dt, substeps): (f32, u32),
+) -> u32 {
+    let part = dt / substeps.max(1) as f32;
+    let mut fastest = 0.0_f32;
+    for manifold in &scratch.manifolds {
+        for dense in [manifold.a, manifold.b] {
+            let shape = &bodies.shape[dense];
+            if bodies.kind[dense] != BodyKind::Dynamic || matches!(shape, Shape::Sphere { .. }) {
+                continue;
+            }
+            let spin = state[dense].angular.length();
+            if spin * bodies.assets.bounding_radius(shape) * part > SMALL_SWING {
+                fastest = fastest.max(spin);
+            }
+        }
+    }
+    ((fastest * dt / MOST_TURN).ceil() as u32).min(MOST_SUBSTEPS)
+}
+
 /// Finds contacts once per step and loads the working joint impulses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_contacts(
@@ -464,6 +501,52 @@ mod tests {
             assert!(
                 state.angular_velocity.length() > 1000.0,
                 "{shape:?} {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bar_spinning_into_a_wall_never_comes_off_with_more_energy() {
+        // with four substeps a bar at 600 rad/s came off at 16,000: its contact points, carried
+        // round with it, swung over a radian a substep away from where it met the wall
+        for spin in [50.0_f32, 300.0, 600.0, 1500.0] {
+            let mut world = space();
+            plate(
+                &mut world,
+                Vec3::new(0.02, 3.0, 3.0),
+                GridPosition::from_local(Vec3::new(0.8, 0.0, 0.0)).unwrap(),
+            );
+            let mut desc = RigidBodyDesc::dynamic(Shape::cuboid(Vec3::new(1.0, 0.03, 0.03)))
+                .rotation(Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2))
+                .angular_velocity(Vec3::new(0.0, 0.0, spin));
+            desc.can_sleep = false;
+            let bar = world.spawn(desc).unwrap();
+            let energy = |world: &PhysicsWorld| {
+                let state = world.body_state(bar).unwrap();
+                let (mass, inertia) = (7.2_f32, Vec3::new(0.00432, 2.4, 2.4));
+                let local = state
+                    .rotation
+                    .conjugate()
+                    .rotate_vec3(state.angular_velocity);
+                0.5 * mass * state.linear_velocity.length_squared()
+                    + 0.5 * (inertia * local).dot(local)
+            };
+            let start = energy(&world);
+            let mut most = 0_u32;
+            for _ in 0..60 {
+                world.step_fixed().unwrap();
+                most = most.max(world.last_substeps());
+                let state = world.body_state(bar).unwrap();
+                for side in [-1.0_f32, 1.0] {
+                    let tip = state.position.to_dvec3().as_vec3()
+                        + state.rotation.rotate_vec3(Vec3::X * side);
+                    assert!(tip.x < 0.82 + 0.05 || tip.y.abs() > 2.9, "{spin} through");
+                }
+            }
+            let end = energy(&world);
+            assert!(
+                end <= start * 1.01,
+                "{spin}: {start} to {end}, {most} substeps"
             );
         }
     }
