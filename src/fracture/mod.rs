@@ -11,6 +11,7 @@ pub use voronoi::{
 use crate::body::{Bodies, BodyHandle, BodyKind, RigidBodyDesc};
 use crate::compound::{CompoundChild, CompoundInfo};
 use crate::error::PhysicsError;
+use crate::frame::FrameId;
 use crate::material::Material;
 use crate::position::GridPosition;
 use crate::shape::Shape;
@@ -41,6 +42,8 @@ pub struct BreakableDesc {
     pub pattern: FracturePattern,
     pub position: GridPosition,
     pub rotation: Quat,
+    /// The frame it and every part it breaks into stand in.
+    pub frame: FrameId,
     /// Fixed stands where it is, for walls and pillars. Pieces that come loose fall, the ones
     /// in `anchored` and what holds on to them stay.
     pub fixed: bool,
@@ -102,6 +105,7 @@ impl BreakableDesc {
             pattern,
             position,
             rotation: Quat::IDENTITY,
+            frame: FrameId::ROOT,
             fixed: false,
             anchored: Vec::new(),
             material: Material::default(),
@@ -292,6 +296,7 @@ pub(crate) struct Breakable {
     material: Material,
     spread: f32,
     debris: Option<Debris>,
+    frame: FrameId,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -441,6 +446,7 @@ impl Breakable {
                 out.f32(debris.remove.unwrap_or(-1.0));
             }
         }
+        out.u32(self.frame.index());
     }
 
     fn load(reader: &mut Reader<'_>, bodies: &Bodies, max: usize) -> Result<Self, SnapshotError> {
@@ -570,6 +576,17 @@ impl Breakable {
         } else {
             None
         };
+        let frame = if reader.version >= 18 {
+            FrameId(reader.u32()?)
+        } else {
+            FrameId::ROOT
+        };
+        for group in &groups {
+            let dense = bodies.dense_index(group.body).map_err(|_| invalid())?;
+            if bodies.frame[dense] != frame {
+                return Err(SnapshotError::Invalid("breakable frame"));
+            }
+        }
         Ok(Self {
             pieces,
             bonds,
@@ -577,6 +594,7 @@ impl Breakable {
             material,
             spread,
             debris,
+            frame,
         })
     }
 }
@@ -614,6 +632,9 @@ impl PhysicsWorld {
             || !(desc.anchored.is_empty() || desc.anchored.len() == count)
         {
             return Err(PhysicsError::InvalidShape);
+        }
+        if !self.frames.contains(desc.frame) {
+            return Err(PhysicsError::InvalidFrame);
         }
         let bottom = -desc.pattern.half.y;
         let mut pieces = Vec::with_capacity(count);
@@ -659,6 +680,7 @@ impl PhysicsWorld {
             material: desc.material,
             spread: desc.crack_spread,
             debris: desc.debris,
+            frame: desc.frame,
         };
         let all: Vec<u32> = (0..count as u32).collect();
         let kind = if desc.fixed {
@@ -748,6 +770,7 @@ impl PhysicsWorld {
         let rotation = (turn * info.axes).normalize();
         let mut desc = RigidBodyDesc::new(kind, info.shape)
             .material(breakable.material)
+            .frame(breakable.frame)
             .position(position)
             .rotation(rotation);
         if kind == BodyKind::Dynamic {
@@ -1322,6 +1345,62 @@ mod tests {
         // the ball went on through, it did not bounce back
         let z = world.body_state(ball).unwrap().position.to_dvec3().z;
         assert!(z > -0.5, "{z}");
+    }
+
+    #[test]
+    fn a_wall_in_its_own_frame_breaks_into_parts_in_that_frame() {
+        let mut world = world();
+        let frame = world
+            .add_frame(crate::FrameDesc::new(crate::FrameId::ROOT))
+            .unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(30.0, 1.0, 30.0)))
+                    .frame(frame)
+                    .local_position(Vec3::new(0.0, -1.0, 0.0)),
+            )
+            .unwrap();
+        let pattern = voronoi_box(Vec3::new(1.5, 1.0, 0.1), 30, 2).unwrap();
+        let target = world
+            .add_breakable(BreakableDesc {
+                fixed: true,
+                strength: 1.0e5,
+                frame,
+                ..BreakableDesc::new(pattern.clone(), at(0.0, 1.0, 0.0))
+            })
+            .unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.15))
+                    .density(7800.0)
+                    .frame(frame)
+                    .local_position(Vec3::new(0.2, 1.2, -2.0))
+                    .linear_velocity(Vec3::new(0.0, 0.0, 40.0)),
+            )
+            .unwrap();
+        for _ in 0..60 {
+            world.step_fixed().unwrap();
+        }
+        let parts = world.breakable_bodies(target);
+        assert!(parts.len() > 2, "{} parts", parts.len());
+        let in_frame = |world: &PhysicsWorld| {
+            world
+                .breakable_bodies(target)
+                .iter()
+                .all(|b| world.body_state(*b).unwrap().frame == frame)
+        };
+        assert!(in_frame(&world));
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert!(in_frame(&loaded));
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+        let missing = BreakableDesc {
+            frame: crate::FrameId(99),
+            ..BreakableDesc::new(pattern, at(0.0, 1.0, 0.0))
+        };
+        assert_eq!(
+            world.add_breakable(missing),
+            Err(PhysicsError::InvalidFrame)
+        );
     }
 
     #[test]
