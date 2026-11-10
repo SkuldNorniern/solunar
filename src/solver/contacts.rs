@@ -19,14 +19,15 @@ const RECOVERY_RATE: f32 = 0.2;
 const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
-/// A pair whose bodies moved less than this against each other since its contacts were found,
-/// meters squared, keeps them rather than finding them again.
 /// Radians a substep a manifold's bodies may turn together and keep their arms from the first
 /// substep.
 const FAST_TURN: f32 = 0.2;
-const REUSE_DISTANCE_SQUARED: f32 = 0.0002 * 0.0002;
-/// The same for turning: the cosine of half of 0.1 degree.
-const REUSE_HALF_TURN_COS: f32 = 0.999_999_6;
+/// A pair whose bodies moved less than this against each other since its contacts were found,
+/// meters squared, keeps them rather than finding them again. Found anew each step, a heap's
+/// points shift a little every time and kick it: 2 mm and about half a degree let it calm.
+const REUSE_DISTANCE_SQUARED: f32 = 0.002 * 0.002;
+/// The same for turning: the cosine of half of about 0.5 degree.
+const REUSE_HALF_TURN_COS: f32 = 0.999_99;
 
 /// Pairs in one job of contact finding. Fixed, so the output does not depend on the thread count.
 const PAIR_CHUNK: usize = 128;
@@ -652,10 +653,6 @@ fn kept_contacts<'c>(
     (a, b): (usize, usize),
     pose: (Vec3, Quat),
 ) -> &'c [CachedManifold] {
-    if matches!(bodies.shape[a], Shape::TriMesh(_)) || matches!(bodies.shape[b], Shape::TriMesh(_))
-    {
-        return &[];
-    }
     let key = (bodies.handle_at(a), bodies.handle_at(b));
     let start = cache.partition_point(|entry| (entry.a, entry.b) < key);
     let end = start + cache[start..].partition_point(|entry| (entry.a, entry.b) == key);
