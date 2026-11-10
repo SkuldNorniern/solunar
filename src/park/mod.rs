@@ -1,4 +1,4 @@
-use algebrix::{DQuat, DVec3};
+use algebrix::{DQuat, DVec3, Quat, Vec3};
 
 use crate::body::{BodyHandle, BodyKind, RigidBodyDesc};
 use crate::error::PhysicsError;
@@ -10,8 +10,10 @@ use crate::snapshot::{Reader, SnapshotError, Writer};
 use crate::structure::{Link, MAX_LINKS, StructureHandle};
 use crate::world::PhysicsWorld;
 
+mod group;
 mod stored;
 
+pub use group::{PARKED_GROUP_VERSION, ParkedGroup, UnparkedGroup};
 use stored::{Geometry, load_geometry, save_geometry};
 
 const MAGIC: [u8; 4] = *b"SLPK";
@@ -365,6 +367,12 @@ impl PhysicsWorld {
     /// # Errors
     /// Fails when its source or frame is gone, or the world refuses the body or its parts.
     pub fn unpark(&mut self, parked: &Parked) -> Result<Unparked, PhysicsError> {
+        self.put_back(parked).map(|(unparked, ..)| unparked)
+    }
+
+    /// [`Self::unpark`], and where the body's center and axes now sit against those it had,
+    /// for what is fixed to it.
+    fn put_back(&mut self, parked: &Parked) -> Result<(Unparked, Vec3, Quat), PhysicsError> {
         let mut desc = parked.desc;
         if let Motion::Coasting {
             source,
@@ -421,7 +429,7 @@ impl PhysicsWorld {
             Some(links) => Some(self.restore_structure(body, links.clone())?),
             None => None,
         };
-        Ok(Unparked { body, structure })
+        Ok((Unparked { body, structure }, center, axes))
     }
 
     /// Where a point standing in `frame` is in the root at `time`, and how fast it goes there.

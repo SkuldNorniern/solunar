@@ -600,7 +600,8 @@ pub(super) fn read_joints(
     Ok(joints)
 }
 
-fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, SnapshotError> {
+/// A joint's desc, its body handles as written, checked alone.
+pub(crate) fn read_joint_desc(reader: &mut Reader<'_>) -> Result<JointDesc, SnapshotError> {
     let a = reader.handle()?;
     let b = reader.handle()?;
     let anchor_a = reader.vec3()?;
@@ -645,6 +646,12 @@ fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, Sn
     };
     desc.validate()
         .map_err(|_| SnapshotError::Invalid("joint"))?;
+    Ok(desc)
+}
+
+fn read_joint(reader: &mut Reader<'_>, bodies: &Bodies) -> Result<JointState, SnapshotError> {
+    let desc = read_joint_desc(reader)?;
+    let (a, b) = (desc.a, desc.b);
     let (Ok(dense_a), Ok(dense_b)) = (bodies.dense_index(a), bodies.dense_index(b)) else {
         return Err(SnapshotError::Invalid("joint body"));
     };
@@ -762,7 +769,15 @@ impl Writer {
     }
 
     pub(super) fn joint(&mut self, state: &JointState) {
-        let desc = &state.desc;
+        self.joint_desc(&state.desc);
+        for impulse in state.impulses {
+            self.f32(impulse);
+        }
+        self.vec3(state.force);
+        self.vec3(state.torque);
+    }
+
+    pub(crate) fn joint_desc(&mut self, desc: &JointDesc) {
         for handle in [desc.a, desc.b] {
             self.u32(handle.index);
             self.u32(handle.generation);
@@ -787,11 +802,6 @@ impl Writer {
         }
         self.f32(desc.break_force);
         self.f32(desc.break_torque);
-        for impulse in state.impulses {
-            self.f32(impulse);
-        }
-        self.vec3(state.force);
-        self.vec3(state.torque);
     }
 
     fn joint_axis(&mut self, axis: &JointAxis) {

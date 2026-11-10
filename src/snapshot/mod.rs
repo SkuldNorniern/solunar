@@ -8,6 +8,7 @@ use crate::compound::Life;
 use crate::{BodyHandle, PhysicsSettings, PhysicsWorld};
 
 pub(crate) use bytes::{Reader, Writer, fnv1a};
+pub(crate) use parts::read_joint_desc;
 use parts::{
     kind_tag, read_bodies, read_contacts, read_fields, read_frames, read_gravity, read_joints,
     read_sensors,
