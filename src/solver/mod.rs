@@ -7,7 +7,9 @@ use algebrix::Vec3;
 
 use crate::body::Bodies;
 use crate::collision::find_pairs;
-use crate::joint::{JOINT_IMPULSES, Joints, add_joint_loads, build_rows, capture_impulses};
+use crate::joint::{
+    JOINT_IMPULSES, Joints, add_joint_loads, build_rows, capture_impulses, joint_turning,
+};
 use crate::material::Material;
 use crate::world::Integrated;
 use crate::{BodyKind, JobDispatch, PhysicsError, Shape};
@@ -177,11 +179,14 @@ pub(crate) fn solve_substep(
     (substep, last): (u32, bool),
     (dispatch, dt): (&dyn JobDispatch, f32),
 ) {
+    if substep == 0 {
+        joint_turning(joints, bodies, dt, &mut scratch.joint_turning);
+    }
     build_rows(
         joints,
         &scratch.joint_impulses,
         bodies,
-        state,
+        (state, &scratch.joint_turning),
         awake,
         &mut scratch.joint_points,
         &mut scratch.joint_rows,

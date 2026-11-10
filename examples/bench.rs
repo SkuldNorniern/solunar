@@ -1009,10 +1009,12 @@ fn heavy_chain() -> Result<Outcome> {
         } else {
             (0.24, 1.727)
         };
+        // a cable, its parts pass through each other: contacts at 10,000 to 1 are another matter
         let ball = world.spawn(
             RigidBodyDesc::dynamic(Shape::sphere(radius))
                 .density(density)
-                .local_position(at),
+                .local_position(at)
+                .filter(solunar::CollisionFilter { layers: 2, mask: 0 }),
         )?;
         joints.push(ball_joint(&mut world, last, ball, at - Vec3::X * 0.25)?);
         last = ball;

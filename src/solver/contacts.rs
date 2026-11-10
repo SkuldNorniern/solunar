@@ -159,6 +159,8 @@ pub(crate) struct ContactScratch {
     pub(super) joint_impulses: Vec<[f32; JOINT_IMPULSES]>,
     /// Each joint's force and torque impulse on B, over the substeps so far.
     pub(super) joint_loads: Vec<(Vec3, Vec3)>,
+    /// Inverse inertia as the joints see it this step.
+    pub(super) joint_turning: Vec<Vec3>,
     pub(super) islands: Islands,
     pub(super) colors: Colors,
     pub(super) motions: Vec<Motion>,

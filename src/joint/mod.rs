@@ -6,8 +6,9 @@ mod rows;
 mod store;
 
 pub(crate) use rows::{
-    JointPoint, JointRow, MOTOR_SLOT, add_joint_loads, build_rows, capture_impulses, solve_point,
-    solve_point_recovery, solve_row, solve_row_recovery, warm_start_point, warm_start_row,
+    JointPoint, JointRow, MOTOR_SLOT, add_joint_loads, build_rows, capture_impulses, joint_turning,
+    solve_point, solve_point_recovery, solve_row, solve_row_recovery, warm_start_point,
+    warm_start_row,
 };
 pub use store::Joints;
 pub(crate) use store::{JointSlot, JointState};

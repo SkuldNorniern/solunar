@@ -106,6 +106,37 @@ impl JointPoint {
 /// Each joint's push on body B this substep, added to what earlier substeps pushed: force and
 /// torque impulses. A push that comes in whole at the first substep, an outside force, is all
 /// taken there, the last substep alone showed none of it and a joint never felt what broke it.
+/// Each body's inverse inertia as the joints see it this step: a body holding a heavy load
+/// through a joint turns as if heavier by the load's geometric stiffness, load times arm, times
+/// the substep squared (andrews, teichmann and kry 2017). A 0.1 kg link under a 1000 kg ball
+/// swung across like a spring past what a 240 hz substep holds, and the chain came apart.
+pub(crate) fn joint_turning(joints: &Joints, bodies: &Bodies, substep: f32, out: &mut Vec<Vec3>) {
+    out.clear();
+    out.extend_from_slice(&bodies.inverse_inertia);
+    let mut stiffness = vec![0.0_f32; out.len()];
+    for (_, state) in joints.live() {
+        let load = state.force.length();
+        if load <= 0.0 || !load.is_finite() {
+            continue;
+        }
+        for (body, anchor) in [
+            (state.desc.a, state.desc.anchor_a),
+            (state.desc.b, state.desc.anchor_b),
+        ] {
+            if let Ok(dense) = bodies.dense_index(body) {
+                stiffness[dense] += load * anchor.length();
+            }
+        }
+    }
+    let squared = substep * substep;
+    for (inverse, added) in out.iter_mut().zip(stiffness) {
+        if added > 0.0 {
+            // 1 / (I + h^2 k), axis by axis, a free axis stays free
+            *inverse = *inverse / (Vec3::ONE + *inverse * (squared * added));
+        }
+    }
+}
+
 pub(crate) fn add_joint_loads(
     points: &[JointPoint],
     rows: &[JointRow],
@@ -183,7 +214,7 @@ fn inverted(columns: &[Vec3; 3]) -> Option<[Vec3; 3]> {
 #[allow(clippy::too_many_arguments)]
 fn build_point(
     bodies: &Bodies,
-    poses: &[Integrated],
+    (poses, turning): (&[Integrated], &[Vec3]),
     impulses: &[f32; JOINT_IMPULSES],
     joint: u32,
     pair: (usize, usize),
@@ -196,19 +227,13 @@ fn build_point(
     let (inverse_a, inverse_b) = (bodies.inverse_mass[a], bodies.inverse_mass[b]);
     let column = |unit: Vec3| {
         let part = |dense: usize, arm: Vec3| {
-            apply_diagonal(
-                poses[dense].rotation,
-                bodies.inverse_inertia[dense],
-                arm.cross(unit),
-            )
-            .cross(arm)
+            apply_diagonal(poses[dense].rotation, turning[dense], arm.cross(unit)).cross(arm)
         };
         unit * (inverse_a + inverse_b) + part(a, arm_a) + part(b, arm_b)
     };
     let matrix = [column(Vec3::X), column(Vec3::Y), column(Vec3::Z)];
     let inertia = |dense: usize| {
-        let turn =
-            |unit: Vec3| apply_diagonal(poses[dense].rotation, bodies.inverse_inertia[dense], unit);
+        let turn = |unit: Vec3| apply_diagonal(poses[dense].rotation, turning[dense], unit);
         [turn(Vec3::X), turn(Vec3::Y), turn(Vec3::Z)]
     };
     JointPoint {
@@ -318,6 +343,7 @@ struct RowGoal {
 struct RowBuilder<'a> {
     bodies: &'a Bodies,
     poses: &'a [Integrated],
+    turning: &'a [Vec3],
     impulses: &'a [f32; JOINT_IMPULSES],
     joint: u32,
     a: usize,
@@ -329,8 +355,8 @@ impl RowBuilder<'_> {
     fn push(&mut self, linear: Vec3, ang_a: Vec3, ang_b: Vec3, goal: RowGoal) {
         let (a, b) = (self.a, self.b);
         let bodies = self.bodies;
-        let turn_a = apply_diagonal(self.poses[a].rotation, bodies.inverse_inertia[a], ang_a);
-        let turn_b = apply_diagonal(self.poses[b].rotation, bodies.inverse_inertia[b], ang_b);
+        let turn_a = apply_diagonal(self.poses[a].rotation, self.turning[a], ang_a);
+        let turn_b = apply_diagonal(self.poses[b].rotation, self.turning[b], ang_b);
         let (inverse_a, inverse_b) = (bodies.inverse_mass[a], bodies.inverse_mass[b]);
         let inverse = linear.length_squared() * (inverse_a + inverse_b)
             + ang_a.dot(turn_a)
@@ -485,7 +511,7 @@ pub(crate) fn build_rows(
     joints: &Joints,
     impulses: &[[f32; JOINT_IMPULSES]],
     bodies: &Bodies,
-    poses: &[Integrated],
+    (poses, turning): (&[Integrated], &[Vec3]),
     awake: &[bool],
     points: &mut Vec<JointPoint>,
     rows: &mut Vec<JointRow>,
@@ -510,6 +536,7 @@ pub(crate) fn build_rows(
         let mut builder = RowBuilder {
             bodies,
             poses,
+            turning,
             impulses: &impulses[index],
             joint: index as u32,
             a,
@@ -542,7 +569,7 @@ pub(crate) fn build_rows(
                 if point_joint {
                     points.push(build_point(
                         bodies,
-                        poses,
+                        (poses, turning),
                         &impulses[index],
                         index as u32,
                         (a, b),
