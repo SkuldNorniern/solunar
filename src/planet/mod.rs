@@ -56,6 +56,10 @@ pub struct CaveDesc {
     /// Share of the ground, 0 to 1, where tunnels break through the top, in patches a few
     /// bends across. On a sea floor they are underwater caves.
     pub openings: f64,
+    /// How much rock, 0 to 1, opens into wide chambers a few bends across that the tunnels
+    /// run through. Not a volume share: 0.1 adds a chamber now and then, 0.3 leaves about a
+    /// fifth of the rock hollow with the tunnels.
+    pub caverns: f64,
 }
 
 impl CaveDesc {
@@ -66,7 +70,13 @@ impl CaveDesc {
             top: 4.0,
             bottom: 200.0,
             openings: 0.0,
+            caverns: 0.0,
         }
+    }
+
+    /// The same caves with wide chambers in `caverns` of the rock.
+    pub fn with_caverns(self, caverns: f64) -> Self {
+        Self { caverns, ..self }
     }
 
     /// The same caves breaking through the top on `openings` of the ground.
@@ -84,6 +94,7 @@ impl CaveDesc {
             && self.bottom.is_finite()
             && self.bottom > self.top
             && (0.0..=1.0).contains(&self.openings)
+            && (0.0..=1.0).contains(&self.caverns)
     }
 }
 
@@ -123,7 +134,13 @@ impl PlanetDesc {
         );
         // per meter each noise changes at most 2 * 1.875 * sqrt(3) over a cell of `scale`
         let per_meter = 2.0 * 1.875 * 3.0_f64.sqrt() / caves.scale;
-        let tunnel = (a.abs().max(b.abs()) - caves.width) / per_meter;
+        let mut tunnel = (a.abs().max(b.abs()) - caves.width) / per_meter;
+        if caves.caverns > 0.0 {
+            let room = CAVERN_SCALE * caves.scale;
+            let c = value_noise(at / room, self.seed.wrapping_add(0x5bd1));
+            let chamber = ((1.0 - 2.0 * caves.caverns) - c) / (2.0 * 1.875 * 3.0_f64.sqrt() / room);
+            tunnel = tunnel.min(chamber);
+        }
         // closed above `top` and below `bottom`, `top` lifting past the ground in open patches
         let mut top = caves.top - depth;
         if caves.openings > 0.0 {
@@ -381,6 +398,8 @@ fn fade(t: f64) -> f64 {
 }
 
 /// In -1 to 1, smooth, the same on every machine.
+/// Bends of a tunnel across a cavern's noise cell.
+const CAVERN_SCALE: f64 = 2.0;
 /// Noise span over which a cave opening goes from shut to open.
 const OPEN_EDGE: f64 = 0.25;
 /// Meters above the ground an open patch lifts the cave's top, so tunnels cut through.

@@ -513,6 +513,28 @@ mod tests {
     }
 
     #[test]
+    fn caverns_hollow_out_more_rock_than_tunnels_alone() {
+        let hollow = |caverns: f64| {
+            let caves = crate::CaveDesc::tunnels().with_caverns(caverns);
+            let planet = Planet::new(PlanetDesc::earth(3).with_caves(caves)).unwrap();
+            let center = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+            let up = center.normalize();
+            let mut open = 0;
+            for i in 0..20_000_u32 {
+                let f = |k: u32| ((i.wrapping_mul(k) % 1000) as f64 / 1000.0 - 0.5) * 400.0;
+                let at = center - up * 100.0 + DVec3::new(f(7919), f(104_729), f(1_299_709));
+                if planet.desc().cave_distance(at, 100.0).unwrap() < 0.0 {
+                    open += 1;
+                }
+            }
+            open
+        };
+        let (tunnels, chambers) = (hollow(0.0), hollow(0.2));
+        assert!(tunnels > 0, "{tunnels}");
+        assert!(chambers > tunnels * 2, "{tunnels} {chambers}");
+    }
+
+    #[test]
     fn open_caves_break_through_the_top_and_shut_ones_never() {
         let near_top = |openings: f64| {
             let caves = crate::CaveDesc::tunnels().with_openings(openings);
