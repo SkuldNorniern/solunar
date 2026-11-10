@@ -1,6 +1,7 @@
 use algebrix::{DVec3, Quat, Vec3};
 
 use super::{Edit, EditOp, EditReport, EditShape, SdfTerrain};
+use crate::dispatch::{JobDispatch, Sequential};
 use crate::error::PhysicsError;
 use crate::fracture::{
     BreakableDesc, BreakableHandle, Debris, FractureMaterial, FracturePattern, MAX_CELLS,
@@ -62,6 +63,22 @@ impl SdfTerrain {
         spoil: &Spoil,
         seed: u64,
     ) -> Result<Dig, PhysicsError> {
+        self.dig_with(world, edit, spoil, seed, &Sequential)
+    }
+
+    /// [`Self::dig`] with its bricks rebuilt on the host's workers. The result does not depend
+    /// on them.
+    ///
+    /// # Errors
+    /// See [`Self::dig`], and a dispatcher that skips jobs.
+    pub fn dig_with(
+        &mut self,
+        world: &mut PhysicsWorld,
+        edit: Edit,
+        spoil: &Spoil,
+        seed: u64,
+        dispatch: &dyn JobDispatch,
+    ) -> Result<Dig, PhysicsError> {
         if edit.op != EditOp::Excavate {
             return Err(PhysicsError::InvalidShape);
         }
@@ -72,7 +89,7 @@ impl SdfTerrain {
                 self.spoil_of(world, &edit, &material, debris, seed)?
             }
         };
-        let report = self.edit(world, edit)?;
+        let report = self.edit_with(world, edit, dispatch)?;
         let (mut spoil, mut fragment_mass) = (None, 0.0);
         if let Some(desc) = pieces {
             let volume: f64 = desc
@@ -423,6 +440,22 @@ mod tests {
             terrain.dig(&mut world, tunnel, &Spoil::Loose, 7),
             Err(PhysicsError::InvalidShape)
         );
+    }
+
+    #[test]
+    fn a_dig_on_workers_is_the_same_as_on_one_thread() {
+        let run = |dispatch: &dyn JobDispatch| {
+            let mut world = world();
+            let mut terrain = ground(&mut world);
+            let dig = terrain
+                .dig_with(&mut world, bore(), &rock(2.0e6), 7, dispatch)
+                .unwrap();
+            (dig, world.save_snapshot())
+        };
+        let (one, one_world) = run(&Sequential);
+        let (many, many_world) = run(&crate::dispatch::testing::Threads(4));
+        assert_eq!(one, many);
+        assert_eq!(one_world, many_world);
     }
 
     #[test]

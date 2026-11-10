@@ -1624,7 +1624,10 @@ fn planet_spoil() -> Result<Outcome> {
         },
     )?;
     let corner = desc.origin.to_dvec3();
-    let mut terrain = SdfTerrain::new_in(&mut world, desc, ground.frame(), &Sequential)?;
+    let mut terrain = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+        Some(pool) => SdfTerrain::new_in(&mut world, desc, ground.frame(), pool),
+        None => SdfTerrain::new_in(&mut world, desc, ground.frame(), &Sequential),
+    })?;
     let spoil = Spoil::Fragments {
         material: FractureMaterial::STONE,
         debris: Some(Debris {
@@ -1648,7 +1651,10 @@ fn planet_spoil() -> Result<Outcome> {
             op: EditOp::Excavate,
         };
         let started = Instant::now();
-        let dig = terrain.dig(&mut world, edit, &spoil, i as u64)?;
+        let dig = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => terrain.dig_with(&mut world, edit, &spoil, i as u64, pool),
+            None => terrain.dig(&mut world, edit, &spoil, i as u64),
+        })?;
         digs.push(started.elapsed());
         fragments += dig.fragment_mass;
         removed += dig.report.removed_mass;
