@@ -17,7 +17,7 @@ pub(crate) struct ConvexHull {
     /// The points it was built from, a reload rebuilds the same hull from these.
     pub(crate) source: Vec<Vec3>,
     pub(crate) vertices: Vec<Vec3>,
-    planes: Vec<(Vec3, f32)>,
+    pub(crate) planes: Vec<(Vec3, f32)>,
     face_starts: Vec<u32>,
     face_corners: Vec<u32>,
     edges: Vec<Vec3>,

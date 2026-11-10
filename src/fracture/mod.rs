@@ -5,6 +5,13 @@ use std::collections::HashMap;
 use algebrix::{DVec3, Quat, Vec3};
 
 pub(crate) use voronoi::voronoi_box_within;
+
+/// Cells a lone piece cracks into.
+const CRACK_CELLS: usize = 6;
+/// Most pieces that crack in one step across the world, the rest wait for the next steps.
+const CRACKS_PER_STEP: usize = 4;
+/// Most pieces a breakable holds, cracked ones and all.
+pub const MAX_PIECES: usize = 16 * MAX_CELLS;
 pub use voronoi::{
     FracturePattern, MAX_CELLS, PatternBond, PatternPiece, voronoi_box, voronoi_box_stretched,
 };
@@ -60,6 +67,9 @@ pub struct BreakableDesc {
     pub grain: Option<Grain>,
     /// What becomes of small pieces once they lie still, none for nothing.
     pub debris: Option<Debris>,
+    /// Cubic meters: a lone piece pushed harder than its cross section holds cracks again
+    /// inside itself, into pieces no smaller than this. Zero for pieces that never do.
+    pub smallest_piece: f32,
 }
 
 /// Small broken pieces lying still turn fixed, so a pile stops costing anything and stops
@@ -114,6 +124,7 @@ impl BreakableDesc {
             crack_spread: 0.0,
             grain: None,
             debris: None,
+            smallest_piece: 0.0,
         }
     }
 
@@ -298,6 +309,9 @@ pub(crate) struct Breakable {
     spread: f32,
     debris: Option<Debris>,
     frame: FrameId,
+    /// Pascals, what a lone piece's cross section holds before it cracks again.
+    strength: f32,
+    smallest: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -309,6 +323,8 @@ pub(crate) struct Breakables {
     removed: Vec<BodyHandle>,
     /// Velocities as the step started, while any breakable is there.
     pub(crate) before: Vec<Vec3>,
+    /// Pieces cracked this step.
+    cracked: usize,
 }
 
 impl Breakables {
@@ -448,6 +464,8 @@ impl Breakable {
             }
         }
         out.u32(self.frame.index());
+        out.f32(self.strength);
+        out.f32(self.smallest);
     }
 
     fn load(reader: &mut Reader<'_>, bodies: &Bodies, max: usize) -> Result<Self, SnapshotError> {
@@ -466,7 +484,12 @@ impl Breakable {
         if !(0.0..=1.0).contains(&spread) {
             return Err(SnapshotError::Invalid("breakable spread"));
         }
-        let count = reader.count(46, MAX_CELLS)?;
+        let most = if reader.version >= 19 {
+            MAX_PIECES
+        } else {
+            MAX_CELLS
+        };
+        let count = reader.count(46, most)?;
         let mut pieces = Vec::with_capacity(count);
         for _ in 0..count {
             let info = load_info(reader)?;
@@ -491,7 +514,7 @@ impl Breakable {
                 gone,
             });
         }
-        let bonds_count = reader.count(17, MAX_CELLS * MAX_CELLS)?;
+        let bonds_count = reader.count(17, most * MAX_CELLS)?;
         let mut bonds = Vec::with_capacity(bonds_count);
         for _ in 0..bonds_count {
             let (a, b) = (reader.u32()?, reader.u32()?);
@@ -582,6 +605,14 @@ impl Breakable {
         } else {
             FrameId::ROOT
         };
+        let (strength, smallest) = if reader.version >= 19 {
+            (reader.f32()?, reader.f32()?)
+        } else {
+            (1.0, 0.0)
+        };
+        if !strength.is_finite() || strength <= 0.0 || !smallest.is_finite() || smallest < 0.0 {
+            return Err(invalid());
+        }
         for group in &groups {
             let dense = bodies.dense_index(group.body).map_err(|_| invalid())?;
             if bodies.frame[dense] != frame {
@@ -596,6 +627,8 @@ impl Breakable {
             spread,
             debris,
             frame,
+            strength,
+            smallest,
         })
     }
 }
@@ -631,6 +664,8 @@ impl PhysicsWorld {
             || !grain_ok
             || !desc.debris.is_none_or(|debris| debris.is_valid())
             || !(desc.anchored.is_empty() || desc.anchored.len() == count)
+            || !desc.smallest_piece.is_finite()
+            || desc.smallest_piece < 0.0
         {
             return Err(PhysicsError::InvalidShape);
         }
@@ -682,6 +717,8 @@ impl PhysicsWorld {
             spread: desc.crack_spread,
             debris: desc.debris,
             frame: desc.frame,
+            strength: desc.strength,
+            smallest: desc.smallest_piece,
         };
         let all: Vec<u32> = (0..count as u32).collect();
         let kind = if desc.fixed {
@@ -817,6 +854,7 @@ impl PhysicsWorld {
             .map(|(dense, velocity)| (self.bodies.handle_at(dense), *velocity))
             .collect();
         self.breakables.removed.clear();
+        self.breakables.cracked = 0;
         let loads = self.piece_loads(dt);
         for (index, (force, hitter)) in loads.into_iter().enumerate() {
             let Some(mut breakable) = self.breakables.slots[index].take() else {
@@ -826,7 +864,9 @@ impl PhysicsWorld {
                 index: index as u32,
                 generation: self.breakables.generations[index],
             };
-            let result = self.load_and_split(handle, &mut breakable, (&force, &hitter), &before);
+            let result = self
+                .load_and_split(handle, &mut breakable, (&force, &hitter), &before)
+                .and_then(|()| self.crack_pieces(handle, &mut breakable, &force));
             self.breakables.slots[index] = Some(breakable);
             result?;
         }
@@ -1013,6 +1053,125 @@ impl PhysicsWorld {
             self.split(handle, breakable, group, parts, (hitter, before))?;
         }
         Ok(())
+    }
+
+    /// Each part that is one piece alone, pushed past what its cross section holds and big
+    /// enough, cracks inside itself: cut into cells within its own faces, bonded at the
+    /// material's strength, standing and moving as it did. The bonds then break as any do.
+    fn crack_pieces(
+        &mut self,
+        handle: BreakableHandle,
+        breakable: &mut Breakable,
+        force: &[f32],
+    ) -> Result<(), PhysicsError> {
+        if breakable.smallest <= 0.0 {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < breakable.groups.len() && self.breakables.cracked < CRACKS_PER_STEP {
+            let group = &breakable.groups[index];
+            let [piece] = group.pieces[..] else {
+                index += 1;
+                continue;
+            };
+            let p = &breakable.pieces[piece as usize];
+            let holds = breakable.strength * p.volume.powf(2.0 / 3.0);
+            let room = MAX_PIECES - breakable.pieces.len();
+            let pushed = force.get(piece as usize).copied().unwrap_or(0.0);
+            if pushed <= holds
+                || p.volume < breakable.smallest * CRACK_CELLS as f32
+                || room < CRACK_CELLS
+                || group.frozen.is_some()
+            {
+                index += 1;
+                continue;
+            }
+            let group = breakable.groups.swap_remove(index);
+            self.breakables.cracked += 1;
+            let made = self.crack(handle, breakable, group, piece)?;
+            breakable.groups.push(made);
+        }
+        Ok(())
+    }
+
+    fn crack(
+        &mut self,
+        handle: BreakableHandle,
+        breakable: &mut Breakable,
+        group: Group,
+        piece: u32,
+    ) -> Result<Group, PhysicsError> {
+        let old = breakable.pieces[piece as usize].clone();
+        // its hull in the pattern's space, from the hull's own axes
+        let hull = self
+            .bodies
+            .assets
+            .convex(&old.info.shape)
+            .ok_or(PhysicsError::InvalidShape)?;
+        let place = |v: Vec3| old.info.center + old.info.axes.rotate_vec3(v);
+        let points: Vec<Vec3> = hull.vertices.iter().map(|v| place(*v)).collect();
+        let low = points.iter().fold(Vec3::splat(f32::MAX), |m, p| m.min(*p));
+        let high = points.iter().fold(Vec3::splat(f32::MIN), |m, p| m.max(*p));
+        let (middle, half) = ((low + high) * 0.5, (high - low) * 0.5);
+        let planes: Vec<(DVec3, f64)> = hull
+            .planes
+            .iter()
+            .map(|(normal, offset)| {
+                let n = old.info.axes.rotate_vec3(*normal);
+                let d = *offset + n.dot(old.info.center) - n.dot(middle);
+                (DVec3::from_vec3(n), f64::from(d))
+            })
+            .collect();
+        let seed =
+            (u64::from(handle.index) << 32) ^ u64::from(piece) ^ breakable.pieces.len() as u64;
+        let pattern = voronoi_box_within(half, CRACK_CELLS, seed, &planes)?;
+        let first = breakable.pieces.len() as u32;
+        let mut members = Vec::with_capacity(pattern.pieces.len());
+        for sub in &pattern.pieces {
+            let mid = sub.points.iter().fold(Vec3::ZERO, |sum, p| sum + *p)
+                / sub.points.len().max(1) as f32;
+            let local: Vec<Vec3> = sub.points.iter().map(|p| *p - mid).collect();
+            let mut info = self.add_convex(&local)?;
+            info.center += middle + mid;
+            members.push(breakable.pieces.len() as u32);
+            breakable.pieces.push(Piece {
+                info,
+                volume: sub.volume,
+                center: middle + sub.center,
+                anchored: false,
+                gone: false,
+            });
+        }
+        for bond in &pattern.bonds {
+            breakable.bonds.push(Bond {
+                a: first + bond.a,
+                b: first + bond.b,
+                strength: bond.area * breakable.strength,
+                damage: 0.0,
+                broken: false,
+            });
+        }
+        breakable.pieces[piece as usize].gone = true;
+        let state = self.body_state(group.body)?;
+        let pose = pattern_pose(&group.info, state.position, state.rotation)
+            .ok_or(PhysicsError::OutOfRange)?;
+        let kind = state.kind;
+        self.despawn(group.body)?;
+        let made = self.spawn_group(
+            breakable,
+            members,
+            pose,
+            kind,
+            (state.linear_velocity, state.angular_velocity),
+        )?;
+        let mass = old.volume * breakable.material.density;
+        self.breakables.events.push(FractureEvent {
+            breakable: handle,
+            body: made.body,
+            pieces: made.pieces.len() as u32,
+            mass,
+        });
+        Ok(made)
     }
 
     fn split(
@@ -1589,6 +1748,75 @@ mod tests {
             loaded.step_fixed().unwrap();
         }
         assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+    }
+
+    /// A lone 0.4 m stone block of `strength` on the floor and a steel ball shot into it.
+    fn lone_block(strength: f32, smallest: f32) -> (PhysicsWorld, BreakableHandle) {
+        let mut world = world();
+        let pattern = voronoi_box(Vec3::splat(0.2), 1, 4).unwrap();
+        let target = world
+            .add_breakable(BreakableDesc {
+                strength,
+                smallest_piece: smallest,
+                material: Material {
+                    density: 2700.0,
+                    ..Material::default()
+                },
+                ..BreakableDesc::new(pattern, at(0.0, 0.2, 0.0))
+            })
+            .unwrap();
+        world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.1))
+                    .density(7800.0)
+                    .local_position(Vec3::new(0.0, 0.25, -2.0))
+                    .linear_velocity(Vec3::new(0.0, 0.0, 30.0)),
+            )
+            .unwrap();
+        (world, target)
+    }
+
+    fn pieces_after(world: &mut PhysicsWorld, target: BreakableHandle, steps: usize) -> usize {
+        for _ in 0..steps {
+            world.step_fixed().unwrap();
+        }
+        world.breakable_bodies(target).len()
+    }
+
+    #[test]
+    fn a_lone_piece_hit_hard_cracks_again_and_keeps_its_mass() {
+        let (mut world, target) = lone_block(2.0e4, 1e-4);
+        let whole = mass(&world, &world.breakable_bodies(target));
+        let parts = pieces_after(&mut world, target, 120);
+        assert!(parts > 1, "{parts} parts");
+        let after = mass(&world, &world.breakable_bodies(target));
+        assert!((after - whole).abs() < whole * 1e-3, "{whole} {after}");
+        // the same once saved and loaded
+        let loaded = PhysicsWorld::load_snapshot(&world.save_snapshot()).unwrap();
+        assert_eq!(loaded.save_snapshot(), world.save_snapshot());
+    }
+
+    #[test]
+    fn a_strong_piece_or_one_told_never_to_crack_stays_whole() {
+        let (mut strong, target) = lone_block(1.0e9, 1e-4);
+        assert_eq!(pieces_after(&mut strong, target, 120), 1);
+        let (mut never, target) = lone_block(2.0e4, 0.0);
+        assert_eq!(pieces_after(&mut never, target, 120), 1);
+    }
+
+    #[test]
+    fn cracking_comes_out_the_same_on_any_worker_count() {
+        let run = |dispatch: &dyn JobDispatch| {
+            let (mut world, target) = lone_block(2.0e4, 1e-4);
+            for _ in 0..90 {
+                world.step_with(dispatch).unwrap();
+            }
+            let parts = world.breakable_bodies(target).len();
+            (parts, world.save_snapshot())
+        };
+        let (parts, one) = run(&Sequential);
+        assert!(parts > 1);
+        assert_eq!(one, run(&Threads(4)).1);
     }
 
     #[test]

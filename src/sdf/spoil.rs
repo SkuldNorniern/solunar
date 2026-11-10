@@ -249,6 +249,8 @@ impl SdfTerrain {
             strength: kind.strength,
             crack_spread: kind.crack_spread,
             debris,
+            // dug rock breaks on down to an eighth of the material's own piece
+            smallest_piece: 1.0 / (8.0 * kind.pieces_per_cubic_meter),
             ..BreakableDesc::new(pattern, position)
         }))
     }
