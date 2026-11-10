@@ -6,6 +6,9 @@ use algebrix::{DVec3, Quat, Vec3};
 
 pub(crate) use voronoi::voronoi_box_within;
 
+/// How far up, as the cosine from straight up, a held neighbour must be under a piece for it
+/// to rest there.
+const REST: f32 = 0.3;
 /// Cells a lone piece cracks into.
 const CRACK_CELLS: usize = 6;
 /// Most pieces that crack in one step across the world, the rest wait for the next steps.
@@ -312,6 +315,9 @@ pub(crate) struct Breakable {
     /// Pascals, what a lone piece's cross section holds before it cracks again.
     strength: f32,
     smallest: f32,
+    /// Per bond, the weight it holds up, worked out again only when a bond breaks or a piece
+    /// cracks. Not saved, none after a load.
+    hanging: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -629,6 +635,7 @@ impl Breakable {
             frame,
             strength,
             smallest,
+            hanging: None,
         })
     }
 }
@@ -719,6 +726,7 @@ impl PhysicsWorld {
             frame: desc.frame,
             strength: desc.strength,
             smallest: desc.smallest_piece,
+            hanging: None,
         };
         let all: Vec<u32> = (0..count as u32).collect();
         let kind = if desc.fixed {
@@ -996,6 +1004,10 @@ impl PhysicsWorld {
         (force, hitter): (&[f32], &Hits),
         before: &HashMap<BodyHandle, Vec3>,
     ) -> Result<(), PhysicsError> {
+        if breakable.hanging.is_none() {
+            breakable.hanging = Some(self.hanging_weight(breakable)?);
+        }
+        let weight = breakable.hanging.take().unwrap_or_default();
         let mut held = vec![0.0_f32; breakable.pieces.len()];
         for bond in breakable.bonds.iter().filter(|bond| !bond.broken) {
             held[bond.a as usize] += bond.strength;
@@ -1022,12 +1034,15 @@ impl PhysicsWorld {
             if ratio > FATIGUE_FROM {
                 bond.damage += ratio * FATIGUE_RATE;
             }
-            if ratio >= 1.0 || bond.damage >= 1.0 {
+            // weight held still wears nothing, it only adds to what breaks it now
+            let carried = weight.get(index).copied().unwrap_or(0.0);
+            if (load + carried) / bond.strength >= 1.0 || bond.damage >= 1.0 {
                 bond.broken = true;
                 broke.push(index);
             }
         }
         if broke.is_empty() {
+            breakable.hanging = Some(weight);
             return Ok(());
         }
         // the crack runs on: faces around each broken one's pieces take damage, breaking next
@@ -1053,6 +1068,101 @@ impl PhysicsWorld {
             self.split(handle, breakable, group, parts, (hitter, before))?;
         }
         Ok(())
+    }
+
+    /// Per bond, the weight it holds up in a fixed part: from the anchored pieces out through
+    /// the unbroken bonds, a piece resting on a held one below passes its load down in
+    /// compression, one that does not hangs on the bond it was reached by with all that hangs
+    /// beyond it, so an overhang's root carries the whole overhang. Empty when nothing is
+    /// fixed.
+    fn hanging_weight(&self, breakable: &Breakable) -> Result<Vec<f32>, PhysicsError> {
+        let mut weight = Vec::new();
+        for group in &breakable.groups {
+            let state = self.body_state(group.body)?;
+            if state.kind == BodyKind::Dynamic {
+                continue;
+            }
+            let anchors: Vec<u32> = group
+                .pieces
+                .iter()
+                .copied()
+                .filter(|p| breakable.pieces[*p as usize].anchored)
+                .collect();
+            if anchors.is_empty() {
+                continue;
+            }
+            let pull = self.gravity_at(breakable.frame, state.position, Vec3::ZERO)?;
+            let g = pull.length();
+            if g <= 0.0 {
+                continue;
+            }
+            // up in the pattern's axes
+            let (_, turn) = pattern_pose(&group.info, state.position, state.rotation)
+                .ok_or(PhysicsError::OutOfRange)?;
+            let up = turn.conjugate().rotate_vec3(-pull / g);
+            if weight.is_empty() {
+                weight = vec![0.0; breakable.bonds.len()];
+            }
+            let count = breakable.pieces.len();
+            let mut touching: Vec<Vec<(u32, usize)>> = vec![Vec::new(); count];
+            for (index, bond) in breakable.bonds.iter().enumerate() {
+                if !bond.broken {
+                    touching[bond.a as usize].push((bond.b, index));
+                    touching[bond.b as usize].push((bond.a, index));
+                }
+            }
+            // reached in breadth order, each by one bond
+            let mut by: Vec<Option<usize>> = vec![None; count];
+            let mut seen = vec![false; count];
+            let mut order = Vec::with_capacity(group.pieces.len());
+            for anchor in &anchors {
+                seen[*anchor as usize] = true;
+                order.push(*anchor);
+            }
+            let mut at = 0;
+            while at < order.len() {
+                let piece = order[at];
+                at += 1;
+                for &(next, bond) in &touching[piece as usize] {
+                    if !seen[next as usize] {
+                        seen[next as usize] = true;
+                        by[next as usize] = Some(bond);
+                        order.push(next);
+                    }
+                }
+            }
+            let center = |p: usize| breakable.pieces[p].center;
+            // resting on a held piece below, its load goes down in compression
+            let rests = |p: usize| {
+                touching[p].iter().any(|&(other, _)| {
+                    seen[other as usize]
+                        && (center(p) - center(other as usize))
+                            .normalize_or(Vec3::ZERO)
+                            .dot(up)
+                            >= REST
+                })
+            };
+            let mut hanging: Vec<f32> = vec![0.0; count];
+            for piece in order.iter().rev() {
+                let p = *piece as usize;
+                hanging[p] += breakable.pieces[p].volume * breakable.material.density * g;
+                if rests(p) {
+                    continue;
+                }
+                // beside or under what holds it, it hangs on the bond it was reached by
+                if let Some(bond) = by[p] {
+                    weight[bond] += hanging[p];
+                    let other = breakable.bonds[bond];
+                    let parent = if other.a as usize == p {
+                        other.b
+                    } else {
+                        other.a
+                    };
+                    hanging[parent as usize] += hanging[p];
+                }
+            }
+        }
+        Ok(weight)
     }
 
     /// Each part that is one piece alone, pushed past what its cross section holds and big
@@ -1152,6 +1262,7 @@ impl PhysicsWorld {
             });
         }
         breakable.pieces[piece as usize].gone = true;
+        breakable.hanging = None;
         let state = self.body_state(group.body)?;
         let pose = pattern_pose(&group.info, state.position, state.rotation)
             .ok_or(PhysicsError::OutOfRange)?;
@@ -1817,6 +1928,63 @@ mod tests {
         let (parts, one) = run(&Sequential);
         assert!(parts > 1);
         assert_eq!(one, run(&Threads(4)).1);
+    }
+
+    /// A 4 m stone beam of `strength`, fixed at its low x end, lying along x or stood up on
+    /// that end, with nothing touching it but the ground under its foot.
+    fn beam(strength: f32, upright: bool) -> (PhysicsWorld, BreakableHandle) {
+        let mut world = world();
+        let pattern = voronoi_box(Vec3::new(2.0, 0.15, 0.15), 24, 6).unwrap();
+        let anchored = pattern.pieces.iter().map(|p| p.center.x < -1.6).collect();
+        let (rotation, at) = if upright {
+            (
+                Quat::from_axis_angle(Vec3::Z, std::f32::consts::FRAC_PI_2),
+                at(0.0, 2.0, 0.0),
+            )
+        } else {
+            (Quat::IDENTITY, at(0.0, 3.0, 0.0))
+        };
+        let target = world
+            .add_breakable(BreakableDesc {
+                fixed: true,
+                anchored,
+                rotation,
+                strength,
+                material: Material {
+                    density: 2400.0,
+                    ..Material::default()
+                },
+                ..BreakableDesc::new(pattern, at)
+            })
+            .unwrap();
+        (world, target)
+    }
+
+    #[test]
+    fn an_overhang_breaks_under_its_own_weight_when_weak_and_a_tower_stands() {
+        let (mut weak, target) = beam(2.0e4, false);
+        assert!(
+            pieces_after(&mut weak, target, 60) > 1,
+            "a weak overhang falls"
+        );
+        let kinds: Vec<BodyKind> = weak
+            .breakable_bodies(target)
+            .iter()
+            .map(|b| weak.body_state(*b).unwrap().kind)
+            .collect();
+        assert!(kinds.contains(&BodyKind::Static) && kinds.contains(&BodyKind::Dynamic));
+        let (mut strong, target) = beam(1.0e7, false);
+        assert_eq!(
+            pieces_after(&mut strong, target, 240),
+            1,
+            "a strong one holds"
+        );
+        let (mut tower, target) = beam(2.0e4, true);
+        assert_eq!(
+            pieces_after(&mut tower, target, 240),
+            1,
+            "standing it presses"
+        );
     }
 
     #[test]
