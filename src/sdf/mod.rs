@@ -1,3 +1,4 @@
+mod compute;
 mod field;
 mod jobs;
 mod nets;
@@ -6,6 +7,7 @@ mod volume;
 
 use crate::{GridPosition, Material, PhysicsError};
 
+pub use compute::{BrickSamples, CpuEdits, EditSpan, SdfCompute};
 pub use field::{Base, Edit, EditOp, EditShape};
 pub use jobs::{BrickJob, BuiltBricks};
 pub use nets::BrickMesh;
@@ -590,6 +592,59 @@ mod tests {
             one.volume().material_volume(),
             batch.volume().material_volume()
         );
+    }
+
+    /// A device that writes nonsense and then turns the work down.
+    struct Lost;
+
+    impl SdfCompute for Lost {
+        fn apply(&self, bricks: &mut [BrickSamples<'_>]) -> bool {
+            for brick in bricks.iter_mut() {
+                brick.values.fill(f32::NAN);
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn edits_applied_by_a_compute_give_the_same_terrain() {
+        let run = |compute: Option<&dyn SdfCompute>| {
+            let mut world = world();
+            let mut terrain = SdfTerrain::new(&mut world, desc(hills())).unwrap();
+            for edit in edits() {
+                terrain.queue_edit(edit).unwrap();
+            }
+            for i in 0..6 {
+                terrain
+                    .queue_edit(dig_at(5.0 + i as f32 * 1.5, 9.0))
+                    .unwrap();
+            }
+            while let Some(job) = terrain.next_job() {
+                let built = match compute {
+                    Some(compute) => job.run_with(&Threads(4), compute),
+                    None => job.run(&Threads(4)),
+                }
+                .unwrap();
+                terrain.commit(&mut world, built).unwrap();
+            }
+            terrain
+        };
+        let plain = run(None);
+        for compute in [&CpuEdits as &dyn SdfCompute, &Lost] {
+            let other = run(Some(compute));
+            for key in all_keys(plain.volume()) {
+                assert_eq!(
+                    plain.volume().brick_mesh(key),
+                    other.volume().brick_mesh(key),
+                    "{key:?}"
+                );
+            }
+            assert_eq!(
+                plain.volume().material_volume(),
+                other.volume().material_volume()
+            );
+            assert_matches_reference(other.volume());
+        }
     }
 
     #[test]

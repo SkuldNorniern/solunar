@@ -5,6 +5,7 @@ use algebrix::{IVec3, Vec3};
 
 use crate::{JobDispatch, PhysicsError, Sequential};
 
+use super::compute::EditSpan;
 use super::jobs::{Rebuilt, in_parallel};
 use super::{BrickKey, BrickMesh, Edit, EditId, SdfDesc};
 use super::{field, nets};
@@ -367,6 +368,16 @@ impl SdfVolume {
                 closed: None,
             };
         }
+        let mut values = self.base_samples(key);
+        for entry in edits {
+            self.apply(key, &mut values, entry);
+        }
+        self.finish(key, values)
+    }
+
+    /// A brick's samples of the base ground alone, before any edit.
+    pub(super) fn base_samples(&self, key: BrickKey) -> Vec<f32> {
+        let (low, _) = self.brick_samples(key);
         let side = self.side();
         let step = self.desc.voxel;
         let mut values = vec![0.0_f32; side * side * side];
@@ -381,10 +392,33 @@ impl SdfVolume {
                 }
             }
         }
-        for entry in edits {
-            self.apply(key, &mut values, entry);
-        }
-        self.finish(key, values)
+        values
+    }
+
+    /// Whether a brick with no edits is known solid or empty without sampling.
+    pub(super) fn known(&self, key: BrickKey) -> bool {
+        let (low, high) = self.brick_samples(key);
+        self.uniform(low, high).is_some()
+    }
+
+    /// What each edit reaches of a brick's samples, those that reach any.
+    pub(super) fn spans(&self, key: BrickKey, edits: &[EditEntry]) -> Vec<EditSpan> {
+        let (low, high) = self.brick_samples(key);
+        edits
+            .iter()
+            .filter_map(|entry| {
+                let (from, to) = (entry.low.max(low), entry.high.min(high));
+                (from.x <= to.x && from.y <= to.y && from.z <= to.z).then_some(EditSpan {
+                    edit: entry.edit,
+                    low: from,
+                    high: to,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn sample_side(&self) -> usize {
+        self.side()
     }
 
     fn side(&self) -> usize {

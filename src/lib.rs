@@ -80,8 +80,8 @@ pub use planet::{
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};
 pub use sdf::{
-    Base, BrickJob, BrickKey, BrickMesh, BuiltBricks, Edit, EditId, EditOp, EditReport, EditShape,
-    GROUND_LAYER, SdfDesc, SdfTerrain, SdfVolume,
+    Base, BrickJob, BrickKey, BrickMesh, BrickSamples, BuiltBricks, CpuEdits, Edit, EditId, EditOp,
+    EditReport, EditShape, EditSpan, GROUND_LAYER, SdfCompute, SdfDesc, SdfTerrain, SdfVolume,
 };
 pub use sensor::{SensorDesc, SensorEvent, SensorHandle};
 pub use shape::{MassProperties, Shape};

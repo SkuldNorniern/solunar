@@ -293,7 +293,8 @@ impl EditShape {
         }
     }
 
-    pub(crate) fn distance(&self, p: Vec3) -> f32 {
+    /// Signed distance from `p` to the shape, negative inside.
+    pub fn distance(&self, p: Vec3) -> f32 {
         match *self {
             Self::Sphere { center, radius } => (p - center).length() - radius,
             Self::Box {
@@ -348,7 +349,8 @@ impl EditShape {
 }
 
 impl EditOp {
-    pub(crate) fn apply(self, distance: f32, shape: f32) -> f32 {
+    /// A sample's distance after this op with a shape at `shape` from it.
+    pub fn apply(self, distance: f32, shape: f32) -> f32 {
         match self {
             Self::Add => distance.min(shape),
             Self::Excavate | Self::Tunnel => distance.max(-shape),
