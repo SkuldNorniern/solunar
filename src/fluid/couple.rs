@@ -318,11 +318,51 @@ impl FluidWorld {
     }
 
     /// The fastest body point, for the substep length.
-    pub(super) fn fastest_mover(&self) -> f32 {
-        self.movers
-            .velocities
+    /// The fastest coupled body that may meet the water within `dt`. A body no faster than
+    /// `slow` always counts, a faster one only when the box round its points, grown by how far
+    /// it and the water go, reaches a cell holding water: a cannon ball still in the air set
+    /// a whole river's substeps by its speed.
+    pub(super) fn fastest_near_water(&self, dt: f32, slow: f32) -> f32 {
+        let movers = &self.movers;
+        let count = self.coupled.len();
+        let mut fastest = vec![0.0_f32; count];
+        let mut boxes = vec![(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); count];
+        for ((at, velocity), owner) in movers
+            .positions
             .iter()
-            .fold(0.0_f32, |most, velocity| most.max(velocity.length()))
+            .zip(&movers.velocities)
+            .zip(&movers.owners)
+        {
+            let owner = *owner as usize;
+            fastest[owner] = fastest[owner].max(velocity.length());
+            boxes[owner] = (boxes[owner].0.min(*at), boxes[owner].1.max(*at));
+        }
+        let water = self.fastest();
+        let radius = self.settings.radius();
+        let mut most = 0.0_f32;
+        for (speed, (low, high)) in fastest.into_iter().zip(boxes) {
+            if speed <= most {
+                continue;
+            }
+            if speed <= slow {
+                most = speed;
+                continue;
+            }
+            let reach = Vec3::splat(radius + (speed + water) * dt);
+            let (low, high) = (self.cell_of(low - reach), self.cell_of(high + reach));
+            // before the first sort there is no grid to ask, any water counts
+            let unsorted = self.grid.cells.is_empty() && !self.positions.is_empty();
+            let wet = unsorted
+                || self.grid.cells.iter().any(|(cell, _)| {
+                    (low.0..=high.0).contains(&cell.0)
+                        && (low.1..=high.1).contains(&cell.1)
+                        && (low.2..=high.2).contains(&cell.2)
+                });
+            if wet {
+                most = speed;
+            }
+        }
+        most
     }
 
     /// Pressure and damping between particle `index` and the body points near it. Adds what the

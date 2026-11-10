@@ -25,7 +25,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 31] = [
+const SUITES: [(&str, Suite); 32] = [
     ("pile", pile),
     ("delta", delta),
     ("sleepers", sleepers),
@@ -55,6 +55,7 @@ const SUITES: [(&str, Suite); 31] = [
     ("dam-fine", dam_medium),
     ("dam-dfsph", dam_dfsph),
     ("floats", floats),
+    ("cannon-water", cannon_water),
     ("shallow", shallow),
     ("sensors", sensors),
 ];
@@ -277,6 +278,51 @@ fn dam_with(spacing: f32, solver: FluidSolver) -> Result<Outcome> {
 
 /// Eight boxes, light to heavy, dropped into a 2.4 m square pool 0.6 m deep on 5 cm water, about
 /// 28k particles, timed per 60 hz tick with the water and the rigid step.
+/// A pool and a steel ball fired at it from 12 m off at 40 m/s, coupled from the start. Times
+/// are whole ticks, water and world, over the flight and the splash.
+fn cannon_water() -> Result<Outcome> {
+    let mut fluid = FluidWorld::new(FluidSettings {
+        spacing: 0.08,
+        ..FluidSettings::default()
+    })?;
+    fluid.add_box_container(Vec3::ZERO, Vec3::new(3.2, 1.6, 3.2))?;
+    fluid.fill_box(Vec3::ZERO, Vec3::new(3.2, 0.6, 3.2))?;
+    fluid.set_domain(Some((Vec3::splat(-20.0), Vec3::splat(20.0))))?;
+    let mut world = PhysicsWorld::new(PhysicsSettings::default())?;
+    world.spawn(
+        RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(5.0, 0.5, 5.0)))
+            .local_position(Vec3::new(1.6, -0.5, 1.6)),
+    )?;
+    let shape = Shape::sphere(0.15);
+    let from = Vec3::new(-10.4, 6.0, 1.6);
+    let toward = (Vec3::new(1.6, 0.6, 1.6) - from).normalize();
+    let ball = world.spawn(
+        RigidBodyDesc::dynamic(shape)
+            .density(7800.0)
+            .local_position(from)
+            .linear_velocity(toward * 40.0),
+    )?;
+    fluid.couple(ball, &shape)?;
+    let mut times = Vec::new();
+    let mut substeps = 0_u64;
+    for _ in 0..90 {
+        let started = Instant::now();
+        let report = DISPATCH.with(|dispatch| match dispatch.borrow().as_ref() {
+            Some(pool) => fluid.step_with_bodies(1.0 / 60.0, &mut world, pool),
+            None => fluid.step_with_bodies(1.0 / 60.0, &mut world, &Sequential),
+        })?;
+        world.step_fixed()?;
+        times.push(started.elapsed());
+        substeps += u64::from(report.substeps);
+    }
+    Ok(Outcome {
+        bodies: fluid.positions().len(),
+        times,
+        unit: "ms",
+        check: format!("{:.1} substeps a tick", substeps as f64 / 90.0),
+    })
+}
+
 fn floats() -> Result<Outcome> {
     let mut fluid = FluidWorld::new(FluidSettings::default())?;
     fluid.add_box_container(Vec3::ZERO, Vec3::new(2.4, 1.2, 2.4))?;

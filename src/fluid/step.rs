@@ -107,9 +107,10 @@ impl FluidWorld {
     ) -> Result<(), PhysicsError> {
         // bodies only: water sped up by pressure raising its own sound speed feeds itself
         let configured = self.settings.sound_speed;
-        self.settings.sound_speed = configured.max(IMPACT_SOUND * self.fastest_mover());
+        let mover = self.fastest_near_water(dt, configured / IMPACT_SOUND);
+        self.settings.sound_speed = configured.max(IMPACT_SOUND * mover);
         report.sound_speed = self.settings.sound_speed;
-        let result = self.wcsph_steps(dt, dispatch, report);
+        let result = self.wcsph_steps(dt, mover, dispatch, report);
         self.settings.sound_speed = configured;
         result
     }
@@ -117,11 +118,13 @@ impl FluidWorld {
     fn wcsph_steps(
         &mut self,
         dt: f32,
+        mover: f32,
         dispatch: &dyn JobDispatch,
         report: &mut FluidReport,
     ) -> Result<(), PhysicsError> {
-        // body points move through the substeps too, none may jump further than water may
-        let fastest = self.fastest().max(self.fastest_mover());
+        // body points near the water move through the substeps too, none may jump further than
+        // water may
+        let fastest = self.fastest().max(mover);
         let largest =
             self.settings.courant * self.settings.radius() / (self.settings.sound_speed + fastest);
         let wanted = (dt / largest).ceil().max(1.0);
