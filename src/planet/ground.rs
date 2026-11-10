@@ -30,7 +30,7 @@ pub struct PlanetGround {
     /// The frame the tiles stand in.
     frame: FrameId,
     /// Tiles wholly inside are left to an editable region.
-    carved: Option<(DVec3, DVec3)>,
+    carved: Vec<(DVec3, DVec3)>,
 }
 
 /// The frames and pull [`PlanetGround::on_planet`] made.
@@ -62,7 +62,7 @@ impl PlanetGround {
             level,
             tiles: BTreeMap::new(),
             frame: FrameId::ROOT,
-            carved: None,
+            carved: Vec::new(),
         })
     }
 
@@ -223,7 +223,20 @@ impl PlanetGround {
         world: &mut PhysicsWorld,
         region: Option<(DVec3, DVec3)>,
     ) -> Result<(), PhysicsError> {
-        self.carved = region;
+        self.carve_all(world, region.as_slice())
+    }
+
+    /// [`Self::carve`] for many regions at once: a tile goes when each of its corners is inside
+    /// one of them, so a tile across two neighbouring regions goes too.
+    ///
+    /// # Errors
+    /// As [`Self::carve`].
+    pub fn carve_all(
+        &mut self,
+        world: &mut PhysicsWorld,
+        regions: &[(DVec3, DVec3)],
+    ) -> Result<(), PhysicsError> {
+        self.carved = regions.to_vec();
         let covered: Vec<TileKey> = self
             .tiles
             .keys()
@@ -240,17 +253,19 @@ impl PlanetGround {
     }
 
     fn covered(&self, tile: TileKey) -> bool {
-        let Some((low, high)) = self.carved else {
+        if self.carved.is_empty() {
             return false;
-        };
+        }
         let ((u0, v0), (u1, v1)) = tile.bounds();
         [(u0, v0), (u1, v0), (u0, v1), (u1, v1)]
             .iter()
             .all(|(u, v)| {
                 let at = self.to_world(self.planet.surface(direction(tile.face, *u, *v)));
-                (low.x..=high.x).contains(&at.x)
-                    && (low.y..=high.y).contains(&at.y)
-                    && (low.z..=high.z).contains(&at.z)
+                self.carved.iter().any(|(low, high)| {
+                    (low.x..=high.x).contains(&at.x)
+                        && (low.y..=high.y).contains(&at.y)
+                        && (low.z..=high.z).contains(&at.z)
+                })
             })
     }
 

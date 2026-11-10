@@ -522,5 +522,12 @@ mod tests {
         ground.carve(&mut world, None).unwrap();
         ground.update(&mut world, &[DVec3::ZERO], 30.0).unwrap();
         assert_eq!(ground.tile_count(), all);
+        // two neighbouring halves take the same tiles as the whole, those across them too
+        let halves = [
+            (low, DVec3::new(0.0, high.y, high.z)),
+            (DVec3::new(0.0, low.y, low.z), high),
+        ];
+        ground.carve_all(&mut world, &halves).unwrap();
+        assert_eq!(ground.tile_count(), carved);
     }
 }
