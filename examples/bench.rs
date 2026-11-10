@@ -25,8 +25,9 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 34] = [
+const SUITES: [(&str, Suite); 35] = [
     ("pile", pile),
+    ("rubble", rubble),
     ("delta", delta),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
@@ -564,6 +565,79 @@ fn delta() -> Result<Outcome> {
             mean(&awake) / 1024,
             mean(&still) / 1024,
             world.sleeping_body_count(),
+        ),
+    })
+}
+
+/// About 800 voronoi rock pieces dropped as a heap on sdf hills, as dug rock and broken
+/// boulders lie: hull against hull and hull against brick mesh. The last 300 of 600 steps.
+fn rubble() -> Result<Outcome> {
+    let mut world = world()?;
+    SdfTerrain::new(
+        &mut world,
+        SdfDesc {
+            origin: GridPosition::ORIGIN,
+            voxel: 0.5,
+            brick_cells: 16,
+            bricks: [4, 2, 4],
+            base: Base::Hills {
+                seed: 5,
+                height: 4.0,
+                amplitude: 1.0,
+                wavelength: 12.0,
+                octaves: 2,
+            },
+            material: Material::default(),
+        },
+    )?;
+    let pattern = voronoi_box(Vec3::new(2.0, 2.0, 2.0), 200, 9)?;
+    for layer in 0..4 {
+        for piece in &pattern.pieces {
+            let middle =
+                piece.points.iter().fold(Vec3::ZERO, |sum, p| sum + *p) / piece.points.len() as f32;
+            let local: Vec<Vec3> = piece.points.iter().map(|p| (*p - middle) * 0.9).collect();
+            let info = world.add_convex(&local)?;
+            let at = Vec3::new(16.0, 8.0 + layer as f32 * 4.5, 16.0) + middle * 1.1;
+            let (place, turn) = info.placed(at, Quat::IDENTITY);
+            world.spawn(
+                RigidBodyDesc::dynamic(info.shape)
+                    .density(2700.0)
+                    .local_position(place)
+                    .rotation(turn),
+            )?;
+        }
+    }
+    steps(&mut world, 300)?;
+    let times = steps(&mut world, 300)?;
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "{} awake, {} islands, largest {}, {}",
+            world.body_count() - world.sleeping_body_count(),
+            world.island_stats().count,
+            world.island_stats().largest_bodies,
+            {
+                let mut speeds: Vec<f32> = world
+                    .body_handles()
+                    .filter_map(|b| world.body_state(b).ok())
+                    .filter(|s| s.kind == BodyKind::Dynamic)
+                    .map(|s| {
+                        s.linear_velocity
+                            .length()
+                            .max(s.angular_velocity.length() * 0.2)
+                    })
+                    .collect();
+                speeds.sort_by(f32::total_cmp);
+                let n = speeds.len();
+                format!(
+                    "speeds p50 {:.3} p90 {:.3} max {:.3}",
+                    speeds[n / 2],
+                    speeds[n * 9 / 10],
+                    speeds[n - 1]
+                )
+            }
         ),
     })
 }
