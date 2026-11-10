@@ -74,9 +74,30 @@ fn by_min_x(bounds: &[Bounds], a: u32, b: u32) -> std::cmp::Ordering {
         .then(a.cmp(&b))
 }
 
+/// Sorts `order` by min x. Bodies barely move between steps, so an order kept from the last
+/// step is nearly sorted and an insertion sort does it in about one pass; past a budget of
+/// moves it is not, and the full sort takes over.
 fn sort_by_min_x(bounds: &[Bounds], order: &mut [u32]) {
-    order.sort_unstable_by(|a, b| by_min_x(bounds, *a, *b));
+    let mut budget = order.len() * INSERTION_MOVES;
+    for at in 1..order.len() {
+        let item = order[at];
+        let mut to = at;
+        while to > 0 && by_min_x(bounds, order[to - 1], item).is_gt() {
+            order[to] = order[to - 1];
+            to -= 1;
+            if budget == 0 {
+                order[to] = item;
+                order.sort_unstable_by(|a, b| by_min_x(bounds, *a, *b));
+                return;
+            }
+            budget -= 1;
+        }
+        order[to] = item;
+    }
 }
+
+/// Moves per body an insertion sort may make before the full sort is cheaper.
+const INSERTION_MOVES: usize = 8;
 
 /// Pairs among `order`, which it sorts. Adds to `pairs` unsorted. The bounds are copied into
 /// `packed` in sweep order first, the inner loop then reads memory in a row.
@@ -143,7 +164,9 @@ const SWEEP_PER_JOB: usize = 256;
 /// they stay still, so a field of sleepers costs a sort and not a sweep.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MovingPairs {
+    /// In last step's sweep order, kept so this step's sort has little to do.
     movers: Vec<u32>,
+    is_mover: Vec<bool>,
     /// Sorted by min x. Kept between steps, still things stay sorted.
     narrow: Vec<u32>,
     is_narrow: Vec<bool>,
@@ -161,16 +184,17 @@ impl MovingPairs {
         pairs: &mut Vec<(u32, u32)>,
         dispatch: &dyn JobDispatch,
     ) {
-        self.movers.clear();
         self.wide.clear();
         self.reach = 0.0;
         self.is_narrow.clear();
         self.is_narrow.resize(bounds.len(), false);
+        self.is_mover.clear();
+        self.is_mover.resize(bounds.len(), false);
         let mut narrow = 0;
         for (index, bound) in bounds.iter().enumerate() {
             let width = bound.max.x - bound.min.x;
             if moving(index) {
-                self.movers.push(index as u32);
+                self.is_mover[index] = true;
             } else if width.is_finite() && width <= WIDE {
                 self.is_narrow[index] = true;
                 narrow += 1;
@@ -179,6 +203,22 @@ impl MovingPairs {
                 self.wide.push(index as u32);
             }
         }
+        // last step's order less those that stopped, then the new ones
+        let is_mover = &mut self.is_mover;
+        self.movers.retain(|index| {
+            let kept = is_mover.get(*index as usize) == Some(&true);
+            if kept {
+                is_mover[*index as usize] = false;
+            }
+            kept
+        });
+        self.movers.extend(
+            is_mover
+                .iter()
+                .enumerate()
+                .filter(|(_, new)| **new)
+                .map(|(index, _)| index as u32),
+        );
         let same = self.narrow.len() == narrow
             && self
                 .narrow
@@ -310,6 +350,45 @@ mod tests {
             find_pairs(&bounds, &mut order, &mut pairs, &crate::Sequential);
             assert_eq!(pairs, brute_force(&bounds));
         }
+    }
+
+    #[test]
+    fn kept_mover_order_over_steps_finds_the_brute_force_pairs() {
+        let mut state = 0x5151_aaaa_1234_9876_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 10_000) as f64 / 10_000.0
+        };
+        let mut centers: Vec<DVec3> = (0..300)
+            .map(|_| DVec3::new(next() * 60.0, next() * 10.0, next() * 60.0))
+            .collect();
+        let mut finder = MovingPairs::default();
+        let mut pairs = Vec::new();
+        for frame in 0..40 {
+            // jitter, and a few bodies far across now and then
+            for (index, center) in centers.iter_mut().enumerate() {
+                *center += DVec3::new(next() - 0.5, next() - 0.5, next() - 0.5) * 0.3;
+                if (index + frame).is_multiple_of(97) {
+                    center.x = next() * 60.0;
+                }
+            }
+            let bounds: Vec<Bounds> = centers.iter().map(|c| at(c.x, c.y, c.z, 0.6)).collect();
+            // movers come and go
+            let moving = |index: usize| !(index + frame / 5).is_multiple_of(3);
+            finder.find(&bounds, moving, &mut pairs, &crate::Sequential);
+            let expected: Vec<(u32, u32)> = brute_force(&bounds)
+                .into_iter()
+                .filter(|(a, b)| moving(*a as usize) || moving(*b as usize))
+                .collect();
+            assert_eq!(pairs, expected, "frame {frame}");
+        }
+        // an order far from sorted falls back to the full sort and still comes out right
+        let bounds: Vec<Bounds> = (0..500).map(|i| at(f64::from(i), 0.0, 0.0, 0.1)).collect();
+        let mut order: Vec<u32> = (0..500).rev().collect();
+        sort_by_min_x(&bounds, &mut order);
+        assert!(order.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
