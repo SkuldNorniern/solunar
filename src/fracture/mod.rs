@@ -768,6 +768,63 @@ impl PhysicsWorld {
             .unwrap_or_default()
     }
 
+    /// Wears the faces holding the piece of `body` nearest `point` by `amount`, 1 for a face
+    /// worn through, as a drill or a pick does where it bites. Worn through faces break on the
+    /// next step like any, the part comes loose with the speed it has, not thrown. False when
+    /// `body` is no breakable's or its piece nearest the point is held by no face.
+    ///
+    /// # Errors
+    /// Fails on a bad point or amount.
+    pub fn wear_breakable_at(
+        &mut self,
+        body: BodyHandle,
+        point: GridPosition,
+        amount: f32,
+    ) -> Result<bool, PhysicsError> {
+        if !amount.is_finite() || amount < 0.0 {
+            return Err(PhysicsError::NonFinite("amount"));
+        }
+        if !point.local.is_finite() {
+            return Err(PhysicsError::NonFinite("point"));
+        }
+        let Ok(state) = self.body_state(body) else {
+            return Ok(false);
+        };
+        let Some(breakable) = self
+            .breakables
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|b| b.groups.iter().any(|group| group.body == body))
+        else {
+            return Ok(false);
+        };
+        let Some(group) = breakable.groups.iter().find(|group| group.body == body) else {
+            return Ok(false);
+        };
+        let (at, turn) = pattern_pose(&group.info, state.position, state.rotation)
+            .ok_or(PhysicsError::OutOfRange)?;
+        let local = turn
+            .conjugate()
+            .rotate_vec3(point.offset_from(at).as_vec3());
+        let Some(piece) = group.pieces.iter().copied().min_by(|a, b| {
+            let far = |p: u32| (breakable.pieces[p as usize].center - local).length_squared();
+            far(*a).total_cmp(&far(*b))
+        }) else {
+            return Ok(false);
+        };
+        let mut worn = false;
+        for bond in breakable
+            .bonds
+            .iter_mut()
+            .filter(|bond| !bond.broken && (bond.a == piece || bond.b == piece))
+        {
+            bond.damage += amount;
+            worn = true;
+        }
+        Ok(worn)
+    }
+
     /// Parts that broke off in the last step.
     /// Debris bodies the last step took out of the world, for the host to drop what it drew.
     pub fn removed_debris(&self) -> &[BodyHandle] {
@@ -1672,6 +1729,34 @@ mod tests {
             world.add_breakable(missing),
             Err(PhysicsError::InvalidFrame)
         );
+    }
+
+    #[test]
+    fn wearing_a_piece_frees_it_alone_and_throws_nothing() {
+        let (mut world, target) = world_and_wall();
+        let wall = world.breakable_bodies(target)[0];
+        // the wall is 3 x 2 x 0.2 m about y 1, its top left corner
+        let corner = at(-1.4, 1.9, 0.0);
+        let mut steps = 0;
+        while world.breakable_bodies(target).len() == 1 && steps < 60 {
+            assert!(world.wear_breakable_at(wall, corner, 0.1).unwrap());
+            world.step_fixed().unwrap();
+            steps += 1;
+        }
+        let parts = world.breakable_bodies(target);
+        assert_eq!(parts.len(), 2, "after {steps} steps");
+        assert!((9..=12).contains(&steps), "{steps}");
+        for body in &parts {
+            let state = world.body_state(*body).unwrap();
+            assert!(state.linear_velocity.length() < 0.2, "{state:?}");
+        }
+        assert!(world.wear_breakable_at(wall, corner, f32::NAN).is_err());
+        let plain = world
+            .spawn(
+                RigidBodyDesc::dynamic(Shape::sphere(0.2)).local_position(Vec3::new(5.0, 1.0, 0.0)),
+            )
+            .unwrap();
+        assert!(!world.wear_breakable_at(plain, corner, 0.5).unwrap());
     }
 
     #[test]
