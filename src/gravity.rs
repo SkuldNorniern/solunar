@@ -17,6 +17,11 @@ pub struct GravitySource {
     /// Zero pulls as a point. A planet of this radius pulls as a point outside it and as a
     /// uniform ball inside it, falling to nothing at its middle.
     pub radius: f64,
+    /// Flattening at the poles, the second zonal harmonic, zero for a round body. The earth's
+    /// is 1.083e-3. It turns orbits' planes about `pole` and needs `radius` as its reference.
+    pub j2: f64,
+    /// The planet's turning axis in the source's frame, any length but none.
+    pub pole: DVec3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -29,7 +34,22 @@ impl GravitySource {
             center,
             mu,
             radius: 0.0,
+            j2: 0.0,
+            pole: DVec3::Y,
         }
+    }
+
+    /// A planet of `radius`, round, pulling as a ball.
+    pub fn planet(frame: FrameId, center: DVec3, mu: f64, radius: f64) -> Self {
+        Self {
+            radius,
+            ..Self::point(frame, center, mu)
+        }
+    }
+
+    /// The same source flattened by `j2` about `pole`.
+    pub fn oblate(self, j2: f64, pole: DVec3) -> Self {
+        Self { j2, pole, ..self }
     }
 
     pub(crate) fn is_valid(&self) -> bool {
@@ -40,6 +60,12 @@ impl GravitySource {
             && self.mu.is_finite()
             && self.mu > 0.0
             && self.radius.is_finite()
+            && self.j2.is_finite()
+            && (self.j2 == 0.0 || self.radius > 0.0)
+            && self.pole.x.is_finite()
+            && self.pole.y.is_finite()
+            && self.pole.z.is_finite()
+            && self.pole.length() > 0.0
             && self.radius >= 0.0
     }
 
@@ -50,7 +76,16 @@ impl GravitySource {
             return DVec3::ZERO;
         }
         let reach = distance.max(self.radius);
-        -offset * (self.mu / (reach * reach * reach))
+        let round = -offset * (self.mu / (reach * reach * reach));
+        if self.j2 == 0.0 || distance < self.radius {
+            return round;
+        }
+        // -3/2 j2 mu R^2 / r^5 ((1 - 5 z^2 / r^2) r + 2 z k), z along the pole
+        let pole = self.pole.normalize();
+        let z = offset.dot(pole);
+        let r2 = distance * distance;
+        let scale = -1.5 * self.j2 * self.mu * self.radius * self.radius / (r2 * r2 * distance);
+        round + (offset * (1.0 - 5.0 * z * z / r2) + pole * (2.0 * z)) * scale
     }
 }
 
@@ -242,6 +277,74 @@ mod tests {
             farthest = farthest.max(distance);
         }
         assert!(farthest - nearest < 0.01 * radius, "{nearest} {farthest}");
+    }
+
+    #[test]
+    fn a_flattened_planet_pulls_harder_at_its_equator_and_less_at_its_poles() {
+        let (mu, radius, j2) = (3.986e14, 6.378e6, 1.083e-3);
+        let earth =
+            GravitySource::planet(FrameId::ROOT, DVec3::ZERO, mu, radius).oblate(j2, DVec3::Y);
+        let round = mu / (radius * radius);
+        // at the surface: the equator mu / R^2 (1 + 3/2 j2), the pole mu / R^2 (1 - 3 j2)
+        let equator = earth.pull(DVec3::new(radius, 0.0, 0.0)).length();
+        let pole = earth.pull(DVec3::new(0.0, radius, 0.0)).length();
+        assert!(
+            (equator / round - (1.0 + 1.5 * j2)).abs() < 1e-9,
+            "{equator}"
+        );
+        assert!((pole / round - (1.0 - 3.0 * j2)).abs() < 1e-9, "{pole}");
+        // and points at the center on both
+        assert!(earth.pull(DVec3::new(radius, 0.0, 0.0)).y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_flattened_planet_turns_an_inclined_orbit_about_its_pole_at_the_textbook_rate() {
+        let mut world = no_gravity();
+        // a minute an orbit at 100 m round a 60 m planet, flattened enough that twenty orbits show
+        // the turn, little enough that the first order rate holds (at 0.05 it was 8% off)
+        let (radius, period, planet, j2) = (100.0_f64, 60.0_f64, 60.0_f64, 0.01_f64);
+        let mu = (std::f64::consts::TAU / period).powi(2) * radius.powi(3);
+        world
+            .add_gravity(
+                GravitySource::planet(FrameId::ROOT, DVec3::ZERO, mu, planet).oblate(j2, DVec3::Y),
+            )
+            .unwrap();
+        // 45 degrees to the equator
+        let tilt = std::f64::consts::FRAC_PI_4;
+        let speed = (mu / radius).sqrt();
+        let velocity = DVec3::new(0.0, tilt.sin(), -tilt.cos()) * speed;
+        let body = ball(
+            &mut world,
+            FrameId::ROOT,
+            Vec3::new(radius as f32, 0.0, 0.0),
+            velocity.as_vec3(),
+        );
+        let node = |world: &PhysicsWorld| {
+            let state = in_root(world, body);
+            let normal = state.position.cross(state.linear_velocity);
+            // the ascending node lies along pole x normal
+            let line = DVec3::Y.cross(normal);
+            line.z.atan2(line.x)
+        };
+        let start = node(&world);
+        let turns = 20.0;
+        for _ in 0..(turns * period * 60.0) as usize {
+            world.step_fixed().unwrap();
+        }
+        let mut moved = node(&world) - start;
+        if moved > std::f64::consts::PI {
+            moved -= std::f64::consts::TAU;
+        } else if moved < -std::f64::consts::PI {
+            moved += std::f64::consts::TAU;
+        }
+        // dOmega/dt = -3/2 n j2 (R / a)^2 cos i, about the pole
+        let n = std::f64::consts::TAU / period;
+        let rate = -1.5 * n * j2 * (planet / radius).powi(2) * tilt.cos();
+        let expected = rate * turns * period;
+        assert!(
+            (moved.abs() - expected.abs()).abs() < 0.05 * expected.abs(),
+            "{moved} {expected}"
+        );
     }
 
     #[test]

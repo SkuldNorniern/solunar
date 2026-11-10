@@ -158,12 +158,18 @@ pub(super) fn read_gravity(
         let source = match reader.u8()? {
             0 => None,
             1 => {
-                let source = GravitySource {
+                let mut source = GravitySource {
                     frame: FrameId(reader.u32()?),
                     center: reader.dvec3()?,
                     mu: reader.f64()?,
                     radius: reader.f64()?,
+                    j2: 0.0,
+                    pole: algebrix::DVec3::Y,
                 };
+                if reader.version >= 17 {
+                    source.j2 = reader.f64()?;
+                    source.pole = reader.dvec3()?;
+                }
                 if !frames.contains(source.frame) || !source.is_valid() {
                     return Err(SnapshotError::Invalid("gravity source"));
                 }
