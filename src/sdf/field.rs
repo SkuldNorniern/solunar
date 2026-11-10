@@ -108,6 +108,34 @@ impl Base {
         }
     }
 
+    /// Lowest and highest ground over the columns from `low` to `high` (x and z, volume space),
+    /// none with no ground. For a planet it is found for just these columns: its five samples
+    /// widened by the ground's steepest slope over the farthest a point can be from one, so a
+    /// brick far above or below the ground is never sampled.
+    pub(crate) fn range_over(
+        &self,
+        low: (f32, f32),
+        high: (f32, f32),
+        step: f32,
+    ) -> Option<(f32, f32)> {
+        let Self::Planet { planet, .. } = *self else {
+            return self.height_range();
+        };
+        let ((x0, z0), (x1, z1)) = (low, high);
+        let (mx, mz) = ((x0 + x1) * 0.5, (z0 + z1) * 0.5);
+        let middle = self.planet_column(mx, mz, 0.0, PLANET_STEPS);
+        let heights = [(x0, z0), (x1, z0), (x0, z1), (x1, z1)]
+            .map(|(x, z)| self.planet_column(x, z, middle, PLANET_STEPS));
+        let (lowest, highest) = heights
+            .iter()
+            .fold((middle, middle), |(lo, hi), h| (lo.min(*h), hi.max(*h)));
+        let reach = 0.5 * ((x1 - x0).powi(2) + (z1 - z0).powi(2)).sqrt();
+        // the column is the frame's up, not out from the center: a hundredth more for its tilt
+        let slope = planet.slope_bound() as f32 + 0.01;
+        let margin = slope * reach + 2.0 * step;
+        Some((lowest - margin, highest + margin))
+    }
+
     /// Ground height and the factor that turns height above it into distance, for one column.
     pub(crate) fn column(&self, x: f32, z: f32, step: f32) -> (f32, f32) {
         match *self {

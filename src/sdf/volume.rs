@@ -499,7 +499,12 @@ impl SdfVolume {
         }
         let on_edge =
             low.x <= 0 || low.y <= 0 || low.z <= 0 || high.x >= bx || high.y >= by || high.z >= bz;
-        match self.desc.base.height_range() {
+        let range = self.desc.base.range_over(
+            (low.x as f32 * step, low.z as f32 * step),
+            (high.x as f32 * step, high.z as f32 * step),
+            step,
+        );
+        match range {
             None => Some(false),
             Some((_, highest)) if bottom > highest => Some(false),
             Some((lowest, _)) if top < lowest && !on_edge => Some(true),
@@ -551,4 +556,54 @@ fn inside(at: IVec3, low: IVec3, high: IVec3) -> bool {
 
 fn overlaps(a_low: IVec3, a_high: IVec3, b_low: IVec3, b_high: IVec3) -> bool {
     (a_high.min(b_high) - a_low.max(b_low)).min_element() >= 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Material, Planet, PlanetDesc, PlanetGround, level_for};
+    use algebrix::DVec3;
+
+    #[test]
+    fn a_planet_brick_called_solid_or_empty_without_sampling_is_so_at_every_sample() {
+        let planet = Planet::new(PlanetDesc::earth(3)).unwrap();
+        let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+        let level = level_for(&planet, 2.5);
+        let ground = PlanetGround::new(planet, anchor, level).unwrap();
+        // away from the anchor too, where the columns lean
+        for at in [DVec3::ZERO, DVec3::new(700.0, 0.0, -400.0)] {
+            let desc = ground
+                .sdf_desc(ground.ground_under(at), 12.0, (0.5, 8), Material::default())
+                .unwrap();
+            let volume = SdfVolume::new(desc).unwrap();
+            let step = desc.voxel;
+            let (mut skipped, mut sampled) = (0, 0);
+            let [bx, by, bz] = desc.bricks;
+            for z in 0..bz {
+                for y in 0..by {
+                    for x in 0..bx {
+                        let key = BrickKey([x, y, z]);
+                        let (low, high) = volume.brick_samples(key);
+                        let Some(solid) = volume.uniform(low, high) else {
+                            sampled += 1;
+                            continue;
+                        };
+                        skipped += 1;
+                        for gz in low.z..=high.z {
+                            for gy in low.y..=high.y {
+                                for gx in low.x..=high.x {
+                                    let p = Vec3::new(gx as f32, gy as f32, gz as f32) * step;
+                                    let (height, slope) = desc.base.column(p.x, p.z, step * 0.5);
+                                    let d = field::base_distance(height, slope, p.y);
+                                    assert_eq!(d < 0.0, solid, "{key:?} at {p:?}: {d}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // bricks well above or below the ground are left unsampled
+            assert!(skipped > 0 && sampled > 0, "{skipped} {sampled}");
+        }
+    }
 }

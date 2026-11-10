@@ -54,6 +54,16 @@ impl PlanetDesc {
         }
     }
 
+    /// Most the ground rises per meter across it. Each octave's value noise changes by at most 2
+    /// over a lattice cell and its fade is steepest at 1.875, so its gradient is at most
+    /// 2 * 1.875 * sqrt(3) a cell; an octave is half the height over half the cells, so every
+    /// octave adds the same, relief / total * 6.5 / wavelength.
+    pub(crate) fn slope_bound(&self) -> f64 {
+        let total: f64 = (0..self.octaves).map(|k| 0.5_f64.powi(k as i32)).sum();
+        self.relief / total * f64::from(self.octaves) * 2.0 * 1.875 * 3.0_f64.sqrt()
+            / self.wavelength
+    }
+
     /// Ground over the base sphere along `direction`, as [`Planet::height`].
     pub(crate) fn height(&self, direction: DVec3) -> f64 {
         let unit = direction.normalize();
