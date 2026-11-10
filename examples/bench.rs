@@ -25,8 +25,9 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 30] = [
+const SUITES: [(&str, Suite); 31] = [
     ("pile", pile),
+    ("delta", delta),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
     ("moving-rays", moving_rays),
@@ -467,6 +468,58 @@ fn ball_joint(
 }
 
 /// 2,000 spheres, boxes and capsules falling into a pile, all awake.
+/// The 2000 body pile sent as a delta each step against the step before: falling, all awake,
+/// then settled. Times are making and loading one, sizes against the full snapshot.
+fn delta() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 60.0)?;
+    let shapes = [
+        Shape::sphere(0.4),
+        Shape::cuboid(Vec3::splat(0.4)),
+        Shape::capsule(0.3, 0.3),
+    ];
+    for i in 0..2000 {
+        let (x, z, y) = (i % 20, (i / 20) % 10, i / 200);
+        let at = Vec3::new(
+            x as f32 * 1.2 - 12.0,
+            1.0 + y as f32 * 1.2,
+            z as f32 * 1.2 - 6.0,
+        );
+        world.spawn(RigidBodyDesc::dynamic(shapes[i % 3]).local_position(at))?;
+    }
+    let mut times = Vec::new();
+    let (mut awake, mut still) = (Vec::new(), Vec::new());
+    let mut base = world.save_snapshot();
+    let full = base.len();
+    for step in 0..900 {
+        world.step_fixed()?;
+        let started = Instant::now();
+        let delta = world.save_delta(&base);
+        let loaded =
+            PhysicsWorld::load_delta(&base, &delta).map_err(|_| PhysicsError::InvalidSettings)?;
+        times.push(started.elapsed());
+        if step < 60 {
+            awake.push(delta.len());
+        } else if step >= 840 {
+            still.push(delta.len());
+        }
+        base = loaded.save_snapshot();
+    }
+    let mean = |sizes: &[usize]| sizes.iter().sum::<usize>() / sizes.len().max(1);
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "full {} kB, falling {} kB, settled {} kB, {} asleep",
+            full / 1024,
+            mean(&awake) / 1024,
+            mean(&still) / 1024,
+            world.sleeping_body_count(),
+        ),
+    })
+}
+
 fn pile() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 60.0)?;

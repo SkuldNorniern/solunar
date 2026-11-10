@@ -1,4 +1,5 @@
 mod bytes;
+mod delta;
 mod parts;
 
 use std::error::Error;
@@ -8,6 +9,7 @@ use crate::compound::Life;
 use crate::{BodyHandle, PhysicsSettings, PhysicsWorld};
 
 pub(crate) use bytes::{Reader, Writer, fnv1a};
+pub use delta::{DELTA_VERSION, apply_snapshot_delta, snapshot_delta};
 pub(crate) use parts::read_joint_desc;
 use parts::{
     kind_tag, read_bodies, read_contacts, read_fields, read_frames, read_gravity, read_joints,

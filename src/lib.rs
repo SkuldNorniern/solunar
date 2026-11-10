@@ -85,7 +85,10 @@ pub use sdf::{
 };
 pub use sensor::{SensorDesc, SensorEvent, SensorHandle};
 pub use shape::{MassProperties, Shape};
-pub use snapshot::{SNAPSHOT_VERSION, SnapshotError, SnapshotLimits};
+pub use snapshot::{
+    DELTA_VERSION, SNAPSHOT_VERSION, SnapshotError, SnapshotLimits, apply_snapshot_delta,
+    snapshot_delta,
+};
 pub use structure::{Link, LinkDesc, MAX_LINKS, StructureEvent, StructureHandle};
 pub use substep::{SubstepBodies, SubstepHook, SubstepPose};
 pub use vehicle::{Controls, Vehicle, WheelContact, WheelDesc, WheelState};
