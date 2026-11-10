@@ -53,6 +53,9 @@ pub struct CaveDesc {
     /// Meters under the ground where caves start and stop. They close before the top.
     pub top: f64,
     pub bottom: f64,
+    /// Share of the ground, 0 to 1, where tunnels break through the top, in patches a few
+    /// bends across. On a sea floor they are underwater caves.
+    pub openings: f64,
 }
 
 impl CaveDesc {
@@ -62,7 +65,13 @@ impl CaveDesc {
             width: 0.1,
             top: 4.0,
             bottom: 200.0,
+            openings: 0.0,
         }
+    }
+
+    /// The same caves breaking through the top on `openings` of the ground.
+    pub fn with_openings(self, openings: f64) -> Self {
+        Self { openings, ..self }
     }
 
     fn is_valid(&self) -> bool {
@@ -74,6 +83,7 @@ impl CaveDesc {
             && self.top >= 0.0
             && self.bottom.is_finite()
             && self.bottom > self.top
+            && (0.0..=1.0).contains(&self.openings)
     }
 }
 
@@ -114,8 +124,18 @@ impl PlanetDesc {
         // per meter each noise changes at most 2 * 1.875 * sqrt(3) over a cell of `scale`
         let per_meter = 2.0 * 1.875 * 3.0_f64.sqrt() / caves.scale;
         let tunnel = (a.abs().max(b.abs()) - caves.width) / per_meter;
-        // closed above `top` and below `bottom`
-        Some(tunnel.max(caves.top - depth).max(depth - caves.bottom))
+        // closed above `top` and below `bottom`, `top` lifting past the ground in open patches
+        let mut top = caves.top - depth;
+        if caves.openings > 0.0 {
+            let patch = 4.0 * caves.scale;
+            let c = value_noise(at / patch, self.seed.wrapping_add(0x3c6e));
+            let open = ((c - (1.0 - 2.0 * caves.openings)) / OPEN_EDGE).clamp(0.0, 1.0);
+            let lift = caves.top + OPEN_ABOVE;
+            // the lift's own change per meter keeps the bound a bound
+            let steep = 1.0 + lift / OPEN_EDGE * 2.0 * 1.875 * 3.0_f64.sqrt() / patch;
+            top = (top - open * lift) / steep;
+        }
+        Some(tunnel.max(top).max(depth - caves.bottom))
     }
 
     /// Most the ground rises per meter across it. Each octave's value noise changes by at most 2
@@ -361,6 +381,11 @@ fn fade(t: f64) -> f64 {
 }
 
 /// In -1 to 1, smooth, the same on every machine.
+/// Noise span over which a cave opening goes from shut to open.
+const OPEN_EDGE: f64 = 0.25;
+/// Meters above the ground an open patch lifts the cave's top, so tunnels cut through.
+const OPEN_ABOVE: f64 = 2.0;
+
 fn value_noise(at: DVec3, seed: u32) -> f64 {
     let floor = DVec3::new(at.x.floor(), at.y.floor(), at.z.floor());
     let (ix, iy, iz) = (floor.x as i64, floor.y as i64, floor.z as i64);

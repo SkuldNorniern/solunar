@@ -513,6 +513,41 @@ mod tests {
     }
 
     #[test]
+    fn open_caves_break_through_the_top_and_shut_ones_never() {
+        let near_top = |openings: f64| {
+            let caves = crate::CaveDesc::tunnels().with_openings(openings);
+            let planet = Planet::new(PlanetDesc::earth(3).with_caves(caves)).unwrap();
+            let anchor = planet.surface(DVec3::new(0.3, 0.8, 0.5));
+            let level = level_for(&planet, 2.5);
+            let ground = PlanetGround::new(planet, anchor, level).unwrap();
+            let surface = ground.ground_under(DVec3::ZERO);
+            let desc = ground
+                .sdf_desc(
+                    surface - DVec3::Y * 4.0,
+                    32.0,
+                    (1.0, 8),
+                    Material::default(),
+                )
+                .unwrap();
+            let volume = crate::SdfVolume::new(desc).unwrap();
+            let corner = desc.origin.to_dvec3();
+            let mut open = 0;
+            for x in 2..62 {
+                for z in 2..62 {
+                    let column = corner + DVec3::new(f64::from(x), 0.0, f64::from(z));
+                    let world = ground.ground_under(column) - DVec3::Y;
+                    if volume.distance((world - corner).as_vec3()) > 0.0 {
+                        open += 1;
+                    }
+                }
+            }
+            open
+        };
+        assert_eq!(near_top(0.0), 0);
+        assert!(near_top(1.0) > 0);
+    }
+
+    #[test]
     fn a_box_keeps_its_turn_through_the_planet() {
         let first = ground(DVec3::new(0.3, 0.8, 0.5));
         let second = ground(DVec3::new(0.31, 0.8, 0.49));
