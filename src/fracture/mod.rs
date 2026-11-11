@@ -143,7 +143,9 @@ impl BreakableDesc {
         seed: u64,
     ) -> Result<Self, PhysicsError> {
         let volume = 8.0 * half.x * half.y * half.z;
-        let cells = ((volume * kind.pieces_per_cubic_meter).round() as usize)
+        // cut coarse, an eighth of the material's pieces; a piece cracks on down to the
+        // material's own size only where a hit lands
+        let cells = ((volume * kind.pieces_per_cubic_meter / COARSE).round() as usize)
             .clamp(kind.fewest_pieces, MAX_CELLS);
         let longest = if half.x >= half.y && half.x >= half.z {
             Vec3::X
@@ -167,10 +169,14 @@ impl BreakableDesc {
                 axis: longest,
                 split: kind.grain_split,
             }),
+            smallest_piece: 1.0 / kind.pieces_per_cubic_meter,
             ..Self::new(pattern, position)
         })
     }
 }
+
+/// How much coarser `BreakableDesc::of` cuts than the material breaks.
+const COARSE: f32 = 8.0;
 
 /// How a material breaks, game scale: strengths are tuned so a 190 kg steel ball at 32 m/s
 /// breaks a 24 cm concrete wall, not measured tensile strengths.
