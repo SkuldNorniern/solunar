@@ -25,7 +25,7 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 36] = [
+const SUITES: [(&str, Suite); 37] = [
     ("pile", pile),
     ("rubble", rubble),
     ("ropes", ropes),
@@ -34,6 +34,7 @@ const SUITES: [(&str, Suite); 36] = [
     ("sleep-rays", sleep_rays),
     ("moving-rays", moving_rays),
     ("fracture", fracture_wall),
+    ("shatter", shatter),
     ("gallery", gallery),
     ("gallery-debris", gallery_debris),
     ("ship", ship),
@@ -874,6 +875,54 @@ fn sleep_rays() -> Result<Outcome> {
 
 /// A fixed concrete wall of 60 voronoi pieces on a floor, a steel ball at 32 m/s into it every
 /// second at a new spot, 300 steps. Times are whole steps, the splits in them.
+/// One big break: a 1.6 m boulder of 256 glass pieces standing on its bottom ones, cracks
+/// running on, hit by a fast steel ball. Every step for 2 s from the hit, the split ones are the cost of breaking.
+fn shatter() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 30.0)?;
+    let pattern = voronoi_box(Vec3::splat(0.8), 256, 11)?;
+    let target = world.add_breakable(BreakableDesc {
+        fixed: true,
+        strength: 4.0e4,
+        crack_spread: 0.6,
+        material: Material {
+            density: 2500.0,
+            ..Material::default()
+        },
+        ..BreakableDesc::new(
+            pattern,
+            GridPosition::from_local(Vec3::new(0.0, 0.8, 0.0)).ok_or(PhysicsError::OutOfRange)?,
+        )
+    })?;
+    world.spawn(
+        RigidBodyDesc::dynamic(Shape::sphere(0.2))
+            .density(7800.0)
+            .local_position(Vec3::new(0.1, 0.9, -2.0))
+            .linear_velocity(Vec3::new(0.0, 0.0, 40.0)),
+    )?;
+    let (mut times, mut splits) = (Vec::with_capacity(240), Vec::new());
+    for _ in 0..240 {
+        times.extend(steps(&mut world, 1)?);
+        if !world.fracture_events().is_empty() {
+            splits.push((times[times.len() - 1], world.fracture_events().len()));
+        }
+    }
+    splits.sort_unstable();
+    let (worst, parts) = splits
+        .last()
+        .map_or((0.0, 0), |(time, count)| (time.as_secs_f64() * 1e3, *count));
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!(
+            "{} parts, {} steps split, slowest {worst:.2} ms making {parts} bodies",
+            world.breakable_bodies(target).len(),
+            splits.len()
+        ),
+    })
+}
+
 fn fracture_wall() -> Result<Outcome> {
     let mut world = world()?;
     ground(&mut world, 30.0)?;
