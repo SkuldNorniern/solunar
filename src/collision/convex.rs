@@ -64,6 +64,102 @@ fn pair_edges(face_starts: &[u32], face_corners: &[u32]) -> Vec<EdgeFaces> {
     paired
 }
 
+/// The faces, each a normal and its corners in order round it, counter clockwise from outside,
+/// as indexes into `points`. A face is the points within the band of a supporting plane; two
+/// planes facing the same way whose points share three or more are one face a hair apart and
+/// become one, so no sliver face overlaps its neighbour and none is lost.
+fn face_rings(points: &[Vec3], planes: &[(Vec3, f32)], tolerance: f32) -> Vec<(Vec3, Vec<usize>)> {
+    let band = tolerance * 4.0;
+    let mut groups: Vec<(Vec3, Vec<usize>)> = planes
+        .iter()
+        .filter_map(|(normal, offset)| {
+            let set: Vec<usize> = (0..points.len())
+                .filter(|i| (normal.dot(points[*i]) - offset).abs() <= band)
+                .collect();
+            (set.len() >= 3).then_some((*normal, set))
+        })
+        .collect();
+    let shared = |a: &[usize], b: &[usize]| a.iter().filter(|i| b.binary_search(i).is_ok()).count();
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'outer: for a in 0..groups.len() {
+            for b in a + 1..groups.len() {
+                // three points on one edge are no plane: the same face also faces the same way
+                if groups[a].0.dot(groups[b].0) > 1.0 - 1e-3
+                    && shared(&groups[a].1, &groups[b].1) >= 3
+                {
+                    let (keep, gone) = if groups[a].1.len() >= groups[b].1.len() {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    let mut set = groups[gone].1.clone();
+                    set.extend_from_slice(&groups[keep].1);
+                    set.sort_unstable();
+                    set.dedup();
+                    groups[keep].1 = set;
+                    groups.remove(gone);
+                    merged = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(normal, set)| {
+            let ring = convex_ring(points, &set, normal);
+            (ring.len() >= 3).then_some((normal, ring))
+        })
+        .collect()
+}
+
+/// The corners of `set` as a convex ring in the plane of `normal`, counter clockwise seen from
+/// outside, points along a side left out.
+fn convex_ring(points: &[Vec3], set: &[usize], normal: Vec3) -> Vec<usize> {
+    let across = if normal.x.abs() < 0.9 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let u = normal.cross(across).normalize();
+    let v = normal.cross(u);
+    let mut flat: Vec<(f32, f32, usize)> = set
+        .iter()
+        .map(|i| (points[*i].dot(u), points[*i].dot(v), *i))
+        .collect();
+    flat.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let turn = |o: &(f32, f32, usize), a: &(f32, f32, usize), b: &(f32, f32, usize)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    // the size of the face sets what counts as a turn, so points along a side drop out
+    let size = flat
+        .iter()
+        .fold(0.0_f32, |most, p| most.max(p.0.abs()).max(p.1.abs()))
+        .max(1e-6);
+    let straight = size * size * 1e-6;
+    let mut hull: Vec<(f32, f32, usize)> = Vec::with_capacity(flat.len() * 2);
+    for pass in 0..2 {
+        let start = hull.len();
+        let order: Vec<&(f32, f32, usize)> = if pass == 0 {
+            flat.iter().collect()
+        } else {
+            flat.iter().rev().collect()
+        };
+        for point in order {
+            while hull.len() >= start + 2
+                && turn(&hull[hull.len() - 2], &hull[hull.len() - 1], point) <= straight
+            {
+                hull.pop();
+            }
+            hull.push(*point);
+        }
+        hull.pop();
+    }
+    hull.into_iter().map(|p| p.2).collect()
+}
+
 /// Every plane through three points with all points on one side is a face.
 /// Quartic in the point count, the cap keeps it small and it only runs when a shape is added.
 fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
@@ -125,66 +221,24 @@ fn build_hull(points: &[Vec3]) -> Result<RawHull, PhysicsError> {
         return Err(PhysicsError::InvalidShape);
     }
     let mut vertices: Vec<Vec3> = Vec::new();
+    let mut vertex_of = vec![u32::MAX; unique.len()];
     let mut face_starts = vec![0];
     let mut face_corners: Vec<u32> = Vec::new();
     let mut edges: Vec<Vec3> = Vec::new();
     let mut faces: Vec<(Vec3, f32)> = Vec::with_capacity(planes.len());
-    for (normal, offset) in &planes {
-        let mut corners: Vec<Vec3> = unique
+    for (normal, ring) in face_rings(&unique, &planes, tolerance) {
+        let offset = ring
             .iter()
-            .filter(|point| (normal.dot(**point) - offset).abs() <= tolerance * 4.0)
-            .copied()
-            .collect();
-        if corners.len() < 3 {
-            continue;
-        }
-        let middle = corners.iter().fold(Vec3::ZERO, |sum, point| sum + *point)
-            * (corners.len() as f32).recip();
-        let across = (corners[0] - middle).normalize();
-        let up = normal.cross(across);
-        corners.sort_by(|a, b| {
-            let angle = |point: &Vec3| {
-                (*point - middle)
-                    .dot(up)
-                    .atan2((*point - middle).dot(across))
-            };
-            angle(a).total_cmp(&angle(b))
-        });
-        // points on an edge between two corners are not corners
-        let count = corners.len();
-        let kept: Vec<Vec3> = (0..count)
-            .filter(|at| {
-                let (before, here, after) = (
-                    corners[(at + count - 1) % count],
-                    corners[*at],
-                    corners[(at + 1) % count],
-                );
-                (here - before)
-                    .normalize()
-                    .cross((after - here).normalize())
-                    .dot(*normal)
-                    > 1e-4
-            })
-            .map(|at| corners[at])
-            .collect();
-        // a sliver plane a hair off a real face keeps no corners of its own
-        if kept.len() < 3 {
-            continue;
-        }
-        faces.push((*normal, *offset));
-        for (at, corner) in kept.iter().enumerate() {
-            let index = match vertices
-                .iter()
-                .position(|known| (*known - *corner).length() <= tolerance)
-            {
-                Some(index) => index,
-                None => {
-                    vertices.push(*corner);
-                    vertices.len() - 1
-                }
-            };
-            face_corners.push(index as u32);
-            let along = (kept[(at + 1) % kept.len()] - *corner).normalize();
+            .map(|i| normal.dot(unique[*i]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        faces.push((normal, offset));
+        for (at, &point) in ring.iter().enumerate() {
+            if vertex_of[point] == u32::MAX {
+                vertex_of[point] = vertices.len() as u32;
+                vertices.push(unique[point]);
+            }
+            face_corners.push(vertex_of[point]);
+            let along = (unique[ring[(at + 1) % ring.len()]] - unique[point]).normalize();
             if !edges
                 .iter()
                 .any(|known| known.dot(along).abs() > 1.0 - 1e-5)
@@ -868,6 +922,28 @@ pub(crate) fn poly_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voronoi_pieces_close_into_hulls() {
+        let (mut open, mut total) = (0, 0);
+        for seed in 0..8u64 {
+            let pattern = crate::voronoi_box(Vec3::splat(2.0), 200, seed).unwrap();
+            for piece in &pattern.pieces {
+                let middle =
+                    piece.points.iter().fold(Vec3::ZERO, |s, p| s + *p) / piece.points.len() as f32;
+                let local: Vec<Vec3> = piece.points.iter().map(|p| *p - middle).collect();
+                let Ok(hull) = build_hull(&local) else {
+                    continue;
+                };
+                total += 1;
+                if hull.edge_faces.is_empty() {
+                    open += 1;
+                }
+            }
+        }
+        assert!(total > 1000);
+        assert!(open * 50 < total, "{open} of {total} open");
+    }
 
     #[test]
     fn near_flat_point_sets_give_a_hull_or_an_error_never_a_panic() {
