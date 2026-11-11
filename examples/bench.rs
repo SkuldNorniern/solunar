@@ -25,9 +25,10 @@ struct Outcome {
 
 type Suite = fn() -> Result<Outcome>;
 
-const SUITES: [(&str, Suite); 35] = [
+const SUITES: [(&str, Suite); 36] = [
     ("pile", pile),
     ("rubble", rubble),
+    ("ropes", ropes),
     ("delta", delta),
     ("sleepers", sleepers),
     ("sleep-rays", sleep_rays),
@@ -566,6 +567,43 @@ fn delta() -> Result<Outcome> {
             mean(&still) / 1024,
             world.sleeping_body_count(),
         ),
+    })
+}
+
+/// 100 ropes of 32 segments, each held at one end, falling across a row of boxes and lying
+/// over them. Steps 61 to 360.
+fn ropes() -> Result<Outcome> {
+    let mut world = world()?;
+    ground(&mut world, 60.0)?;
+    for row in 0..10 {
+        world.spawn(
+            RigidBodyDesc::fixed(Shape::cuboid(Vec3::new(12.0, 0.5, 0.5)))
+                .local_position(Vec3::new(0.0, 2.0, row as f32 * 2.0)),
+        )?;
+    }
+    let mut ropes = Vec::new();
+    for i in 0..100 {
+        let (x, z) = ((i % 10) as f64 * 2.0 - 9.0, (i / 10) as f64 * 2.0);
+        let top = GridPosition::from_dvec3(DVec3::new(x, 4.0, z - 0.8))
+            .ok_or(PhysicsError::OutOfRange)?;
+        let end = GridPosition::from_dvec3(DVec3::new(x, 4.0, z + 1.6))
+            .ok_or(PhysicsError::OutOfRange)?;
+        let mut desc = solunar::RopeDesc::new(top, end, 32);
+        desc.ends[0] = solunar::RopeEnd::Fixed(top);
+        ropes.push(world.add_rope(desc)?);
+    }
+    steps(&mut world, 60)?;
+    let times = steps(&mut world, 300)?;
+    let most = ropes
+        .iter()
+        .filter_map(|rope| world.rope_tension(*rope).ok())
+        .flat_map(|t| t.iter().copied())
+        .fold(0.0_f32, f32::max);
+    Ok(Outcome {
+        bodies: world.body_count(),
+        times,
+        unit: "ms",
+        check: format!("100 ropes, 3300 points, most tension {most:.1} n"),
     })
 }
 

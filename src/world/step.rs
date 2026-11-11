@@ -226,6 +226,7 @@ impl PhysicsWorld {
         self.update_sensors()?;
         self.update_breakables()?;
         self.update_structures()?;
+        self.step_ropes(dt)?;
         lap(&mut phases.finish);
         self.phases = phases;
         self.times.record(started.elapsed());

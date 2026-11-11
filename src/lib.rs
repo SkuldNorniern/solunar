@@ -24,6 +24,7 @@ mod park;
 mod planet;
 mod position;
 mod profile;
+mod rope;
 mod sdf;
 mod sensor;
 mod shape;
@@ -79,6 +80,7 @@ pub use planet::{
 };
 pub use position::{CELL_SIZE, GridPosition};
 pub use profile::{PhaseTimes, StepReport};
+pub use rope::{MAX_SEGMENTS, RopeDesc, RopeEnd, RopeHandle};
 pub use sdf::{
     Base, BrickJob, BrickKey, BrickMesh, BrickSamples, BuiltBricks, CpuEdits, Dig, Edit, EditId,
     EditOp, EditReport, EditShape, EditSpan, GROUND_LAYER, PreparedTerrain, SdfCompute, SdfDesc,
