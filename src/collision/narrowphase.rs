@@ -47,10 +47,11 @@ impl RawManifold {
 
     /// Keeps at most four of `points`: the deepest and the widest spread around it.
     pub(crate) fn reduce_points(&mut self, points: &[RawPoint]) {
-        reduce(points, self);
+        reduce(points, self, Vec3::ZERO);
     }
 
-    pub(crate) fn reduce_from(&mut self, kept: &[(Vec3, f32)]) {
+    /// `along` is a direction fixed to the reference face, so the same corners win each step.
+    pub(crate) fn reduce_from(&mut self, kept: &[(Vec3, f32)], along: Vec3) {
         let mut points = [RawPoint {
             position: Vec3::ZERO,
             depth: 0.0,
@@ -62,7 +63,7 @@ impl RawManifold {
                 depth: *depth,
             };
         }
-        reduce(&points[..count], self);
+        reduce(&points[..count], self, along);
     }
 }
 
@@ -562,7 +563,7 @@ fn face_contact(
             kept_count += 1;
         }
     }
-    reduce(&kept[..kept_count], &mut result);
+    reduce(&kept[..kept_count], &mut result, Vec3::ZERO);
     result
 }
 
@@ -590,8 +591,13 @@ fn clip(polygon: &mut [Vec3; MAX_CLIP_POINTS], count: usize, axis: Vec3, limit: 
     out
 }
 
-/// Deepest point, the one furthest from it, then the largest triangles on each side.
-fn reduce(points: &[RawPoint], result: &mut RawManifold) {
+/// Deeper than the farthest corner along the face by this, meters, the deepest point goes first.
+const DEEPER: f32 = 2e-3;
+
+/// The farthest point along `along` (or the deepest, if clearly deeper), the one furthest from
+/// it, then the largest triangles on each side. Picking by depth alone, a face resting flat
+/// changed its whole set at every wobble and the warm start was lost.
+fn reduce(points: &[RawPoint], result: &mut RawManifold, along: Vec3) {
     if points.len() <= MAX_CONTACTS {
         for point in points {
             result.push(point.position, point.depth);
@@ -610,7 +616,17 @@ fn reduce(points: &[RawPoint], result: &mut RawManifold) {
         }
         best
     };
-    let first = pick(&|point| point.depth);
+    let deepest = pick(&|point| point.depth);
+    let first = if along == Vec3::ZERO {
+        deepest
+    } else {
+        let out = pick(&|point| point.position.dot(along));
+        if deepest.depth > out.depth + DEEPER {
+            deepest
+        } else {
+            out
+        }
+    };
     let second = pick(&|point| (point.position - first.position).length_squared());
     let span = second.position - first.position;
     let area = |point: &RawPoint| {

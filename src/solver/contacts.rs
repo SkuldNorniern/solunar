@@ -27,6 +27,8 @@ const FAST_TURN: f32 = 0.2;
 const REUSE_DISTANCE_SQUARED: f32 = 0.0002 * 0.0002;
 /// The same for turning: the cosine of half of 0.1 degree.
 const REUSE_HALF_TURN_COS: f32 = 0.999_999_6;
+/// Normals this close keep their friction when a manifold's points move on.
+const SAME_NORMAL_COS: f32 = 0.9999;
 
 /// Pairs in one job of contact finding. Fixed, so the output does not depend on the thread count.
 const PAIR_CHUNK: usize = 128;
@@ -799,6 +801,7 @@ fn contact_manifold(
         .map(|at| &cache[at]);
 
     let normal = raw.normal;
+    let normal_a = bodies.rotation[a].conjugate().rotate_vec3(normal);
     let (manifold, contact) = new_manifold(
         bodies,
         (a, b),
@@ -841,7 +844,45 @@ fn contact_manifold(
             pushed: 0.0,
         });
     }
+    if let Some(old) = old {
+        spread_unclaimed(old, (&claimed, normal_a), &mut points[manifold.first..]);
+    }
     manifold
+}
+
+/// The load of old points that found no new one goes to the new points that found no old one.
+/// A piece on a mesh sees its points jump from one corner to the next as it settles, starting
+/// those from nothing lost what held it up and the heap above sank a little every step.
+fn spread_unclaimed(
+    old: &CachedManifold,
+    (claimed, normal_a): (&[bool; MAX_CONTACTS], Vec3),
+    points: &mut [SolverPoint],
+) {
+    let mut left: Vec3 = old.points[..old.count]
+        .iter()
+        .zip(claimed)
+        .filter(|(_, claimed)| !**claimed)
+        .map(|(point, _)| point.impulse)
+        .fold(Vec3::ZERO, |sum, impulse| sum + impulse);
+    let fresh = points
+        .iter()
+        .filter(|point| point.impulse == Vec3::ZERO)
+        .count();
+    if left.x <= 0.0 || fresh == 0 {
+        return;
+    }
+    // friction only along the same tangents, a turned normal starts it over
+    if old.normal == Vec3::ZERO || old.normal.dot(normal_a) < SAME_NORMAL_COS {
+        left.y = 0.0;
+        left.z = 0.0;
+    }
+    let share = left / fresh as f32;
+    for point in points
+        .iter_mut()
+        .filter(|point| point.impulse == Vec3::ZERO)
+    {
+        point.impulse = share;
+    }
 }
 
 /// Each old point goes to one new point, two sharing it would double its load.

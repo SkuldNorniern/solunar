@@ -705,7 +705,9 @@ fn face_contact(
     }
     let normal = if flip { -outward } else { outward };
     let mut result = RawManifold::new(normal);
-    result.reduce_from(&kept[..kept_count]);
+    let along = reference.vertices()[corners[1 % corners.len()] as usize]
+        - reference.vertices()[corners[0] as usize];
+    result.reduce_from(&kept[..kept_count], along);
     result.filled()
 }
 
@@ -922,6 +924,60 @@ pub(crate) fn poly_rounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rock_heap_on_hills_goes_to_sleep() {
+        use crate::{Base, SdfDesc, SdfTerrain};
+        let mut world = world();
+        SdfTerrain::new(
+            &mut world,
+            SdfDesc {
+                origin: crate::GridPosition::ORIGIN,
+                voxel: 0.5,
+                brick_cells: 16,
+                bricks: [1, 1, 1],
+                base: Base::Hills {
+                    seed: 5,
+                    height: 2.0,
+                    amplitude: 1.0,
+                    wavelength: 6.0,
+                    octaves: 2,
+                },
+                material: crate::Material::default(),
+            },
+        )
+        .unwrap();
+        let pattern = crate::voronoi_box(Vec3::splat(1.0), 40, 9).unwrap();
+        let mut pieces = Vec::new();
+        for piece in &pattern.pieces {
+            let middle =
+                piece.points.iter().fold(Vec3::ZERO, |s, p| s + *p) / piece.points.len() as f32;
+            let local: Vec<Vec3> = piece.points.iter().map(|p| (*p - middle) * 0.9).collect();
+            let info = world.add_convex(&local).unwrap();
+            let (place, turn) =
+                info.placed(Vec3::new(4.0, 5.0, 4.0) + middle * 1.1, Quat::IDENTITY);
+            pieces.push(
+                world
+                    .spawn(
+                        RigidBodyDesc::dynamic(info.shape)
+                            .density(2700.0)
+                            .local_position(place)
+                            .rotation(turn),
+                    )
+                    .unwrap(),
+            );
+        }
+        // it slumped and rocked for over a minute: points jumping on the mesh dropped their load,
+        // and small pieces rocking in place counted as turning
+        for _ in 0..60 * 30 {
+            world.step_fixed().unwrap();
+        }
+        let awake = pieces
+            .iter()
+            .filter(|p| !world.bodies.asleep[world.bodies.dense_index(**p).unwrap()])
+            .count();
+        assert_eq!(awake, 0);
+    }
 
     #[test]
     fn voronoi_pieces_close_into_hulls() {

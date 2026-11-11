@@ -818,7 +818,7 @@ pub(crate) fn poly_triangle(
                 count += 1;
             }
         }
-        result.reduce_from(&kept[..count]);
+        result.reduce_from(&kept[..count], triangle[1] - triangle[0]);
     }
     if result.count == 0 {
         // edge against edge, or no corner over the triangle: one point between the closest parts

@@ -50,6 +50,17 @@ pub(crate) fn is_slow(linear: Vec3, angular: Vec3) -> bool {
         && angular.length_squared() < SLEEP_ANGULAR_SQUARED
 }
 
+/// Slow by how fast its farthest point moves, as box2d does: a small piece rocking in place
+/// rests, a long one turning slowly does not.
+pub(crate) fn is_resting(bodies: &Bodies, dense: usize, (linear, angular): (Vec3, Vec3)) -> bool {
+    let reach = bodies.assets.bounding_radius(&bodies.shape[dense]);
+    if !reach.is_finite() {
+        return is_slow(linear, angular);
+    }
+    let edge = angular.length() * reach;
+    linear.length_squared() < SLEEP_LINEAR_SQUARED && edge * edge < SLEEP_LINEAR_SQUARED
+}
+
 fn is_moving(bodies: &Bodies, awake: &[bool], dense: usize) -> bool {
     match bodies.kind[dense] {
         BodyKind::Dynamic => awake[dense],
@@ -210,7 +221,8 @@ pub(crate) fn update_sleep(
         if bodies.kind[dense] != BodyKind::Dynamic || bodies.asleep[dense] {
             continue;
         }
-        let slow = bodies.can_sleep[dense] && is_slow(bodies.linear[dense], bodies.angular[dense]);
+        let slow = bodies.can_sleep[dense]
+            && is_resting(bodies, dense, (bodies.linear[dense], bodies.angular[dense]));
         bodies.still_time[dense] = if slow {
             (bodies.still_time[dense] + dt).min(SLEEP_TIME)
         } else {
