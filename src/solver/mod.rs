@@ -248,7 +248,13 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    refresh_manifolds(bodies, state, scratch, (substep == 0, last), (dispatch, dt));
+    refresh_manifolds(
+        bodies,
+        state,
+        scratch,
+        (substep == 0, last, false),
+        (dispatch, dt),
+    );
     color_constraints(bodies, scratch);
     factor_islands(bodies, scratch);
     scratch.motions.clear();
@@ -266,7 +272,7 @@ pub(crate) fn solve_substep(
         Shared::new(&mut scratch.manifolds),
         Shared::new(&mut scratch.points),
     );
-    plan_stages(&mut scratch.colors, substep);
+    plan_stages(&mut scratch.colors, substep, false);
     let colors = &scratch.colors;
     let direct = (
         scratch.factors.as_slice(),
@@ -293,8 +299,56 @@ pub(crate) fn solve_substep(
         &scratch.joint_rows,
         &mut scratch.joint_loads,
     );
+}
+
+/// The contacts once more after the bodies moved, without their soft push out, so the speed
+/// the push gave is taken back before the next substep (box2d's relax). Velocities only.
+pub(crate) fn relax_substep(
+    bodies: &Bodies,
+    state: &mut [Integrated],
+    scratch: &mut ContactScratch,
+    (substep, dispatch, dt): (u32, &dyn JobDispatch, f32),
+) {
+    if scratch.manifolds.is_empty() {
+        return;
+    }
+    // gaps, and for fast turning bodies arms, where the bodies are now
+    refresh_manifolds(bodies, state, scratch, (false, false, true), (dispatch, dt));
+    scratch.motions.clear();
+    scratch.motions.extend(state.iter().map(|body| Motion {
+        linear: body.linear,
+        angular: body.angular,
+        recovery_linear: Vec3::ZERO,
+        recovery_angular: Vec3::ZERO,
+        touched: false,
+    }));
+    let shared = (
+        Shared::new(&mut scratch.motions),
+        Shared::new(&mut scratch.joint_points),
+        Shared::new(&mut scratch.joint_rows),
+        Shared::new(&mut scratch.manifolds),
+        Shared::new(&mut scratch.points),
+    );
+    plan_stages(&mut scratch.colors, substep, true);
+    let colors = &scratch.colors;
+    let direct = (
+        scratch.factors.as_slice(),
+        scratch.shapes.as_slice(),
+        scratch.direct_nodes.as_slice(),
+    );
+    run_stages(&colors.stages, dispatch, &|stage, block| {
+        solve_block(bodies, colors, direct, &shared, stage, block, substep);
+    });
+    // what the contacts took this substep, the relax counted
     for (frame, point) in scratch.frames.iter_mut().zip(&scratch.points) {
         frame.pushed += point.impulse.x.max(0.0);
+    }
+    for (body, motion) in state.iter_mut().zip(&scratch.motions) {
+        if motion.touched {
+            body.linear = motion.linear;
+            body.angular = motion.angular;
+            body.touched = true;
+        }
     }
 }
 
@@ -492,13 +546,14 @@ mod tests {
                         .linear_velocity(way * 500.0),
                 )
                 .unwrap();
-            // into the face no more than the 5 mm the solver lets things rest in. it went 8 to
-            // 11 cm in and out the back, its contact point carried round by its spin
+            // into the face no more than the 1 cm the soft rows hold. it went 8 to 11 cm in and
+            // out the back, its contact point carried round by its spin
             let deepest = furthest(&mut world, body, 4);
-            assert!(deepest <= 9.975 - 0.05 + 5e-3, "{shape:?} {deepest}");
+            assert!(deepest <= 9.975 - 0.05 + 0.01, "{shape:?} {deepest}");
             let state = world.body_state(body).unwrap();
             assert!(state.linear_velocity.z > 300.0, "{shape:?} {state:?}");
-            assert!(state.linear_velocity.x.abs() < 1.0, "{shape:?} {state:?}");
+            // the soft rows push the 7 mm a spinning capsule sinks back out at about 2 m/s
+            assert!(state.linear_velocity.x.abs() < 3.0, "{shape:?} {state:?}");
             assert!(
                 state.angular_velocity.length() > 1000.0,
                 "{shape:?} {state:?}"

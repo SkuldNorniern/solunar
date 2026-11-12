@@ -186,6 +186,10 @@ pub(crate) struct Bodies {
     pub(crate) asleep: Vec<bool>,
     pub(crate) can_sleep: Vec<bool>,
     pub(crate) still_time: Vec<f32>,
+    /// Where and how the body stood when `still_time` started counting.
+    pub(crate) rest: Vec<(GridPosition, Quat)>,
+    /// How long the body's island has been nearly all at rest, see `sleep::settle`.
+    pub(crate) settle_time: Vec<f32>,
     pub(crate) assets: ShapeAssets,
     pub(crate) tree: TreeCache,
 }
@@ -222,6 +226,7 @@ impl Bodies {
     pub(crate) fn wake(&mut self, dense: usize) {
         self.asleep[dense] = false;
         self.still_time[dense] = 0.0;
+        self.settle_time[dense] = 0.0;
     }
 
     /// Desc must be validated by the caller.
@@ -277,6 +282,8 @@ impl Bodies {
         self.asleep.push(false);
         self.can_sleep.push(desc.can_sleep);
         self.still_time.push(0.0);
+        self.rest.push((desc.position, desc.rotation));
+        self.settle_time.push(0.0);
         Ok(BodyHandle { index, generation })
     }
 
@@ -303,6 +310,8 @@ impl Bodies {
         self.asleep.swap_remove(dense);
         self.can_sleep.swap_remove(dense);
         self.still_time.swap_remove(dense);
+        self.rest.swap_remove(dense);
+        self.settle_time.swap_remove(dense);
         if let Some(moved) = self.owner.get(dense) {
             self.slots[*moved as usize].dense = dense as u32;
         }

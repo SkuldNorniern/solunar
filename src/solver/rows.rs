@@ -77,14 +77,20 @@ fn slip_along(pair: &Pair, manifold: &SolverManifold, point: &SolverPoint, k: us
     speed_along(pair, &manifold.axes, point, k) + manifold.surface.dot(manifold.axes[k])
 }
 
+/// With `relax` the rows hold without their soft push out, which takes back the speed the
+/// push gave once the bodies moved (box2d's relax).
 pub(super) fn solve_manifold(
     pair: &mut Pair,
     manifold: &mut SolverManifold,
     points: &mut [SolverPoint],
+    relax: bool,
 ) {
     let (axes, inverse) = (&manifold.axes, manifold.inverse_mass);
     // friction first, so the normal impulse has the last word on penetration
     if let (Some(block), [one, two]) = (manifold.block, &mut *points)
+        && !relax
+        && one.impulse_scale == 0.0
+        && two.impulse_scale == 0.0
         && one.target.min(two.target) < -BLOCK_SPEED
     {
         solve_friction(pair, manifold, one);
@@ -92,12 +98,35 @@ pub(super) fn solve_manifold(
         solve_block(pair, (axes, inverse), &block, [one, two]);
     } else {
         for point in points.iter_mut() {
-            solve_friction(pair, manifold, point);
+            // the relax often takes a fast hit, friction after it so it sees that load
+            if !relax {
+                solve_friction(pair, manifold, point);
+            }
             let speed = speed_along(pair, axes, point, 0);
-            let next = (point.impulse.x + (point.target - speed) * point.mass.x).max(0.0);
+            let given = if relax {
+                (point.relax_target - speed) * point.mass.x
+            } else {
+                (point.target - speed) * point.mass.x * point.mass_scale
+                    - point.impulse.x * point.impulse_scale
+            };
+            let next = (point.impulse.x + given).max(0.0);
             let change = next - point.impulse.x;
             point.impulse.x = next;
             push(pair, (axes, inverse), point, 0, change);
+        }
+        if relax {
+            // friction after the hit, then the normal rows again so friction's turn opens no
+            // gap a fast body goes through
+            for point in points.iter_mut() {
+                solve_friction(pair, manifold, point);
+            }
+            for point in points.iter_mut() {
+                let speed = speed_along(pair, axes, point, 0);
+                let next = (point.impulse.x + (point.relax_target - speed) * point.mass.x).max(0.0);
+                let change = next - point.impulse.x;
+                point.impulse.x = next;
+                push(pair, (axes, inverse), point, 0, change);
+            }
         }
     }
     let load: f32 = points.iter().map(|point| point.impulse.x).sum();
@@ -157,7 +186,8 @@ fn solve_block(
     push(pair, parts, two, 0, x2 - old2);
 }
 
-/// Split impulse. Pushes overlapping bodies apart through position only, so it adds no energy.
+/// Split impulse for overlap past the soft rows' reach. Pushes the bodies apart through
+/// position only, so a deep overlap, as from a spawn or a fast hit, adds no energy.
 pub(super) fn solve_recovery(
     pair: &mut Pair,
     manifold: &SolverManifold,
@@ -166,6 +196,9 @@ pub(super) fn solve_recovery(
     let normal = manifold.axes[0];
     let [inverse_a, inverse_b] = manifold.inverse_mass;
     for point in points {
+        if point.recovery <= 0.0 && point.recovery_impulse <= 0.0 {
+            continue;
+        }
         let (a, b) = (&mut *pair.a, &mut *pair.b);
         let speed = (b.recovery_linear - a.recovery_linear).dot(normal)
             + b.recovery_angular.dot(point.arm_b[0])

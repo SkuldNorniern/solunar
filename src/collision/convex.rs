@@ -979,6 +979,80 @@ mod tests {
         assert_eq!(awake, 0);
     }
 
+    /// 800 voronoi rock pieces dropped as four shattered blocks on flat ground. slow, run with
+    /// `cargo test --release a_pile_of_800_rocks -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn a_pile_of_800_rocks_goes_to_sleep() {
+        use crate::{Base, SdfDesc, SdfTerrain};
+        let mut world = world();
+        SdfTerrain::new(
+            &mut world,
+            SdfDesc {
+                origin: crate::GridPosition::ORIGIN,
+                voxel: 0.5,
+                brick_cells: 16,
+                bricks: [2, 1, 2],
+                base: Base::Plane { height: 2.0 },
+                material: crate::Material::default(),
+            },
+        )
+        .unwrap();
+        let mut pieces = Vec::new();
+        for block in 0..4_u64 {
+            let pattern = crate::voronoi_box(Vec3::splat(1.5), 200, 9 + block).unwrap();
+            let shift = Vec3::new((block % 2) as f32 * 3.4, 0.0, (block / 2) as f32 * 3.4);
+            for piece in &pattern.pieces {
+                let middle =
+                    piece.points.iter().fold(Vec3::ZERO, |s, p| s + *p) / piece.points.len() as f32;
+                let local: Vec<Vec3> = piece.points.iter().map(|p| (*p - middle) * 0.9).collect();
+                let Ok(info) = world.add_convex(&local) else {
+                    continue;
+                };
+                let (place, turn) = info.placed(
+                    Vec3::new(6.0, 5.0, 6.0) + shift + middle * 1.1,
+                    Quat::IDENTITY,
+                );
+                pieces.push(
+                    world
+                        .spawn(
+                            RigidBodyDesc::dynamic(info.shape)
+                                .density(2700.0)
+                                .local_position(place)
+                                .rotation(turn),
+                        )
+                        .unwrap(),
+                );
+            }
+        }
+        let mut times = Vec::new();
+        let mut slept = None;
+        for step in 0..60 * 30 {
+            let start = std::time::Instant::now();
+            world.step_fixed().unwrap();
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            let awake = pieces
+                .iter()
+                .filter(|p| !world.bodies.asleep[world.bodies.dense_index(**p).unwrap()])
+                .count();
+            if awake == 0 {
+                slept = Some(step as f32 / 60.0);
+                break;
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let at = |share: f64| times[((times.len() - 1) as f64 * share) as usize];
+        println!(
+            "{} pieces asleep at {slept:?} s, step ms p50 {:.2} p95 {:.2} p99 {:.2} max {:.2}",
+            pieces.len(),
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            at(1.0)
+        );
+        assert!(slept.is_some());
+    }
+
     #[test]
     fn voronoi_pieces_close_into_hulls() {
         let (mut open, mut total) = (0, 0);

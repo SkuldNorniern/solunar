@@ -364,6 +364,15 @@ fn read_body(
     if !still_time.is_finite() || still_time < 0.0 {
         return Err(SnapshotError::Invalid("body still time"));
     }
+    // older snapshots start the window where the body is
+    let (rest, settle_time) = if reader.version >= 21 {
+        ((reader.position()?, reader.unit_quat()?), reader.f32()?)
+    } else {
+        ((position, rotation), 0.0)
+    };
+    if !settle_time.is_finite() || settle_time < 0.0 {
+        return Err(SnapshotError::Invalid("body settle time"));
+    }
     // a sleeper is skipped by the step, so it must have nothing left to apply
     let at_rest = [linear, angular, momentum, force, torque]
         .iter()
@@ -408,6 +417,8 @@ fn read_body(
     bodies.asleep.push(asleep);
     bodies.can_sleep.push(can_sleep);
     bodies.still_time.push(still_time);
+    bodies.rest.push(rest);
+    bodies.settle_time.push(settle_time);
     Ok(())
 }
 

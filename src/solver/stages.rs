@@ -22,6 +22,7 @@ use super::{COLORED_ISLAND, COLORS, Motion, Pair};
 /// Per substep. Odd on purpose, 2 and 4 left stacks jittering far more than 3.
 const VELOCITY_ITERATIONS: usize = 3;
 const RECOVERY_ITERATIONS: usize = 1;
+const RELAX_ITERATIONS: usize = 1;
 
 /// Constraints in one block of work. A block is the smallest piece a thread takes.
 const COLOR_CHUNK: usize = if cfg!(miri) { 2 } else { 64 };
@@ -73,6 +74,7 @@ pub(super) struct Colors {
 pub(super) enum Stage {
     Islands {
         blocks: u32,
+        relax: bool,
     },
     /// The direct solve of each colored island with equality joints, one island a block.
     Direct {
@@ -92,7 +94,7 @@ pub(super) enum Stage {
 impl Stage {
     fn blocks(self) -> usize {
         match self {
-            Self::Islands { blocks }
+            Self::Islands { blocks, .. }
             | Self::Direct { blocks, .. }
             | Self::Colors { blocks, .. } => blocks as usize,
         }
@@ -410,12 +412,14 @@ unsafe fn solve_direct(
 }
 
 /// Small islands in one stage, then each pass of the colored solve, color by color.
-pub(super) fn plan_stages(colors: &mut Colors, substep: u32) {
+/// With `relax` only the relax sweeps, run after the bodies moved.
+pub(super) fn plan_stages(colors: &mut Colors, substep: u32, relax: bool) {
     let mut stages = std::mem::take(&mut colors.stages);
     stages.clear();
     if colors.runs.len() > 1 {
         stages.push(Stage::Islands {
             blocks: colors.runs.len() as u32 - 1,
+            relax,
         });
     }
     // runs of colors: a big one alone, small neighbours together in one block
@@ -451,13 +455,20 @@ pub(super) fn plan_stages(colors: &mut Colors, substep: u32) {
             groups.iter().for_each(&mut push);
         }
         // the joints after the rest, so they have the last word
-        if direct > 0 {
+        if direct > 0 && pass != Pass::Relax {
             stages.push(Stage::Direct {
                 pass,
                 blocks: direct,
             });
         }
     };
+    if relax {
+        for _ in 0..RELAX_ITERATIONS {
+            sweep(Pass::Relax, false);
+        }
+        colors.stages = stages;
+        return;
+    }
     sweep(Pass::WarmStart, false);
     // sweeping both ways keeps a stack from favoring one end, one way it rocks and never settles
     for iteration in 0..VELOCITY_ITERATIONS {
@@ -489,7 +500,7 @@ pub(super) fn solve_block(
     // right hand sides of direct solves, one buffer for the block
     let mut rhs = Vec::new();
     match stage {
-        Stage::Islands { .. } => {
+        Stage::Islands { relax, .. } => {
             let (first, last) = (colors.runs[block] as usize, colors.runs[block + 1] as usize);
             for index in first..last {
                 let start = if index == 0 {
@@ -498,6 +509,12 @@ pub(super) fn solve_block(
                     colors.serial_ends[index - 1]
                 };
                 let items = &colors.serial[start as usize..colors.serial_ends[index] as usize];
+                if relax {
+                    for _ in 0..RELAX_ITERATIONS {
+                        items.iter().for_each(|item| go(item, Pass::Relax));
+                    }
+                    continue;
+                }
                 let from = if index == 0 {
                     0
                 } else {
@@ -559,6 +576,7 @@ pub(super) fn solve_block(
                 Pass::Recovery => unsafe {
                     solve_direct(bodies, items, nodes, factor, shared, true, &mut rhs);
                 },
+                Pass::Relax => {}
             }
         }
         Stage::Colors {
@@ -678,6 +696,8 @@ pub(super) enum Pass {
     WarmStart,
     Velocity,
     Recovery,
+    /// Contacts again after the move, without their push out.
+    Relax,
 }
 
 type SharedParts<'a> = (
@@ -725,6 +745,7 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
                 Pass::WarmStart => warm_start_point(&mut pair, point),
                 Pass::Velocity => solve_point(&mut pair, point),
                 Pass::Recovery => solve_point_recovery(&mut pair, point),
+                Pass::Relax => {}
             }
         }
         Item::Row(index) => {
@@ -733,6 +754,7 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
                 Pass::WarmStart => warm_start_row(&mut pair, row),
                 Pass::Velocity => solve_row(&mut pair, row),
                 Pass::Recovery => solve_row_recovery(&mut pair, row),
+                Pass::Relax => {}
             }
         }
         Item::Manifold(index) => {
@@ -741,7 +763,8 @@ unsafe fn solve_item(bodies: &Bodies, item: Item, shared: &SharedParts<'_>, pass
             let points = unsafe { contacts.slice(manifold.first, manifold.count) };
             match pass {
                 Pass::WarmStart => warm_start(&mut pair, manifold, points),
-                Pass::Velocity => solve_manifold(&mut pair, manifold, points),
+                Pass::Velocity => solve_manifold(&mut pair, manifold, points, false),
+                Pass::Relax => solve_manifold(&mut pair, manifold, points, true),
                 Pass::Recovery => solve_recovery(&mut pair, manifold, points),
             }
         }

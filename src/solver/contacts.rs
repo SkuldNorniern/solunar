@@ -15,8 +15,16 @@ use super::rows::{dynamic_inverse_mass, relative_velocity, tangent_of};
 use super::stages::Colors;
 use super::{Motion, pair_margin, part_material, straight_motion};
 
+/// Overlap is pushed out by a spring this stiff, hertz, and this damped, as a ratio of
+/// critical (box2d's soft contact). Pushed through position alone it never pushed back on
+/// the speed, and a pile of 400 rocks crept and slumped for a minute.
+const CONTACT_HERTZ: f32 = 60.0;
+const CONTACT_DAMPING: f32 = 10.0;
+const MAX_PUSH_SPEED: f32 = 3.0;
+/// Overlap deeper than this, meters, goes out through position only, as before the soft rows:
+/// pushed out through speed a spawned overlap or a fast hit came out with more energy.
+const SOFT_REACH: f32 = 0.01;
 const RECOVERY_RATE: f32 = 0.2;
-const PENETRATION_SLOP: f32 = 0.005;
 const MAX_RECOVERY_SPEED: f32 = 3.0;
 const MATCH_DISTANCE_SQUARED: f32 = 0.05 * 0.05;
 /// A pair whose bodies moved less than this against each other since its contacts were found,
@@ -87,6 +95,15 @@ pub(super) struct SolverPoint {
     pub(super) turn_b: [Vec3; 3],
     pub(super) mass: Vec3,
     pub(super) target: f32,
+    /// Soft rows keep this share of their mass and give up this share of what they took, rigid
+    /// ones 1 and 0.
+    pub(super) mass_scale: f32,
+    pub(super) impulse_scale: f32,
+    /// What the relax pass holds the normal speed to, worked out after the bodies moved.
+    pub(super) relax_target: f32,
+    /// Bouncing this substep, the relax keeps the bounce.
+    pub(super) bouncing: bool,
+    /// Position only push speed for the overlap past `SOFT_REACH`, and what it took so far.
     pub(super) recovery: f32,
     pub(super) recovery_impulse: f32,
     pub(super) impulse: Vec3,
@@ -222,7 +239,7 @@ pub(super) fn refresh_manifolds(
     bodies: &Bodies,
     state: &[Integrated],
     scratch: &mut ContactScratch,
-    (first, last): (bool, bool),
+    (first, last, relax): (bool, bool, bool),
     (dispatch, dt): (&dyn JobDispatch, f32),
 ) {
     let manifolds = &mut scratch.manifolds;
@@ -235,7 +252,7 @@ pub(super) fn refresh_manifolds(
         for manifold in manifolds.iter_mut() {
             let range = manifold.first..manifold.first + manifold.count;
             let points = (&mut scratch.points[range.clone()], &scratch.frames[range]);
-            refresh_manifold(bodies, state, manifold, points, (first, last), dt);
+            refresh_manifold(bodies, state, manifold, points, (first, last, relax), dt);
         }
         return;
     }
@@ -271,7 +288,7 @@ pub(super) fn refresh_manifolds(
         for manifold in manifolds.iter_mut() {
             let range = manifold.first - base..manifold.first - base + manifold.count;
             let pair = (&mut points[range.clone()], &frames[range]);
-            refresh_manifold(bodies, state, manifold, pair, (first, last), dt);
+            refresh_manifold(bodies, state, manifold, pair, (first, last, relax), dt);
         }
         *done = true;
     };
@@ -290,10 +307,13 @@ fn refresh_manifold(
     state: &[Integrated],
     manifold: &mut SolverManifold,
     (points, frames): (&mut [SolverPoint], &[PointFrame]),
-    (first, last): (bool, bool),
+    (first, last, relax): (bool, bool, bool),
     dt: f32,
 ) {
     let (a, b) = (&state[manifold.a], &state[manifold.b]);
+    // against something that never moves twice as stiff, as box2d does
+    let fixed = manifold.inverse_mass[0] == 0.0 || manifold.inverse_mass[1] == 0.0;
+    let soft = soft_contact(dt, if fixed { 2.0 } else { 1.0 });
     // a body turning fast moves its arms a lot in a substep, kept from the first one a capsule
     // rolling at 1700 rad/s tumbled up to 38,000 and flew off
     let first = first || (a.angular.length() + b.angular.length()) * dt > FAST_TURN;
@@ -346,19 +366,40 @@ fn refresh_manifold(
             }
         }
         let gap = (center_b + offset_b - offset_a).dot(normal);
+        if relax {
+            // after the move: only what the relax holds to, the bounce kept as it was
+            if !point.bouncing {
+                point.relax_target = if gap > 0.0 { -gap / dt } else { 0.0 };
+            }
+            continue;
+        }
         // still apart it may close the gap, and only arriving can bounce. arriving in the last
         // substep would clamp the speed the next step's bounce is worked out from, so it bounces now
         let speed =
             relative_velocity(state, manifold.a, manifold.b, offset_a, offset_b).dot(normal);
         let arrives = -speed * dt >= gap;
-        point.target = if gap > 0.0 && !(last && arrives && frame.bounce > 0.0) {
-            -gap / dt
+        point.bouncing = frame.bounce > 0.0 && (gap <= 0.0 || (last && arrives));
+        (point.target, point.mass_scale, point.impulse_scale) = if point.bouncing {
+            (frame.bounce, 1.0, 0.0)
+        } else if gap > 0.0 {
+            (-gap / dt, 1.0, 0.0)
         } else {
-            frame.bounce
+            (
+                (soft.0 * (-gap).min(SOFT_REACH)).min(MAX_PUSH_SPEED),
+                soft.1,
+                soft.2,
+            )
         };
         point.recovery =
-            (RECOVERY_RATE / dt * (-gap - PENETRATION_SLOP).max(0.0)).min(MAX_RECOVERY_SPEED);
+            (RECOVERY_RATE / dt * (-gap - SOFT_REACH).max(0.0)).min(MAX_RECOVERY_SPEED);
         point.recovery_impulse = 0.0;
+        point.relax_target = if point.bouncing {
+            point.target
+        } else if gap > 0.0 {
+            -gap / dt
+        } else {
+            0.0
+        };
     }
     if first {
         manifold.block = match &*points {
@@ -366,6 +407,18 @@ fn refresh_manifold(
             _ => None,
         };
     }
+}
+
+/// Push out speed per meter of overlap, mass scale and impulse scale of a soft contact row for
+/// a substep of `dt` (Catto, Solver2D, 2024). Never stiffer than a quarter of the substep rate,
+/// half of it against a fixed body.
+fn soft_contact(dt: f32, stiffer: f32) -> (f32, f32, f32) {
+    let hertz = CONTACT_HERTZ.min(0.25 / dt) * stiffer;
+    let omega = 2.0 * std::f32::consts::PI * hertz;
+    let a1 = 2.0 * CONTACT_DAMPING + dt * omega;
+    let a2 = dt * omega * a1;
+    let a3 = 1.0 / (1.0 + a2);
+    (omega / a1, a2 * a3, a3)
 }
 
 /// Two points' normal rows as one 2 by 2 system, `k` and its inverse. Solved one after the

@@ -9,7 +9,7 @@ use crate::profile::PhaseTimes;
 use crate::sleep::{is_resting, plan_wakes, update_sleep};
 use crate::solver::{
     CachedManifold, add_woken_pairs, find_broad_pairs, finish_contacts, prepare_contacts,
-    solve_substep, turning_substeps,
+    relax_substep, solve_substep, turning_substeps,
 };
 use crate::{
     BodyHandle, BodyKind, ContactEvent, FrameId, GridPosition, JobDispatch, JointHandle,
@@ -177,11 +177,28 @@ impl PhysicsWorld {
                 (dispatch, part),
             );
             lap(&mut phases.solve);
-            // this substep's move and the next one's velocity in one pass, body by body as
-            // before, one dispatch fewer
-            let next = substep + 1 < substeps;
             run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
                 integrate_position(bodies, awake[dense], dense, slot, part);
+            })?;
+            lap(&mut phases.integrate);
+            relax_substep(
+                bodies,
+                &mut self.scratch,
+                &mut self.contact_scratch,
+                (substep, dispatch, part),
+            );
+            lap(&mut phases.solve);
+            // the relax changed speeds, the turn is kept as momentum
+            let next = substep + 1 < substeps;
+            run_jobs(&mut self.scratch, chunk_size, dispatch, &|dense, slot| {
+                if slot.touched && bodies.kind[dense] == BodyKind::Dynamic && awake[dense] {
+                    slot.momentum = momentum_from_velocity(
+                        BodyKind::Dynamic,
+                        slot.rotation,
+                        bodies.inverse_inertia[dense],
+                        slot.angular,
+                    );
+                }
                 if next {
                     integrate_velocity(bodies, gravity, awake[dense], dense, slot, (part, 0.0));
                 }

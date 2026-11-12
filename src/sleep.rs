@@ -9,6 +9,23 @@ use crate::{BodyHandle, BodyKind};
 const SLEEP_TIME: f32 = 0.5;
 const SLEEP_LINEAR_SQUARED: f32 = 0.05 * 0.05;
 const SLEEP_ANGULAR_SQUARED: f32 = 0.05 * 0.05;
+/// How far a body's center or farthest point may wander over `SLEEP_TIME` and still rest,
+/// meters. Judged by where it went, as jolt does, not how fast it was going: deep in a pile
+/// of 400 rocks each one shook at a few cm/s on the spot, some always over the speed line,
+/// and the pile never slept.
+const REST_REACH: f32 = 0.02;
+/// Faster than this, m/s at its farthest point, a body is moving whatever its window says.
+const MOVING_SPEED: f32 = 0.5;
+/// An island of at least this many bodies with this share of them resting settles its last
+/// creepers: those slower than `SETTLE_SPEED` lose speed at `SETTLE_DAMPING` per second. a
+/// pile of 800 rocks had 95 to 99 percent at rest and always a few dozen sliding at up to
+/// 1 m/s, so it never slept. physx damps slow bodies the same way (stabilization).
+const SETTLE_ISLAND: u32 = 64;
+const SETTLE_SHARE: f32 = 0.95;
+const SETTLE_SPEED: f32 = 1.0;
+const SETTLE_DAMPING: f32 = 4.0;
+/// Settling this long, seconds, the island sleeps with its creepers.
+const SETTLE_TIME: f32 = 2.0;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SleepScratch {
@@ -16,6 +33,9 @@ pub(crate) struct SleepScratch {
     parent: Vec<u32>,
     flagged: Vec<bool>,
     supported: Vec<bool>,
+    members: Vec<u32>,
+    resting: Vec<u32>,
+    unsettled: Vec<bool>,
 }
 
 impl SleepScratch {
@@ -50,15 +70,27 @@ pub(crate) fn is_slow(linear: Vec3, angular: Vec3) -> bool {
         && angular.length_squared() < SLEEP_ANGULAR_SQUARED
 }
 
-/// Slow by how fast its farthest point moves, as box2d does: a small piece rocking in place
-/// rests, a long one turning slowly does not.
+/// Not plainly moving, by how fast its farthest point goes, as box2d does: a small piece
+/// rocking in place may rest, a long one turning fast does not.
 pub(crate) fn is_resting(bodies: &Bodies, dense: usize, (linear, angular): (Vec3, Vec3)) -> bool {
     let reach = bodies.assets.bounding_radius(&bodies.shape[dense]);
     if !reach.is_finite() {
         return is_slow(linear, angular);
     }
     let edge = angular.length() * reach;
-    linear.length_squared() < SLEEP_LINEAR_SQUARED && edge * edge < SLEEP_LINEAR_SQUARED
+    let most = MOVING_SPEED * MOVING_SPEED;
+    linear.length_squared() < most && edge * edge < most
+}
+
+/// Still near where its window began, center and farthest point both.
+fn stays(bodies: &Bodies, dense: usize) -> bool {
+    let (place, turn) = bodies.rest[dense];
+    let moved = bodies.position(dense).offset_from(place).length() as f32;
+    let reach = bodies.assets.bounding_radius(&bodies.shape[dense]);
+    let reach = if reach.is_finite() { reach } else { 1.0 };
+    let half = (turn.conjugate() * bodies.rotation[dense]).w.abs().min(1.0);
+    let turned = 2.0 * half.acos() * reach;
+    moved < REST_REACH && turned < REST_REACH
 }
 
 fn is_moving(bodies: &Bodies, awake: &[bool], dense: usize) -> bool {
@@ -221,30 +253,91 @@ pub(crate) fn update_sleep(
         if bodies.kind[dense] != BodyKind::Dynamic || bodies.asleep[dense] {
             continue;
         }
-        let slow = bodies.can_sleep[dense]
-            && is_resting(bodies, dense, (bodies.linear[dense], bodies.angular[dense]));
-        bodies.still_time[dense] = if slow {
-            (bodies.still_time[dense] + dt).min(SLEEP_TIME)
-        } else {
-            0.0
-        };
+        let fast = !is_resting(bodies, dense, (bodies.linear[dense], bodies.angular[dense]));
+        if bodies.still_time[dense] == 0.0 || fast || !stays(bodies, dense) {
+            // a new window starts here
+            bodies.rest[dense] = (bodies.position(dense), bodies.rotation[dense]);
+            bodies.still_time[dense] = 0.0;
+        }
+        if bodies.can_sleep[dense] && !fast {
+            bodies.still_time[dense] = (bodies.still_time[dense] + dt).min(SLEEP_TIME);
+        }
         if bodies.still_time[dense] < SLEEP_TIME {
             let root = scratch.find(dense);
             scratch.flagged[root] = true;
         }
     }
 
+    settle(bodies, scratch, dt);
+
     for dense in 0..count {
         if bodies.kind[dense] != BodyKind::Dynamic || bodies.asleep[dense] {
             continue;
         }
         let root = scratch.find(dense);
-        if scratch.supported[root] && !scratch.flagged[root] {
+        let settled = !scratch.unsettled[root] && bodies.can_sleep[dense];
+        if scratch.supported[root] && (!scratch.flagged[root] || settled) {
             bodies.asleep[dense] = true;
+            bodies.settle_time[dense] = 0.0;
             bodies.still_time[dense] = 0.0;
             bodies.linear[dense] = Vec3::ZERO;
             bodies.angular[dense] = Vec3::ZERO;
             bodies.momentum[dense] = Vec3::ZERO;
+        }
+    }
+}
+
+/// Slows the creepers of big islands that are nearly all at rest, see `SETTLE_ISLAND`.
+fn settle(bodies: &mut Bodies, scratch: &mut SleepScratch, dt: f32) {
+    let count = bodies.len();
+    scratch.members.clear();
+    scratch.members.resize(count, 0);
+    scratch.resting.clear();
+    scratch.resting.resize(count, 0);
+    let awake = |bodies: &Bodies, dense: usize| {
+        bodies.kind[dense] == BodyKind::Dynamic && !bodies.asleep[dense]
+    };
+    for dense in 0..count {
+        if awake(bodies, dense) {
+            let root = scratch.find(dense);
+            scratch.members[root] += 1;
+            if bodies.still_time[dense] >= SLEEP_TIME {
+                scratch.resting[root] += 1;
+            }
+        }
+    }
+    let keep = (-SETTLE_DAMPING * dt).exp();
+    scratch.unsettled.clear();
+    scratch.unsettled.resize(count, false);
+    for dense in 0..count {
+        if !awake(bodies, dense) {
+            continue;
+        }
+        let root = scratch.find(dense);
+        let members = scratch.members[root];
+        let settling = scratch.supported[root]
+            && members >= SETTLE_ISLAND
+            && scratch.resting[root] as f32 >= SETTLE_SHARE * members as f32;
+        bodies.settle_time[dense] = if settling {
+            (bodies.settle_time[dense] + dt).min(SETTLE_TIME)
+        } else {
+            0.0
+        };
+        if bodies.settle_time[dense] < SETTLE_TIME {
+            scratch.unsettled[root] = true;
+        }
+        if !settling || bodies.still_time[dense] >= SLEEP_TIME {
+            continue;
+        }
+        let reach = bodies.assets.bounding_radius(&bodies.shape[dense]);
+        let reach = if reach.is_finite() { reach } else { 1.0 };
+        let speed = bodies.linear[dense]
+            .length()
+            .max(bodies.angular[dense].length() * reach);
+        if speed < SETTLE_SPEED {
+            bodies.linear[dense] *= keep;
+            bodies.angular[dense] *= keep;
+            bodies.momentum[dense] *= keep;
         }
     }
 }
@@ -407,7 +500,8 @@ mod tests {
         assert!(!asleep(&world, body));
         assert!(!asleep(&world, other));
         let state = world.body_state(body).unwrap();
-        assert_eq!(state.linear_velocity.x, 0.01);
+        // the soft push apart along y leaves only rounding along x
+        assert!((state.linear_velocity.x - 0.01).abs() < 1e-6);
     }
 
     #[test]
@@ -477,7 +571,8 @@ mod tests {
                 .map(|point| point.impulse.x)
                 .sum::<f32>()
         };
-        run(&mut world, 1.0);
+        // the soft contacts ring a little longer after the hit than rigid ones
+        run(&mut world, 2.0);
         // four boxes of 1000 kg and the ball, per substep
         let part = world.settings().fixed_timestep / world.settings().substeps as f32;
         let ball_mass = 5000.0 * 4.0 / 3.0 * std::f32::consts::PI * 0.125;

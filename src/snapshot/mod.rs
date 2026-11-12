@@ -17,7 +17,7 @@ use parts::{
 };
 
 const MAGIC: [u8; 4] = *b"SLNR";
-pub const SNAPSHOT_VERSION: u32 = 20;
+pub const SNAPSHOT_VERSION: u32 = 21;
 /// Older versions still read, what they lack takes its default.
 const OLDEST_VERSION: u32 = 2;
 
@@ -243,6 +243,9 @@ impl PhysicsWorld {
             }
             out.u8(flags);
             out.f32(bodies.still_time[dense]);
+            out.position(bodies.rest[dense].0);
+            out.quat(bodies.rest[dense].1);
+            out.f32(bodies.settle_time[dense]);
         }
 
         out.len(self.contact_cache.len());
@@ -644,6 +647,17 @@ mod tests {
             .windows(marker.len())
             .position(|window| window == marker.as_slice())
             .unwrap();
+        // and the rest pose and settle time 21 added after the still time: zero place, unit
+        // turn, zero time
+        let mut rest = vec![super::FLAG_CAN_SLEEP];
+        rest.extend([0_u8; 4 + 24 + 12]);
+        rest.extend(1.0_f32.to_le_bytes());
+        let pose = at
+            + bytes[at..]
+                .windows(rest.len())
+                .position(|window| window == rest.as_slice())
+                .unwrap();
+        bytes.drain(pose + 5..pose + rest.len() + 4);
         bytes.drain(at + marker.len()..at + marker.len() + 4 * 2 + 2 + 4 * 2 + 4 * 3);
         // and the sensor, field, breakable, structure, two atmosphere, two gas, heat and rope
         // counts at the end, all empty
