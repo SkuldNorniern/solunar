@@ -17,9 +17,11 @@ use crate::{BodyKind, JobDispatch, PhysicsError, Shape};
 pub(crate) use contacts::{
     CachedManifold, CachedPoint, ContactScratch, FinishScratch, finish_contacts,
 };
-use contacts::{build_manifolds, refresh_manifolds};
+use contacts::{build_manifolds, refresh_block, refresh_blocks, refresh_range};
 use islands::{NONE, find_islands, group};
-use stages::{Shared, color_constraints, factor_islands, plan_stages, run_stages, solve_block};
+use stages::{
+    Shared, Stage, color_constraints, factor_islands, plan_stages, run_stages, solve_block,
+};
 
 /// Contacts exist this far apart, so a corner lifting a hair keeps its constraint.
 pub(crate) const CONTACT_MARGIN: f32 = 0.02;
@@ -248,15 +250,9 @@ pub(crate) fn solve_substep(
         |row| pair(row.bodies()),
         &mut islands.row_ends,
     );
-    refresh_manifolds(
-        bodies,
-        state,
-        scratch,
-        (substep == 0, last, false),
-        (dispatch, dt),
-    );
     color_constraints(bodies, scratch);
     factor_islands(bodies, scratch);
+    let refresh = plan_refresh(scratch);
     scratch.motions.clear();
     scratch.motions.extend(state.iter().map(|body| Motion {
         linear: body.linear,
@@ -272,14 +268,37 @@ pub(crate) fn solve_substep(
         Shared::new(&mut scratch.manifolds),
         Shared::new(&mut scratch.points),
     );
-    plan_stages(&mut scratch.colors, substep, false);
+    plan_stages(&mut scratch.colors, substep, false, refresh);
     let colors = &scratch.colors;
     let direct = (
         scratch.factors.as_slice(),
         scratch.shapes.as_slice(),
         scratch.direct_nodes.as_slice(),
     );
+    let (ranges, frames, read): (_, _, &[Integrated]) =
+        (&scratch.refresh_ranges, &scratch.frames, state);
     run_stages(&colors.stages, dispatch, &|stage, block| {
+        if let Stage::Refresh { .. } = stage {
+            let (manifolds, points) = ranges[block].clone();
+            // SAFETY: refresh blocks own disjoint manifold and point ranges, and the refresh
+            // stage ends before any other stage starts.
+            let parts = unsafe {
+                (
+                    shared.3.slice(manifolds.start, manifolds.len()),
+                    shared.4.slice(points.start, points.len()),
+                )
+            };
+            let frames = &frames[points.clone()];
+            refresh_block(
+                bodies,
+                read,
+                (parts.0, parts.1, frames),
+                points.start,
+                (substep == 0, last, false),
+                dt,
+            );
+            return;
+        }
         solve_block(bodies, colors, direct, &shared, stage, block, substep);
     });
     for (body, motion) in state.iter_mut().zip(&scratch.motions) {
@@ -312,8 +331,8 @@ pub(crate) fn relax_substep(
     if scratch.manifolds.is_empty() {
         return;
     }
-    // gaps, and for fast turning bodies arms, where the bodies are now
-    refresh_manifolds(bodies, state, scratch, (false, false, true), (dispatch, dt));
+    // gaps, and for fast turning bodies arms, where the bodies are now, in the first stage
+    let refresh = plan_refresh(scratch);
     scratch.motions.clear();
     scratch.motions.extend(state.iter().map(|body| Motion {
         linear: body.linear,
@@ -329,14 +348,37 @@ pub(crate) fn relax_substep(
         Shared::new(&mut scratch.manifolds),
         Shared::new(&mut scratch.points),
     );
-    plan_stages(&mut scratch.colors, substep, true);
+    plan_stages(&mut scratch.colors, substep, true, refresh);
     let colors = &scratch.colors;
     let direct = (
         scratch.factors.as_slice(),
         scratch.shapes.as_slice(),
         scratch.direct_nodes.as_slice(),
     );
+    let (ranges, frames, read): (_, _, &[Integrated]) =
+        (&scratch.refresh_ranges, &scratch.frames, state);
     run_stages(&colors.stages, dispatch, &|stage, block| {
+        if let Stage::Refresh { .. } = stage {
+            let (manifolds, points) = ranges[block].clone();
+            // SAFETY: refresh blocks own disjoint manifold and point ranges, and the refresh
+            // stage ends before any other stage starts.
+            let parts = unsafe {
+                (
+                    shared.3.slice(manifolds.start, manifolds.len()),
+                    shared.4.slice(points.start, points.len()),
+                )
+            };
+            let frames = &frames[points.clone()];
+            refresh_block(
+                bodies,
+                read,
+                (parts.0, parts.1, frames),
+                points.start,
+                (false, false, true),
+                dt,
+            );
+            return;
+        }
         solve_block(bodies, colors, direct, &shared, stage, block, substep);
     });
     // what the contacts took this substep, the relax counted
@@ -350,6 +392,17 @@ pub(crate) fn relax_substep(
             body.touched = true;
         }
     }
+}
+
+/// Plans the refresh blocks that open a stage run, their ranges kept in `scratch`.
+fn plan_refresh(scratch: &mut ContactScratch) -> u32 {
+    let blocks = refresh_blocks(&scratch.manifolds);
+    scratch.refresh_ranges.clear();
+    for block in 0..blocks as usize {
+        let range = refresh_range(&scratch.manifolds, (block, blocks));
+        scratch.refresh_ranges.push(range);
+    }
+    blocks
 }
 
 /// The material a contact on this part of the body touches: a compound part's own when it has

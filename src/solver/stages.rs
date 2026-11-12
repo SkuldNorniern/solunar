@@ -72,6 +72,10 @@ pub(super) struct Colors {
 /// Blocks that may run at once. Every block of a stage is done before the next one starts.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Stage {
+    /// Contact gaps and arms before anything is solved, one block of manifolds each.
+    Refresh {
+        blocks: u32,
+    },
     Islands {
         blocks: u32,
         relax: bool,
@@ -94,7 +98,8 @@ pub(super) enum Stage {
 impl Stage {
     fn blocks(self) -> usize {
         match self {
-            Self::Islands { blocks, .. }
+            Self::Refresh { blocks }
+            | Self::Islands { blocks, .. }
             | Self::Direct { blocks, .. }
             | Self::Colors { blocks, .. } => blocks as usize,
         }
@@ -131,7 +136,7 @@ impl<'a, T: Copy> Shared<'a, T> {
     /// # Safety
     /// No other job may use `start..start + len` while the slice lives.
     #[allow(clippy::mut_from_ref)]
-    unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
+    pub(super) unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
         assert!(start <= self.len && len <= self.len - start);
         // SAFETY: in bounds, and the caller gives the range to one job only.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.add(start), len) }
@@ -413,9 +418,12 @@ unsafe fn solve_direct(
 
 /// Small islands in one stage, then each pass of the colored solve, color by color.
 /// With `relax` only the relax sweeps, run after the bodies moved.
-pub(super) fn plan_stages(colors: &mut Colors, substep: u32, relax: bool) {
+pub(super) fn plan_stages(colors: &mut Colors, substep: u32, relax: bool, refresh: u32) {
     let mut stages = std::mem::take(&mut colors.stages);
     stages.clear();
+    if refresh > 0 {
+        stages.push(Stage::Refresh { blocks: refresh });
+    }
     if colors.runs.len() > 1 {
         stages.push(Stage::Islands {
             blocks: colors.runs.len() as u32 - 1,
@@ -500,6 +508,8 @@ pub(super) fn solve_block(
     // right hand sides of direct solves, one buffer for the block
     let mut rhs = Vec::new();
     match stage {
+        // the caller's own stage, it holds what a refresh needs
+        Stage::Refresh { .. } => {}
         Stage::Islands { relax, .. } => {
             let (first, last) = (colors.runs[block] as usize, colors.runs[block + 1] as usize);
             for index in first..last {
